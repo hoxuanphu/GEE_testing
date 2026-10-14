@@ -1,0 +1,11 @@
+shapefile34/*.shp filter=lfs diff=lfs merge=lfs -text
+shapefile34/*.dbf filter=lfs diff=lfs merge=lfs -text
+shapefile34/*.cpg filter=lfs diff=lfs merge=lfs -text
+shapefile34/vn34.json filter=lfs diff=lfs merge=lfs -text
+Shapefile_PX_VN_34/*.dbf filter=lfs diff=lfs merge=lfs -text
+shapefile34/*.shx filter=lfs diff=lfs merge=lfs -text
+shapefile34/*.prj filter=lfs diff=lfs merge=lfs -text
+Shapefile_PX_VN_34/*.shp filter=lfs diff=lfs merge=lfs -text
+Shapefile_PX_VN_34/*.shx filter=lfs diff=lfs merge=lfs -text
+Shapefile_PX_VN_34/*.prj filter=lfs diff=lfs merge=lfs -text
+Shapefile_PX_VN_34/*.cpg filter=lfs diff=lfs merge=lfs -text

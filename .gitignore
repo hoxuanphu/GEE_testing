@@ -10,8 +10,7 @@ wheels/
 .pytest_cache/
 *.pem
 /shapefile/
-/shapefile34/
-/Shapefile_PX_VN_34/
+/shapefile34/*.zip
 /*.tif
 /*.tiff
 /*.png

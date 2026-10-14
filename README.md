@@ -5,17 +5,25 @@ Web nhỏ: click bản đồ hoặc nhập tọa độ → tải ảnh **Surface
 
 ## Dữ liệu và cấu hình cục bộ
 
-Repository không kèm thông tin đăng nhập, chứng chỉ CA nội bộ, dữ liệu ranh giới
-hoặc ảnh đã tải. Sau khi clone:
+Repository không kèm thông tin đăng nhập, chứng chỉ CA nội bộ hoặc ảnh đã tải.
+Dữ liệu ranh giới tỉnh/thành và xã/phường được quản lý bằng **Git LFS** vì file
+shapefile xã/phường vượt 100 MiB. Cài Git LFS trước khi clone; sau khi clone chạy:
+
+```powershell
+git lfs install --local
+git lfs pull
+```
 
 - Sao chép `.env.example` thành `.env` và điền thông tin đăng nhập của bạn;
   đặt khóa service account theo `GEE_KEY_FILE`. Không commit các khóa này.
-- Bổ sung `shapefile34/vn34.json` để dùng ranh giới tỉnh/thành. Có thể tạo file
-  bằng `convert_shapefile34.py` từ bộ shapefile tỉnh/thành tương ứng.
-- Bổ sung bộ `Shapefile_PX_VN_34/Việt Nam (phường xã) - 34` gồm các file
-  `.shp`, `.shx`, `.dbf`, `.prj`, `.cpg` để dùng ranh giới xã/phường.
-- Chỉ sử dụng hoặc phân phối dữ liệu ranh giới khi có quyền phù hợp. Các thư mục
-  dữ liệu này được giữ ngoài Git; file shapefile xã/phường vượt 100 MiB.
+- `shapefile34/` chứa bộ shapefile tỉnh/thành và `vn34.json` dùng trong ứng dụng.
+  Có thể tạo lại JSON bằng `convert_shapefile34.py`. Bản ZIP trùng dữ liệu không
+  được commit.
+- `Shapefile_PX_VN_34/` chứa bộ shapefile xã/phường gồm các file `.shp`, `.shx`,
+  `.dbf`, `.prj`, `.cpg`.
+- Chỉ sử dụng hoặc phân phối dữ liệu ranh giới khi có quyền phù hợp. Khi push,
+  Git LFS tải dữ liệu lên riêng; dung lượng lưu trữ và tải xuống chịu hạn mức
+  Git LFS của tài khoản GitHub. Thư mục `shapefile/` cũ vẫn được giữ ngoài Git.
 - Nếu mạng nội bộ yêu cầu CA riêng, bổ sung `vingroup_cas.pem` trên máy;
   `combined_cas.pem` được ứng dụng tạo cục bộ. Không commit chứng chỉ nội bộ.
 
