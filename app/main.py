@@ -5,6 +5,8 @@ import datetime as dt
 import asyncio
 from contextlib import asynccontextmanager, suppress
 import os
+import math
+import uuid
 import re
 import time
 from pathlib import Path
@@ -54,7 +56,8 @@ from .admin_boundaries import (
 )
 from .commune_boundaries import Commune, commune_feature, get_commune, list_communes
 from .ee_session import init_ee
-from .geo import Bbox, bbox_to_ee_geom, point_bbox
+from .geo import Bbox, bbox_to_ee_geom, point_roi, source_bbox
+from .raster_grid import build_rotated_grid, warp_to_grid, grid_profile, write_grid_band
 from .imagery import (
     LANDSAT_SCALE,
     NICFI_SCALE,
@@ -147,7 +150,21 @@ def _ensure_ee() -> None:
             ) from exc
 
 
-class SceneRequest(BaseModel):
+class PointSelectionRequest(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False)
+    rotation_deg: float = Field(0.0, ge=0, le=360)
+
+    @model_validator(mode="after")
+    def valid_rotation(self):
+        self.rotation_deg %= 360
+        if self.selection_mode != "point" and self.rotation_deg:
+            raise ValueError("rotation_deg is only supported for point selection")
+        if self.selection_mode == "point" and self.lon is not None and self.lat is not None:
+            point_roi(self.lon, self.lat, self.radius_m, self.rotation_deg)
+        return self
+
+
+class SceneRequest(PointSelectionRequest):
     selection_mode: Literal["point", "province", "commune"] = "point"
     lon: float | None = Field(None, ge=-180, le=180, description="Longitude (degrees)")
     lat: float | None = Field(None, ge=-90, le=90, description="Latitude (degrees)")
@@ -180,6 +197,8 @@ class SceneResponse(BaseModel):
     date: str
     cloud_pct: float
     bbox: dict[str, float]
+    roi_geometry: dict | None = None
+    rotation_deg: float = 0
     scale_m: float
     bands: list[str]
     preview_url: str | None = None
@@ -222,8 +241,14 @@ def _resolve_selection(
     radius_m: float,
     province_id: str | None,
     commune_id: str | None = None,
+    rotation_deg: float = 0,
 ) -> tuple[object, Bbox, Province | Commune | None]:
     """Resolve a trusted point or local administrative polygon into an ROI."""
+    if not math.isfinite(rotation_deg) or not 0 <= rotation_deg <= 360:
+        raise HTTPException(400, "rotation_deg must be finite and between 0 and 360")
+    rotation_deg %= 360
+    if selection_mode != "point" and rotation_deg:
+        raise HTTPException(400, "rotation_deg is only supported for point selection")
     if selection_mode == "commune":
         if not commune_id:
             raise HTTPException(400, "commune_id is required for commune selection")
@@ -250,7 +275,13 @@ def _resolve_selection(
         raise HTTPException(400, "lon and lat are required for point selection")
     if radius_m <= 0 or radius_m > _MAX_RADIUS_M:
         raise HTTPException(400, f"radius_m must be > 0 and <= {_MAX_RADIUS_M:.0f} m")
-    bbox = point_bbox(lon, lat, radius_m)
+    try:
+        geometry, bbox = point_roi(lon, lat, radius_m, rotation_deg)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if rotation_deg:
+        import ee
+        return ee.Geometry.Polygon(geometry["coordinates"], geodesic=False), bbox, None
     return bbox_to_ee_geom(bbox), bbox, None
 
 
@@ -263,7 +294,7 @@ def _bbox_dict(bbox: Bbox) -> dict[str, float]:
     }
 
 
-class TimeSeriesRequest(BaseModel):
+class TimeSeriesRequest(PointSelectionRequest):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
     selection_mode: Literal["point"] = "point"
     dataset: Literal["sentinel2", "landsat", "nicfi", "dynamic_world", "s1gee"]
@@ -309,15 +340,20 @@ class TimeSeriesJobRequest(BaseModel):
 @app.post("/api/timeseries/search")
 def search_timeseries(body: TimeSeriesRequest) -> dict:
     _ensure_ee()
-    _, bbox, _ = _resolve_selection("point", body.lon, body.lat, body.radius_m, None)
+    roi, bbox, _ = _resolve_selection("point", body.lon, body.lat, body.radius_m, None, rotation_deg=body.rotation_deg)
     end_exclusive = (dt.date.fromisoformat(body.end_date) + dt.timedelta(days=1)).isoformat()
     try:
         scenes = list_timeseries_scenes(body.dataset, body.lon, body.lat,
-                                       body.start_date, end_exclusive, body.polarization)
+                                       body.start_date, end_exclusive, body.polarization,
+                                       **({"roi": roi} if body.rotation_deg else {}))
         parameters = body.model_dump()
         parameters.update(timeseries_source_metadata(body.dataset, body.polarization))
         parameters["bbox"] = vars(bbox)
         parameters["crs"] = "EPSG:4326"
+        parameters["roi_geometry"] = point_roi(body.lon, body.lat, body.radius_m, body.rotation_deg)[0]
+        if body.rotation_deg:
+            parameters["output_grid"] = build_rotated_grid(body.lon, body.lat, body.radius_m,
+                                                          body.rotation_deg, parameters["scale_m"])
         scenes = [TimeSeriesSceneResponse.model_validate(scene).model_dump() for scene in scenes]
         return _timeseries_store.create_search(parameters, scenes)
     except Exception as exc:
@@ -471,7 +507,7 @@ def find_scene(req: SceneRequest) -> SceneResponse:
         raise HTTPException(400, "start_date must be <= end_date")
 
     roi, bbox, province = _resolve_selection(
-        req.selection_mode, req.lon, req.lat, req.radius_m, req.province_id, req.commune_id
+        req.selection_mode, req.lon, req.lat, req.radius_m, req.province_id, req.commune_id, req.rotation_deg
     )
 
     # Inclusive end date for GEE filterDate (shift by +1 day)
@@ -498,6 +534,7 @@ def find_scene(req: SceneRequest) -> SceneResponse:
                 start_date=req.start_date,
                 end_date=end_exclusive,
                 merge_scenes=req.merge_scenes,
+                roi=roi if req.rotation_deg else None,
             )
     except InsufficientCoverageError:
         raise
@@ -536,7 +573,7 @@ def find_scene(req: SceneRequest) -> SceneResponse:
 
     try:
         preview_url = preview_rgb(
-            scene.ee_object, req.dataset, bbox, roi if province is not None else None
+            scene.ee_object, req.dataset, bbox, roi if province is not None or req.rotation_deg else None
         )
     except Exception:
         preview_url = None
@@ -554,7 +591,7 @@ def find_scene(req: SceneRequest) -> SceneResponse:
         )
     else:
         download_params = (
-            f"?selection_mode=point&lon={req.lon}&lat={req.lat}&radius_m={req.radius_m}"
+            f"?selection_mode=point&lon={req.lon}&lat={req.lat}&radius_m={req.radius_m}&rotation_deg={req.rotation_deg}"
             f"&start_date={req.start_date}&end_date={req.end_date}"
         )
 
@@ -570,6 +607,8 @@ def find_scene(req: SceneRequest) -> SceneResponse:
         date=scene.date,
         cloud_pct=scene.cloud_pct,
         bbox=bbox_dict,
+        roi_geometry=province.geometry if province else point_roi(req.lon, req.lat, req.radius_m, req.rotation_deg)[0],
+        rotation_deg=req.rotation_deg,
         scale_m=_scale_for(req.dataset),
         bands=bands,
         preview_url=preview_url,
@@ -604,7 +643,7 @@ def plan_composite(req: SceneRequest) -> dict:
         raise HTTPException(400, "Composite planning is only available for Sentinel-2 or Landsat")
 
     roi, _bbox, _province = _resolve_selection(
-        req.selection_mode, req.lon, req.lat, req.radius_m, req.province_id, req.commune_id
+        req.selection_mode, req.lon, req.lat, req.radius_m, req.province_id, req.commune_id, req.rotation_deg
     )
     end_exclusive = (dt.date.fromisoformat(req.end_date) + dt.timedelta(days=1)).isoformat()
     try:
@@ -633,6 +672,7 @@ def download(
     composite_method: Literal[
         "mosaic", "median", "medoid", "base-score", "raw"
     ] = "medoid",
+    rotation_deg: float = 0.0,
 ):
     _ensure_ee()
     if dataset not in ("sentinel2", "landsat", "nicfi", "dynamic_world"):
@@ -640,7 +680,7 @@ def download(
             400, "dataset must be sentinel2, landsat, nicfi or dynamic_world"
         )
     roi, bbox, province = _resolve_selection(
-        selection_mode, lon, lat, radius_m, province_id, commune_id
+        selection_mode, lon, lat, radius_m, province_id, commune_id, rotation_deg
     )
 
     end_exclusive = (
@@ -667,11 +707,15 @@ def download(
             start_date=start_date,
             end_date=end_exclusive,
             merge_scenes=merge_scenes,
+            roi=roi if rotation_deg % 360 else None,
         )
     if scene is None:
         raise HTTPException(404, "No scene found for this point/date range")
 
     scale = _scale_for(dataset)
+    output_grid = build_rotated_grid(lon, lat, radius_m, rotation_deg, scale) if rotation_deg % 360 else None
+    if output_grid:
+        bbox = source_bbox(bbox, scale, lat)
     band_urls = download_geotiff(
         scene.ee_object,
         dataset,
@@ -695,15 +739,24 @@ def download(
         fname = f"{dataset}_{province.id}_{start_date}_{end_date}_{method_tag}.tif"
     else:
         fname = f"{dataset}_{scene.scene_id[:40]}_{scene.date}.tif"
-    out = _DOWNLOADS_DIR / fname
+    if output_grid:
+        fname = f"{Path(fname).stem}_pt{lon:.5f}_{lat:.5f}_r{radius_m:g}_a{rotation_deg % 360:g}.tif"
+    out = _DOWNLOADS_DIR / (f"{uuid.uuid4().hex}_{fname}" if output_grid else fname)
+    raw = out.with_suffix(".source.tif") if output_grid else out
     try:
         merge_band_tiffs(
-            band_urls, out, categorical=dataset == "dynamic_world"
+            band_urls, raw, categorical=dataset == "dynamic_world",
+            **({"preserve_masks": True} if output_grid else {})
         )
+        if output_grid:
+            warp_to_grid(raw, out, output_grid, categorical=dataset == "dynamic_world")
     except requests.RequestException as exc:
         raise HTTPException(502, f"Failed to download GeoTIFF from GEE: {exc}") from exc
     except RuntimeError as exc:
         raise HTTPException(502, f"Failed to merge band GeoTIFFs: {exc}") from exc
+    finally:
+        if output_grid:
+            raw.unlink(missing_ok=True)
 
     return FileResponse(
         path=out,
@@ -718,7 +771,7 @@ def download(
 # ---------------------------------------------------------------------------
 
 
-class S1SceneRequest(BaseModel):
+class S1SceneRequest(PointSelectionRequest):
     selection_mode: Literal["point", "province", "commune"] = "point"
     lon: float | None = Field(None, ge=-180, le=180)
     lat: float | None = Field(None, ge=-90, le=90)
@@ -747,7 +800,7 @@ def find_s1_scene(req: S1SceneRequest):
         raise HTTPException(400, "start_date must be <= end_date")
 
     roi, bbox, province = _resolve_selection(
-        req.selection_mode, req.lon, req.lat, req.radius_m, req.province_id, req.commune_id
+        req.selection_mode, req.lon, req.lat, req.radius_m, req.province_id, req.commune_id, req.rotation_deg
     )
 
     end_exclusive = (
@@ -766,6 +819,7 @@ def find_s1_scene(req: S1SceneRequest):
                 start_date=req.start_date,
                 end_date=end_exclusive,
                 polarization=req.polarization,
+                roi=roi if req.rotation_deg else None,
             )
     except Exception as exc:
         raise HTTPException(502, f"Earth Engine query failed: {exc}") from exc
@@ -784,7 +838,7 @@ def find_s1_scene(req: S1SceneRequest):
 
     try:
         preview_url = preview_rgb(
-            scene.ee_object, "s1gee", bbox, roi if province is not None else None
+            scene.ee_object, "s1gee", bbox, roi if province is not None or req.rotation_deg else None
         )
     except Exception:
         preview_url = None
@@ -802,7 +856,7 @@ def find_s1_scene(req: S1SceneRequest):
         )
     else:
         download_params = (
-            f"?selection_mode=point&lon={req.lon}&lat={req.lat}&radius_m={req.radius_m}"
+            f"?selection_mode=point&lon={req.lon}&lat={req.lat}&radius_m={req.radius_m}&rotation_deg={req.rotation_deg}"
             f"&start_date={req.start_date}&end_date={req.end_date}"
             f"&polarization={req.polarization}"
         )
@@ -812,6 +866,8 @@ def find_s1_scene(req: S1SceneRequest):
         "date": scene.date,
         "cloud_pct": scene.cloud_pct,
         "bbox": _bbox_dict(bbox),
+        "roi_geometry": province.geometry if province else point_roi(req.lon, req.lat, req.radius_m, req.rotation_deg)[0],
+        "rotation_deg": req.rotation_deg,
         "scale_m": S1_SCALE,
         "bands": bands,
         "preview_url": preview_url,
@@ -835,13 +891,14 @@ def s1gee_download(
     polarization: str = "vvvh",
     province_id: str | None = None,
     commune_id: str | None = None,
+    rotation_deg: float = 0.0,
 ):
     """Tải GeoTIFF S1 GRD (dB) theo vùng đã chọn — không cần tài khoản CDSE."""
     _ensure_ee()
     if polarization not in ("vvvh", "vv", "hhhv", "hh"):
         raise HTTPException(400, "polarization must be vvvh|vv|hhhv|hh")
     roi, bbox, province = _resolve_selection(
-        selection_mode, lon, lat, radius_m, province_id, commune_id
+        selection_mode, lon, lat, radius_m, province_id, commune_id, rotation_deg
     )
 
     end_exclusive = (
@@ -850,10 +907,14 @@ def s1gee_download(
     if province is not None:
         scene = best_s1_scene_for_roi(roi, start_date, end_exclusive, polarization)
     else:
-        scene = best_s1_scene(lon, lat, radius_m, start_date, end_exclusive, polarization)
+        scene = best_s1_scene(lon, lat, radius_m, start_date, end_exclusive, polarization,
+                              roi=roi if rotation_deg % 360 else None)
     if scene is None:
         raise HTTPException(404, "No Sentinel-1 scene found for this point/date range")
 
+    output_grid = build_rotated_grid(lon, lat, radius_m, rotation_deg, S1_SCALE) if rotation_deg % 360 else None
+    if output_grid:
+        bbox = source_bbox(bbox, S1_SCALE, lat)
     band_urls = download_geotiff(
         scene.ee_object, "s1gee", bbox, S1_SCALE, roi if province is not None else None
     )
@@ -862,13 +923,21 @@ def s1gee_download(
         fname = f"s1gee_{province.id}_{start_date}_{end_date}.tif"
     else:
         fname = f"s1gee_{scene.scene_id[:40]}_{scene.date}.tif"
-    out = _DOWNLOADS_DIR / fname
+    if output_grid:
+        fname = f"{Path(fname).stem}_pt{lon:.5f}_{lat:.5f}_r{radius_m:g}_a{rotation_deg % 360:g}.tif"
+    out = _DOWNLOADS_DIR / (f"{uuid.uuid4().hex}_{fname}" if output_grid else fname)
+    raw = out.with_suffix(".source.tif") if output_grid else out
     try:
-        merge_band_tiffs(band_urls, out)
+        merge_band_tiffs(band_urls, raw, **({"preserve_masks": True} if output_grid else {}))
+        if output_grid:
+            warp_to_grid(raw, out, output_grid)
     except requests.RequestException as exc:
         raise HTTPException(502, f"Failed to download GeoTIFF from GEE: {exc}") from exc
     except RuntimeError as exc:
         raise HTTPException(502, f"Failed to merge band GeoTIFFs: {exc}") from exc
+    finally:
+        if output_grid:
+            raw.unlink(missing_ok=True)
 
     return FileResponse(
         path=out,
@@ -1663,6 +1732,8 @@ def s2_scenes(
     limit: int = 20,
     cloud_max: float | None = None,
     source: str = "cdse",
+    radius_m: float = 0.0,
+    rotation_deg: float = 0.0,
 ):
     """Search Sentinel-2 L2A products (surface reflectance).
 
@@ -1677,8 +1748,18 @@ def s2_scenes(
     if source not in ("cdse", "aws"):
         raise HTTPException(400, "source phải là 'cdse' hoặc 'aws'")
 
+    _s2_output_grid(lon, lat, radius_m, rotation_deg, None)
+    geometry, envelope = point_roi(lon, lat, radius_m, rotation_deg) if radius_m > 0 else (None, None)
     try:
-        if source == "aws":
+        if envelope is not None and rotation_deg % 360:
+            bounds = (envelope.west, envelope.south, envelope.east, envelope.north)
+            if source == "aws":
+                products = aws_search_s2_l2a_bbox(bounds, start_date, end_date,
+                                                   max_results=limit, cloud_max=cloud_max)
+            else:
+                products = search_s2_area(bounds, start_date, end_date,
+                                          max_results=limit, cloud_max=cloud_max)
+        elif source == "aws":
             products = aws_search_s2_l2a(
                 lon, lat, start_date, end_date, max_results=limit, cloud_max=cloud_max
             )
@@ -1693,7 +1774,10 @@ def s2_scenes(
             404,
             "Không tìm thấy ảnh Sentinel-2 L2A nào trong khoảng ngày này.",
         )
-    return {"source": source, "count": len(products), "products": products}
+    result = {"source": source, "count": len(products), "products": products}
+    if geometry is not None:
+        result.update(roi_geometry=geometry, bbox=vars(envelope), rotation_deg=rotation_deg % 360)
+    return result
 
 
 @app.get("/api/s3/scenes")
@@ -1751,6 +1835,28 @@ def s2_download(product_id: str, filename: str | None = None):
     )
 
 
+def _s2_output_grid(lon, lat, radius_m, rotation_deg, province_id):
+    if not math.isfinite(radius_m) or radius_m < 0 or radius_m > _MAX_RADIUS_M:
+        raise HTTPException(400, "radius_m must be finite and between 0 and 45000")
+    for value, limit, name in ((lon, 180, "lon"), (lat, 85.05112878, "lat")):
+        if value is not None and (not math.isfinite(value) or not -limit <= value <= limit):
+            raise HTTPException(400, f"{name} is outside the supported geographic domain")
+    if not math.isfinite(rotation_deg) or not 0 <= rotation_deg <= 360:
+        raise HTTPException(400, "rotation_deg must be finite and between 0 and 360")
+    if province_id and rotation_deg % 360:
+        raise HTTPException(400, "rotation_deg is only supported for point selection")
+    if lon is not None and lat is not None and radius_m > 0 and not province_id:
+        try:
+            point_roi(lon, lat, radius_m, rotation_deg)
+            if rotation_deg % 360:
+                return build_rotated_grid(lon, lat, radius_m, rotation_deg, S2_SCALE)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+    elif rotation_deg % 360:
+        raise HTTPException(400, "lon, lat and positive radius_m are required for rotation")
+    return None
+
+
 @app.get("/api/s2/bands")
 def s2_bands(
     product_id: str,
@@ -1760,6 +1866,8 @@ def s2_bands(
     lon: float | None = None,
     lat: float | None = None,
     radius_m: float = 0.0,
+    rotation_deg: float = 0.0,
+    commune_id: str | None = None,
 ):
     """Liệt kê hoặc tải band từ product S2 L2A ZIP trên CDSE qua Nodes API.
 
@@ -1771,6 +1879,7 @@ def s2_bands(
     GeoTIFF đa lớp, harmonize reflectance như pipeline GEE. Có thể crop
     theo province_id hoặc lon/lat + radius_m.
     """
+    output_grid = _s2_output_grid(lon, lat, radius_m, rotation_deg, province_id or commune_id)
     if not _PRODUCT_ID_RE.match(product_id):
         raise HTTPException(400, "product_id không hợp lệ")
     _ensure_cdse_creds()
@@ -1814,9 +1923,9 @@ def s2_bands(
     # Vùng crop (nếu có)
     crop_bbox = None
     tag = "full"
-    if province_id:
+    if province_id or commune_id:
         try:
-            province = get_province(province_id)
+            province = get_commune(commune_id) if commune_id else get_province(province_id)
         except RuntimeError as exc:
             raise HTTPException(503, f"Administrative boundaries unavailable: {exc}") from exc
         if province is None:
@@ -1825,9 +1934,10 @@ def s2_bands(
         crop_bbox = (pb.west, pb.south, pb.east, pb.north)
         tag = province.id
     elif lon is not None and lat is not None and radius_m > 0:
-        pb = point_bbox(lon, lat, radius_m)
+        _, pb = point_roi(lon, lat, radius_m, rotation_deg)
         crop_bbox = (pb.west, pb.south, pb.east, pb.north)
-        tag = f"pt{lon:.3f}_{lat:.3f}_r{int(radius_m)}"
+        tag = (f"pt{lon:.5f}_{lat:.5f}_r{radius_m:g}_a{rotation_deg % 360:g}"
+               if output_grid else f"pt{lon:.3f}_{lat:.3f}_r{int(radius_m)}")
 
     # Tên từ product (scene id ngắn) — tile + date lấy từ tên .SAFE
     safe = info["safe"]
@@ -1836,15 +1946,14 @@ def s2_bands(
     date = m.group(2)[:4] + "-" + m.group(2)[4:6] + "-" + m.group(2)[6:8] if m else "date"
     band_tag = "-".join(wanted)
     fname = f"sentinel2_cdse_{tile}_{date}_{tag}_{band_tag}.tif"
-    out = _DOWNLOADS_DIR / fname
-    band_dir = _DOWNLOADS_DIR / f"_nodes_{product_id[:8]}"
+    request_id = uuid.uuid4().hex
+    out = _DOWNLOADS_DIR / f"{request_id}_{fname}"
+    band_dir = _DOWNLOADS_DIR / f"_nodes_{request_id}"
     band_dir.mkdir(exist_ok=True)
 
     # Tải từng band JP2 (mỗi file ~100 MB — lọt dưới ngưỡng proxy)
     import numpy as np  # noqa: PLC0415
     import rasterio  # noqa: PLC0415
-    from rasterio.enums import Resampling  # noqa: PLC0415
-    from rasterio.vrt import WarpedVRT  # noqa: PLC0415
     from rasterio.warp import transform_bounds  # noqa: PLC0415
 
     layers: list[tuple[str, object, object, object]] = []  # (band, arr, transform, crs)
@@ -1874,11 +1983,18 @@ def s2_bands(
                             f"Vùng chọn không giao với band {b} (tile {tile}).",
                         )
                     win = from_bounds(w, s, e2, n, transform=src.transform)
-                    win = win.round_lengths().round_offsets()
-                    data = src.read(1, window=win, out_dtype="float32")
+                    if output_grid:
+                        from rasterio.windows import Window
+                        left, top = math.floor(win.col_off)-1, math.floor(win.row_off)-1
+                        right, bottom = math.ceil(win.col_off+win.width)+1, math.ceil(win.row_off+win.height)+1
+                        win = Window(left, top, right-left, bottom-top).intersection(
+                            Window(0, 0, src.width, src.height))
+                    else:
+                        win = win.round_lengths().round_offsets()
+                    data = src.read(1, window=win, out_dtype="float32", masked=bool(output_grid))
                     transform = src.window_transform(win)
                 else:
-                    data = src.read(1, out_dtype="float32")
+                    data = src.read(1, out_dtype="float32", masked=bool(output_grid))
                     transform = src.transform
                 crs = src.crs
 
@@ -1890,6 +2006,24 @@ def s2_bands(
         raise
     except Exception as exc:
         raise HTTPException(502, f"Đọc band JP2 thất bại: {exc}") from exc
+
+    finally:
+        import shutil
+        shutil.rmtree(band_dir, ignore_errors=True)
+
+    if output_grid:
+        with rasterio.open(out, "w", **grid_profile(output_grid, len(layers))) as dst:
+            for index, (band, data, transform, crs) in enumerate(layers, 1):
+                data = np.ma.asarray(data, dtype="float32")
+                with rasterio.MemoryFile() as memory:
+                    with memory.open(driver="GTiff", width=data.shape[1], height=data.shape[0],
+                                     count=1, dtype="float32", crs=crs, transform=transform,
+                                     nodata=float("nan")) as source:
+                        source.write(data.filled(float("nan")), 1)
+                    with memory.open() as source:
+                        write_grid_band(source, dst, output_grid, 1, index, band == "SCL")
+                dst.set_band_description(index, band)
+        return FileResponse(path=out, media_type="image/tiff", filename=fname)
 
     if not layers:
         raise HTTPException(502, "Không đọc được band nào")
@@ -1949,6 +2083,8 @@ def s2_aws_download(
     lat: float | None = None,
     radius_m: float = 0.0,
     province_id: str | None = None,
+    rotation_deg: float = 0.0,
+    commune_id: str | None = None,
 ):
     """Tải GeoTIFF đa lớp (tất cả band COG) của một item S2 L2A từ AWS.
 
@@ -1963,6 +2099,7 @@ def s2_aws_download(
     # Lấy item trực tiếp theo ID qua STAC — không phụ thuộc tọa độ điểm
     # (điểm chọn có thể nằm ngoài footprint tile của item, search theo điểm
     # sẽ bỏ sót -> 404 nhầm).
+    output_grid = _s2_output_grid(lon, lat, radius_m, rotation_deg, province_id or commune_id)
     try:
         product = aws_get_item(product_id)
     except Exception as exc:
@@ -1970,17 +2107,17 @@ def s2_aws_download(
     if product is None or not product.get("assets"):
         raise HTTPException(404, f"Không tìm thấy item AWS STAC: {product_id}")
 
-    tile = product.get("tile") or "tile?"
-    date = product.get("date") or "date?"
+    tile = product.get("tile") or "tile"
+    date = product.get("date") or "date"
     # Tên đầy đủ: sentinel2_tile_date_ID.tif — ID đảm bảo không trùng
     fname = f"sentinel2_{tile}_{date}_{product_id[:60]}.tif"
     out = _DOWNLOADS_DIR / fname
 
     try:
-        if province_id:
+        if province_id or commune_id:
             # Chế độ tỉnh: window = giao (tile ∩ bbox tỉnh)
             try:
-                province = get_province(province_id)
+                province = get_commune(commune_id) if commune_id else get_province(province_id)
             except RuntimeError as exc:
                 raise HTTPException(
                     503, f"Administrative boundaries unavailable: {exc}"
@@ -1993,11 +2130,15 @@ def s2_aws_download(
             fname = f"sentinel2_{tile}_{date}_{province.id}_{product_id[:48]}.tif"
             out = _DOWNLOADS_DIR / fname
         elif lon is not None and lat is not None and radius_m > 0:
-            pb = point_bbox(lon, lat, radius_m)
+            _, pb = point_roi(lon, lat, radius_m, rotation_deg)
             bbox = (pb.west, pb.south, pb.east, pb.north)
         else:
             bbox = None
-        aws_merge_all_bands(product["assets"], out, bbox)
+        if output_grid:
+            fname = f"{Path(fname).stem}_pt{lon:.5f}_{lat:.5f}_r{radius_m:g}_a{rotation_deg % 360:g}.tif"
+            out = _DOWNLOADS_DIR / f"{uuid.uuid4().hex}_{fname}"
+        aws_merge_all_bands(product["assets"], out, bbox,
+                            **({"output_grid": output_grid} if output_grid else {}))
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     except Exception as exc:
@@ -2103,4 +2244,8 @@ def s2_aws_province_mosaic(
 
 
 # Serve the frontend
+from .scene_catalog import register_scene_catalog
+
+_scene_catalog_store = register_scene_catalog(app)
+
 app.mount("/", StaticFiles(directory=str(_STATIC_DIR), html=True), name="static")

@@ -22,7 +22,11 @@
     el('esriCancel').disabled = !running || actionPending;
     el('esriResume').disabled = !['partial', 'failed', 'cancelled', 'interrupted'].includes(job.status) || actionPending;
     const progress = job.progress || job;
-    el('esriStatus').textContent = `${job.status}: ${progress.processed || 0}/${progress.total || 0} tile; thành công ${progress.succeeded || 0}, lỗi ${progress.failed || 0}, cache ${progress.cached || 0}` + (job.error ? ` — ${job.error}` : '') + (job.status === 'partial' ? ' — Ảnh chưa đầy đủ; có thể thử lại các tile thiếu.' : '');
+    const angle = Number(job.request?.rotation_deg) || 0;
+    const gridNote = job.request?.bbox
+      ? ' — Job bbox cũ/khung nhập riêng, lưới Bắc–Nam. Đổi góc không thay đổi file job này; tạo lượt tải mới.'
+      : ` — Góc lưới của job: ${angle}°; giữ nguyên theo thời điểm tạo job.`;
+    el('esriStatus').textContent = `${job.status}: ${progress.processed || 0}/${progress.total || 0} tile; thành công ${progress.succeeded || 0}, lỗi ${progress.failed || 0}, cache ${progress.cached || 0}` + (job.error ? ` — ${job.error}` : '') + (job.status === 'partial' ? ' — Ảnh chưa đầy đủ; có thể thử lại các tile thiếu.' : '') + gridNote;
     el('esriDownload').hidden = !['completed', 'partial'].includes(job.status);
     el('esriDownload').href = `/api/esri/jobs/${encodeURIComponent(job.job_id)}/download`;
     clearTimeout(timer);
@@ -45,7 +49,13 @@
   }
   el('esriMode').addEventListener('change', async () => {
     const commune = el('esriMode').value === 'commune';
-    el('esriBboxFields').hidden = commune;
+    const point = el('esriMode').value === 'point';
+    el('esriBboxFields').hidden = commune || point;
+    el('esriPointInfo').hidden = !point;
+    if (point) {
+      el('selection_mode').value = 'point';
+      el('selection_mode').dispatchEvent(new Event('change'));
+    }
     if (commune) {
       el('selection_mode').value = 'commune';
       el('selection_mode').dispatchEvent(new Event('change'));
@@ -67,6 +77,15 @@
       if (el('esriMode').value === 'commune') {
         body.commune_id = el('commune_id').value;
         if (!body.commune_id) throw new Error('Chọn xã/phường trước khi tải.');
+      } else if (el('esriMode').value === 'point') {
+        const lon = Number(el('lon').value), lat = Number(el('lat').value);
+        const radius = Number(el('radius_m').value);
+        body.lon = lon; body.lat = lat; body.radius_m = radius;
+        body.rotation_deg = rotationValue();
+        if (![lon, lat, radius, body.rotation_deg].every(Number.isFinite) || body.rotation_deg < 0 || body.rotation_deg > 360) {
+          throw new Error('Nhập tọa độ, bán kính và góc xoay hợp lệ ở phần vị trí.');
+        }
+        updatePositionMap();
       } else {
         const ids = ['esriWest', 'esriSouth', 'esriEast', 'esriNorth'];
         if (ids.some(id => el(id).value.trim() === '')) throw new Error('Nhập đủ 4 tọa độ bbox.');

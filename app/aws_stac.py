@@ -342,6 +342,7 @@ def search_s2_l2a(
     end_date: str,
     max_results: int = 50,
     cloud_max: float | None = None,
+    cloud_min: float | None = None,
 ) -> list[dict]:
     """Search S2 L2A items trên AWS Earth Search STAC quanh một điểm.
 
@@ -358,6 +359,8 @@ def search_s2_l2a(
     }
     if cloud_max is not None:
         body["query"] = {"eo:cloud_cover": {"lte": float(cloud_max)}}
+    if cloud_min is not None:
+        body.setdefault("query", {}).setdefault("eo:cloud_cover", {})["gte"] = float(cloud_min)
 
     features = _search_stac(body, max_results)
 
@@ -402,6 +405,7 @@ def search_s2_l2a_bbox(
     # cho khoảng nhiều năm, nên mặc định 2000 (20 trang STAC).
     max_results: int = 2000,
     cloud_max: float | None = None,
+    cloud_min: float | None = None,
 ) -> list[dict]:
     """Search S2 L2A items intersecting bbox (west, south, east, north)."""
     _ensure_cas()
@@ -415,6 +419,8 @@ def search_s2_l2a_bbox(
     }
     if cloud_max is not None:
         body["query"] = {"eo:cloud_cover": {"lte": float(cloud_max)}}
+    if cloud_min is not None:
+        body.setdefault("query", {}).setdefault("eo:cloud_cover", {})["gte"] = float(cloud_min)
 
     features = _search_stac(body, max_results)
     return _normalize_features(features)
@@ -450,6 +456,8 @@ def _normalize_features(features: list[dict]) -> list[dict]:
 def read_band_window(
     asset_url: str,
     bbox: tuple[float, float, float, float] | None = None,
+    halo: int = 0,
+    masked: bool = False,
 ) -> "tuple":
     """Đọc COG band từ S3 (no-sign-request) chỉ trong vùng bbox.
 
@@ -505,7 +513,14 @@ def read_band_window(
                     window = from_bounds(
                         west, south, east, north, transform=src.transform
                     )
-                    window = window.round_lengths().round_offsets()
+                    if halo:
+                        import math
+                        from rasterio.windows import Window
+                        left, top = math.floor(window.col_off) - halo, math.floor(window.row_off) - halo
+                        right, bottom = math.ceil(window.col_off + window.width) + halo, math.ceil(window.row_off + window.height) + halo
+                        window = Window(left, top, right-left, bottom-top)
+                    else:
+                        window = window.round_lengths().round_offsets()
                     # Giới hạn trong ảnh (tránh đọc vượt extent -> dataset 0 chiều)
                     window = window.intersection(full)
                     if window.width < 1 or window.height < 1:
@@ -513,11 +528,11 @@ def read_band_window(
                             "Vùng chọn (bbox) không giao với ảnh COG này — "
                             "hãy kiểm tra lại tọa độ điểm."
                         )
-                    data = src.read(1, window=window)
+                    data = src.read(1, window=window, masked=masked)
                     transform = src.window_transform(window)
                     crs = src.crs
                 else:
-                    data = src.read(1)
+                    data = src.read(1, masked=masked)
                     transform = src.transform
                     crs = src.crs
                 return data, transform, crs
@@ -535,6 +550,7 @@ def merge_all_bands(
     assets: dict[str, str],
     out_path: "Path",
     bbox: tuple[float, float, float, float] | None = None,
+    output_grid: dict | None = None,
 ) -> list[str]:
     """Ghép các band COG thành một GeoTIFF đa lớp (kiểu GEE band order).
 
@@ -549,6 +565,25 @@ def merge_all_bands(
     band_order = [b for b in ("B02", "B03", "B04", "B08", "SCL") if b in assets]
     if not band_order:
         raise ValueError("Không có band COG nào khả dụng trong assets")
+
+    if output_grid is not None:
+        import rasterio
+        from .raster_grid import grid_profile, write_grid_band
+        with rasterio.open(out_path, "w", **grid_profile(output_grid, len(band_order))) as dst:
+            for index, band in enumerate(band_order, 1):
+                arr, transform, crs = read_band_window(assets[band], bbox, halo=1, masked=True)
+                arr = np.ma.asarray(arr, dtype="float32")
+                if band != "SCL":
+                    arr = (arr + _BASELINE_OFFSET) / _S2_SCALE
+                with rasterio.MemoryFile() as memory:
+                    with memory.open(driver="GTiff", width=arr.shape[1], height=arr.shape[0],
+                                     count=1, dtype="float32", crs=crs, transform=transform,
+                                     nodata=float("nan")) as source:
+                        source.write(arr.filled(float("nan")), 1)
+                    with memory.open() as source:
+                        write_grid_band(source, dst, output_grid, 1, index, band == "SCL")
+                dst.set_band_description(index, band)
+        return band_order
 
     layers = []
     profile = None

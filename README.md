@@ -27,6 +27,19 @@ git lfs pull
 - Nếu mạng nội bộ yêu cầu CA riêng, bổ sung `vingroup_cas.pem` trên máy;
   `combined_cas.pem` được ứng dụng tạo cục bộ. Không commit chứng chỉ nội bộ.
 
+## Kiểm tra đúng lượt tải và góc xoay
+
+Ảnh đã tải và job Esri cũ không thay đổi khi chỉnh góc trên bản đồ. Sau khi đổi góc cần tìm ảnh/tạo lượt tải mới. Kết quả GEE hiển thị **Góc lưới xuất**; trạng thái Esri hiển thị góc đã lưu của job và cảnh báo khi đó là job bbox Bắc–Nam cũ. GeoTIFF xoay có các hệ số affine ngoài đường chéo khác 0 (trừ góc trùng trục); phần mềm GIS vẫn có thể hiển thị bản đồ hướng Bắc do tôn trọng georeference.
+
+## Chọn ảnh theo khoảng ngày và phần trăm mây
+
+- Mặc định bật **Tự chọn ảnh ít mây nhất**, giữ cách tìm ảnh/composite hiện tại.
+- Tắt tùy chọn để liệt kê Sentinel-2 GEE/CDSE/AWS hoặc Landsat GEE theo ngày bắt đầu–kết thúc (bao gồm cả ngày kết thúc) và khoảng **Mây tối thiểu–tối đa**, mặc định **0–100%**.
+- Kết quả mới nhất trước, 50 ảnh/trang, có ngày chụp, % mây toàn cảnh, vệ tinh/ID và liên kết tải **đúng cảnh đó**, không chạy lại chọn ảnh ít mây nhất. Vùng tải và góc xoay được giữ trong snapshot tìm kiếm.
+- % mây là metadata toàn cảnh, không phải % mây riêng vùng chọn. Cảnh không có metadata mây bị loại khỏi khoảng lọc; 0% là giá trị hợp lệ.
+- Catalogue ngoài GEE có giới hạn an toàn: CDSE tối đa 500 kết quả, AWS tối đa 4.000. Khi chạm giới hạn, giao diện yêu cầu thu hẹp khoảng ngày; không trình bày danh sách bị giới hạn là đầy đủ.
+- **Time series** là chế độ độc lập, vẫn lấy mọi cảnh theo hành vi cũ, không chịu bộ lọc này. Sentinel-1/NICFI/Dynamic World không hiện tùy chọn mây mới.
+
 ## Nguồn dữ liệu
 
 | Dataset | GEE ID | Scale | Cloud mask |
@@ -83,7 +96,11 @@ người dùng chọn tại vị trí đó (revisit 5–16 ngày, nên khoảng 
 ## Esri World Imagery
 
 Panel **Esri World Imagery** hoạt động độc lập với luồng GEE/CDSE, không cần
-khởi tạo Earth Engine. Nhập bbox WGS84 theo thứ tự west, south, east, north
+khởi tạo Earth Engine. Mặc định dùng **Vị trí + bán kính vùng tải**: nhập tọa độ
+hoặc click bản đồ, marker tự cập nhật và khung vuông được vẽ theo bán kính.
+Bán kính 3.000 m tạo bbox khoảng 6 × 6 km; công thức khớp `point_bbox` của GEE.
+Thay tọa độ/bán kính cập nhật khung ngay; pan/zoom bản đồ không đổi vùng tải này.
+Muốn chọn vùng khác, dùng chế độ bbox WGS84 theo thứ tự west, south, east, north
 (hoặc lấy khung bản đồ); để tải theo xã, chọn chế độ xã/phường và chọn đơn vị
 trong danh sách. Tải chạy ở nền, có tiến độ, hủy và tiếp tục/thử lại; trình duyệt
 nhớ job gần nhất qua localStorage. File tải là GeoTIFF RGB EPSG:3857.
@@ -104,7 +121,11 @@ Esri của service); nếu vượt giới hạn cần giảm zoom/vùng tải ho
 cũ khi không có job hoạt động. Không tự xóa ảnh người dùng.
 
 Chỉ một job Esri hoạt động trong mỗi tiến trình server; dùng một worker Uvicorn.
-Trạng thái lưu trong `downloads/esri`; khi server khởi động lại, job chưa xong
+Trạng thái lưu trong `downloads/esri` chỉ khi bắt đầu/kết thúc lượt chạy;
+không ghi file tiến độ sau mỗi tile. Khi đang tải, tiến độ trên giao diện được
+đọc từ RAM. Nếu server dừng đột ngột, số tile tiến độ trong file có thể cũ,
+nhưng cache vẫn được kiểm tra và tái sử dụng khi tiếp tục.
+Khi server khởi động lại, job chưa xong
 được đánh dấu `interrupted` để người dùng tiếp tục. Cache tái sử dụng tile đã
 kiểm tra; vùng ngoài polygon và tile thiếu được đánh dấu bằng raster mask,
 không coi pixel RGB đen là NoData. Không tự ghi đè sản phẩm CLI nếu chưa cho phép.
@@ -133,8 +154,7 @@ kết quả cũ; danh sách phân trang 50 cảnh, không âm thầm giới hạ
 Ngày đầu/cuối đều bao gồm. Lấy mọi asset chứa điểm tâm, kể cả nhiều cảnh cùng
 ngày và mây 100%; không chọn best scene hoặc composite nhiều ngày. % mây là
 metadata toàn cảnh, không phải % mây trong ROI. NICFI vẫn là composite theo kỳ
-của nguồn và phụ thuộc quyền truy cập. Vùng tải là bbox chữ nhật: footprint
-chứa tâm không bảo đảm phủ đủ bbox, phần thiếu coverage giữ nodata.
+của nguồn và phụ thuộc quyền truy cập. Với chế độ point, vùng tải là hình vuông cục bộ quanh tâm; có thể xoay 0–360° theo chiều kim đồng hồ. Góc xoay được giữ xuyên suốt tìm kiếm, preview và liên kết tải; backend trả polygon ROI chính thức và bbox chỉ là bao ngoài. Raster đầu ra xoay cả lưới pixel theo ROI, giữ nguyên CRS/georeference tương ứng; dữ liệu thiếu thật do mây, footprint hoặc nguồn vẫn có thể là nodata. Góc 0°/360° tương thích lưới cũ.
 
 ZIP gồm từng GeoTIFF thành công và `manifest.json`/`manifest.csv` (tham số,
 asset ID, thời gian UTC, bands, scale/units, cloud/orbit/track, lỗi và grid).

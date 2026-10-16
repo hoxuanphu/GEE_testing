@@ -23,7 +23,8 @@ import requests
 from rasterio.transform import Affine
 from rasterio.warp import calculate_default_transform, reproject, Resampling
 
-from .geo import Bbox
+from .geo import Bbox, source_bbox
+from .raster_grid import warp_to_grid
 from .imagery import download_geotiff, load_timeseries_scene, merge_band_tiffs
 
 TTL_SECONDS = 24 * 60 * 60
@@ -228,6 +229,16 @@ def align_timeseries_raster(source: Path, destination: Path, grid: dict | None =
                             *, categorical: bool = False, bands: list[str] | None = None,
                             nodata=None) -> dict:
     """Warp to the first successful scene grid, retaining descriptions and missing coverage."""
+    if grid is not None and "actual_pixel_size_m" in grid:
+        with rasterio.open(source) as src:
+            if bands is not None and src.count != len(bands):
+                raise ValueError("Exported raster bands do not match the search snapshot")
+        warp_to_grid(source, destination, grid, categorical=categorical)
+        if bands:
+            with rasterio.open(destination, "r+") as dst:
+                for index, name in enumerate(bands, 1):
+                    dst.set_band_description(index, name)
+        return grid
     with rasterio.open(source) as src:
         if not src.crs:
             raise ValueError("Raster CRS is missing")
@@ -345,6 +356,7 @@ class TimeSeriesService:
         fatal = None
         try:
             parameters, scenes = self.store._snapshot(job["search_id"])
+            grid = parameters.get("output_grid")
             directory.mkdir(parents=True, exist_ok=True)
             for position, scene in enumerate(scenes):
                 record = {**scene, "file": None, "status": "failed", "error": None,
@@ -360,9 +372,13 @@ class TimeSeriesService:
                         try:
                             image = load_timeseries_scene(scene["asset_id"], parameters["dataset"],
                                                           parameters.get("polarization", "vvvh"))
+                            envelope = Bbox(**parameters["bbox"])
+                            if parameters.get("output_grid"):
+                                envelope = source_bbox(envelope, parameters["scale_m"], parameters["lat"])
                             urls = download_geotiff(image, parameters["dataset"],
-                                                    Bbox(**parameters["bbox"]), parameters["scale_m"])
-                            merge_band_tiffs(urls, raw, categorical=parameters["dataset"] == "dynamic_world")
+                                                    envelope, parameters["scale_m"])
+                            merge_band_tiffs(urls, raw, categorical=parameters["dataset"] == "dynamic_world",
+                                             **({"preserve_masks": True} if parameters.get("output_grid") else {}))
                             break
                         except Exception as exc:
                             # The merge helper already retries HTTP fetches/URL refreshes.

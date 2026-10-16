@@ -179,6 +179,15 @@
     <input id="radius_m" type="number" value="2000" min="100" max="15000" step="100" />
   </div>
 
+  <div id="rotationSelection">
+    <label for="rotation_deg">Góc xoay (độ, chiều kim đồng hồ)</label>
+    <div class="row">
+      <div><input id="rotation_deg" type="number" min="0" max="360" step="1" value="0" inputmode="numeric" /></div>
+      <div><input id="rotation_slider" type="range" min="0" max="360" step="1" value="0" aria-label="Góc xoay (độ)" /></div>
+      <button id="rotation_reset" type="button" style="width:auto; flex:0 0 auto">Đặt lại</button>
+    </div>
+  </div>
+
   <div id="pointMergeSelection">
     <label><input id="merge_scenes" type="checkbox" style="width:auto" /> Ghép nhiều cảnh (bù vùng thiếu / mây)</label>
     <div class="hint">Sentinel-2/Landsat theo vị trí: yêu cầu phủ ≥99% vùng. Ghép ưu tiên pixel ít mây, có thể khác ngày; giữ pixel có mây nếu không có ảnh trong thay thế.</div>
@@ -189,6 +198,21 @@
     <div class="hint" id="timeSeriesHint">Lấy mọi cảnh, không lọc ngưỡng mây; NICFI là composite theo kỳ. Chỉ tải ZIP sau khi xác nhận. ROI là bbox; cảnh chứa tâm không bảo đảm phủ đủ bbox.</div>
   </div>
 
+  <div id="cloudSelection">
+    <label><input id="least_cloud_enabled" type="checkbox" checked style="width:auto" /> Tự chọn ảnh ít mây nhất</label>
+    <div id="cloudRange" hidden>
+      <div class="row">
+        <div><label for="cloud_min">Mây tối thiểu (%)</label><input id="cloud_min" type="number" min="0" max="100" step="1" value="0" /></div>
+        <div><label for="cloud_max">Mây tối đa (%)</label><input id="cloud_max" type="number" min="0" max="100" step="1" value="100" /></div>
+      </div>
+      <div class="hint">Lọc % mây toàn cảnh theo khoảng ngày đã chọn, không phải % mây riêng vùng tải. Ảnh thiếu thông tin mây không nằm trong khoảng lọc.</div>
+    </div>
+  </div>
+  <section id="sceneCatalogResults" hidden aria-label="Danh sách ảnh theo phần trăm mây">
+    <div id="sceneCatalogMeta"></div>
+    <div id="sceneCatalogRows"></div>
+    <div class="row"><button id="sceneCatalogPrev" type="button">Trang trước</button><button id="sceneCatalogNext" type="button">Trang sau</button></div>
+  </section>
   <button id="btnSearch">Tìm ảnh (ít mây nhất)</button>
   <div id="status"></div>
 
@@ -216,10 +240,12 @@
     <h2>Esri World Imagery</h2>
     <label>Vùng tải Esri</label>
     <select id="esriMode">
-      <option value="bbox">Khung tọa độ WGS84</option>
+      <option value="point">Vị trí + bán kính vùng tải</option>
+      <option value="bbox">Khung tọa độ WGS84 (nhập riêng)</option>
       <option value="commune">Xã/phường đang chọn ở trên</option>
     </select>
-    <div id="esriBboxFields">
+    <div id="esriPointInfo" class="hint">Dùng tọa độ và bán kính ở trên. Bán kính 3.000 m tạo khung khoảng 6 × 6 km, không lấy toàn bộ màn hình bản đồ.</div>
+    <div id="esriBboxFields" hidden>
       <label>West, South, East, North (kinh độ / vĩ độ)</label>
       <div class="row">
         <input id="esriWest" type="number" step="any" placeholder="West" aria-label="West" />
@@ -382,6 +408,7 @@ async function setSelectionMode() {
   const administrativeMode = provinceMode || communeMode;
   pointSelection.style.display = administrativeMode ? 'none' : '';
   radiusSelection.style.display = administrativeMode ? 'none' : '';
+  $('rotationSelection').style.display = administrativeMode ? 'none' : '';
   $('provinceSelection').style.display = provinceMode ? '' : 'none';
   $('communeSelection').style.display = communeMode ? '' : 'none';
   updateCompositeVisibility();
@@ -520,7 +547,8 @@ function updateTimeSeriesVisibility() {
     $('selection_mode').value === 'point' && ['sentinel2', 'landsat'].includes($('dataset').value)
     && !$('time_series_enabled').checked ? '' : 'none';
   $('btnSearch').textContent = $('time_series_enabled').checked
-    ? 'Tìm ảnh time series' : 'Tìm ảnh (ít mây nhất)';
+    ? 'Tìm ảnh time series' : ['sentinel2', 'landsat', 's2', 's2aws'].includes($('dataset').value) && !$('least_cloud_enabled').checked
+      ? 'Liệt kê ảnh theo % mây' : 'Tìm ảnh (ít mây nhất)';
 }
 
 async function timeSeriesRequest(url, options = {}) {
@@ -689,14 +717,109 @@ const monthAgo = new Date(today.getTime() - 30 * 864e5);
 $('end_date').value = today.toISOString().slice(0, 10);
 $('start_date').value = monthAgo.toISOString().slice(0, 10);
 
+function rotationValue() {
+  const raw = $('rotation_deg').value.trim();
+  if (!raw) return null;
+  const value = Number(raw);
+  return Number.isFinite(value) && Number.isInteger(value) && value >= 0 && value <= 360 ? value : null;
+}
+
+function pointRoiPolygon() {
+  const lonRaw = $('lon').value.trim(), latRaw = $('lat').value.trim(), radiusRaw = $('radius_m').value.trim();
+  const lon = Number(lonRaw), lat = Number(latRaw), radius = Number(radiusRaw);
+  const rotation = rotationValue();
+  if (![lon, lat, radius, rotation].every(Number.isFinite) || lon < -180 || lon > 180 ||
+      lat <= -85.05112878 || lat >= 85.05112878 || radius <= 0 || radius > 45000) return null;
+  const theta = rotation * Math.PI / 180;
+  const cosLat = Math.max(Math.cos(lat * Math.PI / 180), 1e-6);
+  const points = [[-radius, -radius], [radius, -radius], [radius, radius], [-radius, radius]]
+    .map(([x, y]) => {
+      const east = x * Math.cos(theta) + y * Math.sin(theta);
+      const north = -x * Math.sin(theta) + y * Math.cos(theta);
+      return [lon + east / (111320 * cosLat), lat + north / 111320];
+    });
+  if (points.some(([x, y]) => x < -180 || x > 180 || y < -85.05112878 || y > 85.05112878)) return null;
+  return points.concat([points[0]]);
+}
+
+function pointQuery(lon, lat) {
+  return `lon=${encodeURIComponent(lon)}&lat=${encodeURIComponent(lat)}` +
+    `&radius_m=${encodeURIComponent(Number($('radius_m').value) || 2000)}` +
+    `&rotation_deg=${encodeURIComponent(rotationValue() ?? 0)}`;
+}
+
+function pointDownloadQuery() {
+  return `&lon=${encodeURIComponent($('lon').value)}&lat=${encodeURIComponent($('lat').value)}` +
+    `&radius_m=${encodeURIComponent(Number($('radius_m').value) || 2000)}&rotation_deg=${encodeURIComponent(rotationValue() ?? 0)}`;
+}
+
+function renderResponseRoi(data) {
+  if (!data.roi_geometry || data.selection_mode !== 'point') return;
+  if (roiLayer) map.removeLayer(roiLayer);
+  roiLayer = L.geoJSON(data.roi_geometry, {color: '#38bdf8', weight: 2, fillOpacity: 0.05}).addTo(map);
+  map.fitBounds(roiLayer.getBounds(), {padding: [30, 30]});
+}
+
+function positionBbox() {
+  const polygon = pointRoiPolygon();
+  if (!polygon) return null;
+  const xs = polygon.map(point => point[0]), ys = polygon.map(point => point[1]);
+  return [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
+}
+
+let positionMapFrame = null;
+function updatePositionMap(recenter = true) {
+  if ($('selection_mode').value !== 'point') return;
+  if (positionMapFrame) cancelAnimationFrame(positionMapFrame);
+  positionMapFrame = requestAnimationFrame(() => {
+    positionMapFrame = null;
+    const polygon = pointRoiPolygon();
+    if (roiLayer) { map.removeLayer(roiLayer); roiLayer = null; }
+    if (!polygon) {
+      if (marker) { map.removeLayer(marker); marker = null; }
+      $('coords').textContent = 'Nhập tọa độ, bán kính và góc xoay hợp lệ.';
+      return;
+    }
+    const lat = Number($('lat').value), lon = Number($('lon').value);
+    $('coords').textContent = `${lat.toFixed(5)}, ${lon.toFixed(5)}`;
+    if (marker) marker.setLatLng([lat, lon]);
+    else marker = L.marker([lat, lon]).addTo(map);
+    roiLayer = L.polygon(polygon.map(([x, y]) => [y, x]), {
+      color: '#fbbf24', weight: 2, fillOpacity: 0.08, interactive: false
+    }).addTo(map);
+    if (recenter) map.fitBounds(roiLayer.getBounds(), {padding: [20, 20], maxZoom: 16});
+  });
+}
+
 function setPosition(lat, lon) {
   invalidateTimeSeries();
+  updateCloudSelection();
   $('lat').value = lat.toFixed(5);
   $('lon').value = lon.toFixed(5);
-  $('coords').textContent = `${lat.toFixed(5)}, ${lon.toFixed(5)}`;
-  if (marker) map.removeLayer(marker);
-  marker = L.marker([lat, lon]).addTo(map);
+  updatePositionMap();
 }
+
+for (const id of ['lon', 'lat', 'radius_m']) {
+  $(id).addEventListener('input', () => updatePositionMap());
+  $(id).addEventListener('change', () => updatePositionMap());
+}
+$('rotation_deg').addEventListener('input', () => {
+  const value = $('rotation_deg').value;
+  $('rotation_slider').value = value;
+  invalidateTimeSeries();
+  $('result').style.display = 'none'; $('s1result').style.display = 'none'; $('plan').style.display = 'none';
+  pendingCompositeBody = null;
+  updatePositionMap(false);
+});
+$('rotation_slider').addEventListener('input', () => {
+  $('rotation_deg').value = $('rotation_slider').value;
+  $('rotation_deg').dispatchEvent(new Event('input'));
+});
+$('rotation_reset').addEventListener('click', () => {
+  $('rotation_deg').value = $('rotation_slider').value = '0';
+  $('rotation_deg').dispatchEvent(new Event('input'));
+});
+$('selection_mode').addEventListener('change', () => updatePositionMap());
 
 map.on('click', e => {
   if ($('selection_mode').value === 'point') setPosition(e.latlng.lat, e.latlng.lng);
@@ -718,6 +841,7 @@ function opticalSceneBody(selectionMode, provinceId, communeId, lon, lat) {
     start_date: $('start_date').value,
     end_date: $('end_date').value,
     radius_m: parseFloat($('radius_m').value) || 2000,
+    rotation_deg: rotationValue(),
     merge_scenes: selectionMode === 'point' && ['sentinel2', 'landsat'].includes($('dataset').value)
       && $('merge_scenes').checked
   };
@@ -730,6 +854,75 @@ function opticalSceneBody(selectionMode, provinceId, communeId, lon, lat) {
 }
 
 let pendingCompositeBody = null;
+let sceneCatalog = null;
+let sceneCatalogGeneration = 0;
+function updateCloudSelection() {
+  const supported = ['sentinel2', 'landsat', 's2', 's2aws'].includes($('dataset').value);
+  const timeSeries = $('time_series_enabled').checked && timeSeriesAvailable();
+  $('cloudSelection').hidden = !supported || timeSeries;
+  const listing = supported && !timeSeries && !$('least_cloud_enabled').checked;
+  $('cloudRange').hidden = !listing;
+  $('btnSearch').textContent = listing ? 'Liệt kê ảnh theo % mây' : timeSeries ? 'Tìm chuỗi thời gian' : 'Tìm ảnh (ít mây nhất)';
+  sceneCatalog = null;
+  sceneCatalogGeneration++;
+  $('sceneCatalogResults').hidden = true;
+}
+function renderSceneCatalog(data) {
+  sceneCatalog = data;
+  $('sceneCatalogResults').hidden = false;
+  $('sceneCatalogMeta').textContent = `${data.total} ảnh — ${data.total ? data.offset + 1 : 0}–${data.offset + data.scenes.length}; mây ${data.parameters.cloud_min}–${data.parameters.cloud_max}%` +
+    (data.parameters.truncated ? ' — Đã chạm giới hạn catalogue; thu hẹp khoảng ngày để xem đủ ảnh.' : '');
+  const container = $('sceneCatalogRows'); container.replaceChildren();
+  data.scenes.forEach(scene => {
+    const row = document.createElement('div'); row.style.cssText = 'border-top:1px solid #334155;padding:8px 0;overflow-wrap:anywhere';
+    const label = document.createElement('div');
+    label.textContent = `${scene.date || ''} | Mây: ${scene.cloud_pct == null ? 'không rõ' : scene.cloud_pct + '%'} | ${scene.platform || ''}`;
+    const id = document.createElement('div'); id.textContent = scene.asset_id || scene.name || scene.id;
+    const link = document.createElement('a'); link.textContent = 'Tải ảnh này (GeoTIFF)'; link.href = scene.download_url;
+    link.style.color = '#38bdf8';
+    row.append(label, id, link); container.appendChild(row);
+  });
+  $('sceneCatalogPrev').disabled = data.offset === 0;
+  $('sceneCatalogNext').disabled = data.offset + data.scenes.length >= data.total;
+}
+async function searchSceneCatalog(offset = null) {
+  const token = ++sceneCatalogGeneration;
+  const btn = $('btnSearch'); btn.disabled = true;
+  $('sceneCatalogPrev').disabled = $('sceneCatalogNext').disabled = true;
+  $('status').textContent = 'Đang tìm danh sách ảnh…';
+  try {
+    let response;
+    if (offset !== null && sceneCatalog) {
+      response = await fetch(`/api/scene-catalog/${encodeURIComponent(sceneCatalog.search_id)}?offset=${offset}&limit=50`);
+    } else {
+      const min = $('cloud_min').value.trim(), max = $('cloud_max').value.trim();
+      if (!min || !max || !Number.isFinite(Number(min)) || !Number.isFinite(Number(max)) || Number(min) < 0 || Number(max) > 100 || Number(min) > Number(max))
+        throw new Error('Nhập khoảng mây hợp lệ: 0 ≤ tối thiểu ≤ tối đa ≤ 100.');
+      const mode = $('selection_mode').value;
+      const body = opticalSceneBody(mode, $('province_id').value, $('commune_id').value,
+        mode === 'point' ? Number($('lon').value) : null, mode === 'point' ? Number($('lat').value) : null);
+      body.cloud_min = Number(min); body.cloud_max = Number(max);
+      body.source = $('dataset').value === 's2aws' ? 'aws' : $('s2_source').value;
+      response = await fetch('/api/scene-catalog', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+    }
+    const data = await response.json();
+    if (!response.ok) throw new Error(typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail));
+    if (token !== sceneCatalogGeneration) return;
+    renderSceneCatalog(data);
+    $('status').textContent = data.total ? 'Chọn ảnh cụ thể để tải; không tự chọn lại ảnh ít mây nhất.' : 'Không có ảnh phù hợp khoảng ngày và % mây.';
+  } catch (error) {
+    if (token === sceneCatalogGeneration) $('status').textContent = 'Lỗi: ' + error.message;
+  } finally { btn.disabled = false; }
+}
+$('sceneCatalogPrev').addEventListener('click', () => sceneCatalog && searchSceneCatalog(Math.max(0, sceneCatalog.offset - 50)));
+$('sceneCatalogNext').addEventListener('click', () => sceneCatalog && searchSceneCatalog(sceneCatalog.offset + 50));
+for (const id of ['least_cloud_enabled', 'cloud_min', 'cloud_max', 'dataset', 'selection_mode', 'province_id', 'commune_id', 'start_date', 'end_date', 'lon', 'lat', 'radius_m', 'rotation_deg', 'rotation_slider', 'time_series_enabled', 's2_source']) {
+  $(id).addEventListener('change', updateCloudSelection);
+}
+for (const id of ['lon', 'lat', 'radius_m', 'rotation_deg', 'rotation_slider', 'cloud_min', 'cloud_max']) {
+  $(id).addEventListener('input', updateCloudSelection);
+}
+updateCloudSelection();
 
 $('btnSearch').addEventListener('click', async () => {
   const selectionMode = $('selection_mode').value;
@@ -738,6 +931,9 @@ $('btnSearch').addEventListener('click', async () => {
   const administrativeMode = ['province', 'commune'].includes(selectionMode);
   const lon = administrativeMode ? 0 : parseFloat($('lon').value);
   const lat = administrativeMode ? 0 : parseFloat($('lat').value);
+  if (!isFinite(lon) || !isFinite(lat) || (!administrativeMode && rotationValue() === null)) {
+    $('status').textContent = 'Vui lòng nhập tọa độ và góc xoay hợp lệ (0–360°).'; return;
+  }
   if (!isFinite(lon) || !isFinite(lat)) { $('status').textContent = 'Vui lòng chọn vị trí trước.'; return; }
 
   if (selectionMode === 'province' && !provinceId) {
@@ -760,8 +956,13 @@ $('btnSearch').addEventListener('click', async () => {
       start_date: $('start_date').value,
       end_date: $('end_date').value,
       radius_m: parseFloat($('radius_m').value),
+      rotation_deg: rotationValue(),
       polarization: 'vvvh'
     });
+  }
+
+  if (['sentinel2', 'landsat', 's2', 's2aws'].includes(dataset) && !$('least_cloud_enabled').checked) {
+    return searchSceneCatalog();
   }
 
   if (dataset === 's1') {
@@ -818,6 +1019,13 @@ async function runSceneSearch(body) {
       throw new Error(formatError(err) || 'Query failed');
     }
     const data = await res.json();
+    if (body.selection_mode === 'point' && body.rotation_deg % 360) {
+      const actual = Number(data.rotation_deg);
+      const linked = new URL(data.download_url, location.origin).searchParams.get('rotation_deg');
+      if (!Number.isFinite(actual) || actual !== body.rotation_deg % 360 || Number(linked) !== actual) {
+        throw new Error('Backend/link tải chưa hỗ trợ đúng góc xoay. Tải lại trang và khởi động lại ứng dụng, sau đó tìm ảnh lại.');
+      }
+    }
 
     $('status').textContent = '';
     const cloudTxt = data.cloud_pct >= 0 ? ` · Mây (scene): ${data.cloud_pct}%` : '';
@@ -832,20 +1040,13 @@ async function runSceneSearch(body) {
     $('meta').innerHTML =
       `<b>${data.scene_id.slice(0, 50)}</b><br>` +
       `Ngày: <b>${data.date}</b>${cloudDisplay}${methodTxt}${landCoverTxt}<br>` +
-      `Độ phân giải: ${data.scale_m} m · Băng: ${data.bands.join(', ')}` +
+      `Độ phân giải: ${data.scale_m} m · Băng: ${data.bands.join(', ')} · Góc lưới xuất: ${Number(data.rotation_deg) || 0}°` +
       (data.coverage_pct != null ? ` · Độ phủ: ${data.coverage_pct.toFixed(2)}%` : '');
     if (data.preview_url) { $('preview').src = data.preview_url; }
     $('dl').href = data.download_url;
     $('dl').textContent = 'Tải GeoTIFF';
 
-    if (data.selection_mode === 'point') {
-      if (roiLayer) map.removeLayer(roiLayer);
-      roiLayer = L.rectangle(
-        [[data.bbox.south, data.bbox.west], [data.bbox.north, data.bbox.east]],
-        {color: '#38bdf8', weight: 2, fillOpacity: 0.05}
-      ).addTo(map);
-      map.fitBounds(roiLayer.getBounds(), {padding: [30, 30]});
-    }
+    renderResponseRoi(data);
 
     $('result').style.display = 'block';
   } catch (e) {
@@ -885,6 +1086,7 @@ async function searchS1Gee(lon, lat) {
       start_date: $('start_date').value,
       end_date: $('end_date').value,
       radius_m: parseFloat($('radius_m').value) || 2000,
+      rotation_deg: rotationValue(),
       polarization: 'vvvh'
     };
     const res = await fetch('/api/s1gee/scene', {
@@ -906,14 +1108,7 @@ async function searchS1Gee(lon, lat) {
     $('dl').href = data.download_url;
     $('dl').textContent = 'Tải GeoTIFF (dB)';
 
-    if (selectionMode === 'point') {
-      if (roiLayer) map.removeLayer(roiLayer);
-      roiLayer = L.rectangle(
-        [[data.bbox.south, data.bbox.west], [data.bbox.north, data.bbox.east]],
-        {color: '#38bdf8', weight: 2, fillOpacity: 0.05}
-      ).addTo(map);
-      map.fitBounds(roiLayer.getBounds(), {padding: [30, 30]});
-    }
+    renderResponseRoi(data);
 
     $('result').style.display = 'block';
   } catch (e) {
@@ -927,7 +1122,7 @@ async function searchS1(lon, lat) {
   const btn = $('btnSearch');
   btn.disabled = true; $('status').textContent = 'Đang tìm kiếm trên Copernicus catalogue…';
   try {
-    const q = `/api/s1/scenes?lon=${lon}&lat=${lat}` +
+    const q = `/api/s1/scenes?${pointQuery(lon, lat)}` +
       `&start_date=${$('start_date').value}&end_date=${$('end_date').value}`;
     const res = await fetch(q);
     if (!res.ok) {
@@ -949,12 +1144,12 @@ async function searchS1(lon, lat) {
       const btns = document.createElement('div');
       btns.style.cssText = 'display:flex; gap:6px; flex-shrink:0;';
       const a = document.createElement('a');
-      a.href = `/api/s1/download?product_id=${p.id}&filename=${encodeURIComponent(p.name + '.zip')}`;
+      a.href = `/api/s1/download?product_id=${p.id}&filename=${encodeURIComponent(p.name + '.zip')}` + pointDownloadQuery();
       a.textContent = 'Tải ZIP';
       a.style.cssText = 'background:#059669; color:#fff; text-decoration:none; padding:6px 10px; border-radius:6px; font-weight:600;';
       // GRD ZIP ~1.7 GB vượt ngưỡng proxy 300MB — nút S3 tải theo chunk
       const b = document.createElement('a');
-      b.href = `/api/s1/s3/download?product_id=${p.id}&filename=${encodeURIComponent(p.name + '.zip')}`;
+      b.href = `/api/s1/s3/download?product_id=${p.id}&filename=${encodeURIComponent(p.name + '.zip')}` + pointDownloadQuery();
       b.textContent = 'S3';
       b.title = 'Tải qua S3 eodata theo chunk 250MB — vượt giới hạn proxy 300MB, nhanh hơn ~8x';
       b.style.cssText = 'background:#f59e0b; color:#fff; text-decoration:none; padding:6px 10px; border-radius:6px; font-weight:600;';
@@ -987,7 +1182,7 @@ async function searchS2(lon, lat, source) {
   const btn = $('btnSearch');
   btn.disabled = true; $('status').textContent = 'Đang tìm kiếm Sentinel-2 L2A…';
   try {
-    const q = `/api/s2/scenes?lon=${lon}&lat=${lat}&source=${source}` +
+    const q = `/api/s2/scenes?${pointQuery(lon, lat)}&source=${source}` +
       `&start_date=${$('start_date').value}&end_date=${$('end_date').value}`;
     const res = await fetch(q);
     if (!res.ok) {
@@ -1021,7 +1216,8 @@ async function searchS2(lon, lat, source) {
         const dlLon = $('lon').value || map.getCenter().lng;
         const dlLat = $('lat').value || map.getCenter().lat;
         a.href = `/api/s2/aws/download?product_id=${encodeURIComponent(p.id)}` +
-          `&lon=${dlLon}&lat=${dlLat}&radius_m=${parseFloat($('radius_m').value) || 2000}`;
+          `&lon=${dlLon}&lat=${dlLat}&radius_m=${parseFloat($('radius_m').value) || 2000}` +
+          `&rotation_deg=${rotationValue() ?? 0}`;
         a.textContent = 'Tải GeoTIFF (all bands)';
         a.style.cssText = 'flex-shrink:0; background:#0ea5e9; color:#fff; text-decoration:none; padding:6px 10px; border-radius:6px; font-weight:600;';
         div.appendChild(info); div.appendChild(a);
@@ -1037,7 +1233,8 @@ async function searchS2(lon, lat, source) {
         const dlLon = $('lon').value || map.getCenter().lng;
         const dlLat = $('lat').value || map.getCenter().lat;
         b.href = `/api/s2/bands?product_id=${encodeURIComponent(p.id)}&action=download` +
-          `&lon=${dlLon}&lat=${dlLat}&radius_m=${parseFloat($('radius_m').value) || 2000}`;
+          `&lon=${dlLon}&lat=${dlLat}&radius_m=${parseFloat($('radius_m').value) || 2000}` +
+          `&rotation_deg=${rotationValue() ?? 0}`;
         b.textContent = 'Tải GeoTIFF (bands)';
         b.title = 'Tải B02,B03,B04,B08 từ CDSE ZIP theo từng file (lọt dưới ngưỡng proxy 300 MB)';
         b.style.cssText = 'flex-shrink:0; background:#0ea5e9; color:#fff; text-decoration:none; padding:6px 10px; border-radius:6px; font-weight:600;';
@@ -1276,7 +1473,7 @@ async function searchS3(lon, lat) {
   const btn = $('btnSearch');
   btn.disabled = true; $('status').textContent = 'Đang tìm kiếm Sentinel-3 trên CDSE…';
   try {
-    const q = `/api/s3/scenes?lon=${lon}&lat=${lat}` +
+    const q = `/api/s3/scenes?${pointQuery(lon, lat)}` +
       `&start_date=${$('start_date').value}&end_date=${$('end_date').value}` +
       `&product_type=${$('s3_product_type').value}`;
     const res = await fetch(q);
@@ -1351,7 +1548,7 @@ async function searchS1Slc(lon, lat) {
   const btn = $('btnSearch');
   btn.disabled = true; $('status').textContent = 'Đang tìm SLC trên Copernicus catalogue…';
   try {
-    const q = `/api/s1/slc/scenes?lon=${lon}&lat=${lat}` +
+    const q = `/api/s1/slc/scenes?${pointQuery(lon, lat)}` +
       `&start_date=${$('start_date').value}&end_date=${$('end_date').value}`;
     const res = await fetch(q);
     if (!res.ok) {
@@ -1390,7 +1587,7 @@ async function searchS1Pairs(lon, lat) {
   try {
     const minDays = parseFloat($('min_days').value) || 6;
     const maxDays = parseFloat($('max_days').value) || 48;
-    const q = `/api/s1/pairs?lon=${lon}&lat=${lat}` +
+    const q = `/api/s1/pairs?${pointQuery(lon, lat)}` +
       `&start_date=${$('start_date').value}&end_date=${$('end_date').value}` +
       `&min_days=${minDays}&max_days=${maxDays}`;
     const res = await fetch(q);
@@ -1442,6 +1639,6 @@ async function searchS1Pairs(lon, lat) {
   }
 }
 </script>
-<script src="/esri.js"></script>
+<script src="/esri.js?v=rotated-grid-2"></script>
 </body>
 </html>

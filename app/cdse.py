@@ -189,6 +189,7 @@ def search_s2(
     end_date: str,
     max_results: int = 50,
     cloud_max: float | None = None,
+    cloud_min: float | None = None,
 ) -> list[dict]:
     """Search Sentinel-2 L2A (surface reflectance) products covering (lon, lat).
 
@@ -213,15 +214,18 @@ def search_s2(
         f"OData.CSC.Intersects(area=geography'SRID=4326;{polygon}')"
     )
     if cloud_max is not None:
-        filt += f" and Attributes/OData.CSC.Doubles/any(d:d/Name eq 'cloudCover' and d/LessThanOrEqual eq {float(cloud_max)})"
+        filt += f" and Attributes/OData.CSC.Doubles/any(d:d/Name eq 'cloudCover' and d/Value le {float(cloud_max)})"
+    if cloud_min is not None:
+        filt += f" and Attributes/OData.CSC.Doubles/any(d:d/Name eq 'cloudCover' and d/Value ge {float(cloud_min)})"
     params = {
         "$filter": filt,
         "$orderby": "ContentDate/Start desc",
     }
-    value = _fetch_products(params, max_results, expand=False)
+    value = _fetch_products(params, max_results, expand=True)
     products = []
     for p in value:
         norm = _normalize_product(p, with_metadata=False)
+        norm["cloud_pct"] = next((a.get("Value") for a in p.get("Attributes", []) if a.get("Name") == "cloudCover"), None)
         # Tile MGRS từ tên: S2A_MSIL2A_YYYYMMDDT...T48PWS_...
         m = re.search(r"_T(\d{2}[A-Z]{3})_", p["Name"])
         norm["tile"] = m.group(1) if m else None
@@ -247,6 +251,7 @@ def search_s2_area(
     end_date: str,
     cloud_max: float | None = None,
     max_results: int = 300,
+    cloud_min: float | None = None,
 ) -> list[dict]:
     """Search S2 L2A products intersecting a bbox (province mode).
 
@@ -261,12 +266,15 @@ def search_s2_area(
         f"OData.CSC.Intersects(area=geography'SRID=4326;{_bbox_wkt(bbox)}')"
     )
     if cloud_max is not None:
-        filt += f" and Attributes/OData.CSC.Doubles/any(d:d/Name eq 'cloudCover' and d/LessThanOrEqual eq {float(cloud_max)})"
+        filt += f" and Attributes/OData.CSC.Doubles/any(d:d/Name eq 'cloudCover' and d/Value le {float(cloud_max)})"
+    if cloud_min is not None:
+        filt += f" and Attributes/OData.CSC.Doubles/any(d:d/Name eq 'cloudCover' and d/Value ge {float(cloud_min)})"
     params = {"$filter": filt, "$orderby": "ContentDate/Start desc"}
-    value = _fetch_products(params, max_results, expand=False)
+    value = _fetch_products(params, max_results, expand=True)
     products = []
     for p in value:
         norm = _normalize_product(p, with_metadata=False)
+        norm["cloud_pct"] = next((a.get("Value") for a in p.get("Attributes", []) if a.get("Name") == "cloudCover"), None)
         m = re.search(r"_T(\d{2}[A-Z]{3})_", p["Name"])
         norm["tile"] = m.group(1) if m else None
         products.append(norm)

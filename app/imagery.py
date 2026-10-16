@@ -86,7 +86,7 @@ def _coverage_fraction(image: ee.Image, dataset: str, roi: ee.Geometry) -> ee.Nu
     ).get("valid"))
 
 
-def _point_optical_scene(dataset, roi, start, end, max_cloud_pct, merge_scenes):
+def _point_optical_scene(dataset, roi, start, end, max_cloud_pct, merge_scenes, clip_output=True):
     coll, cloud_prop, _ = _optical_collection(dataset, start, end)
     coll = coll.filterBounds(roi).filter(ee.Filter.lt(cloud_prop, max_cloud_pct))
     if coll.size().getInfo() == 0:
@@ -118,7 +118,9 @@ def _point_optical_scene(dataset, roi, start, end, max_cloud_pct, merge_scenes):
     # mosaic gives priority to the LAST scene; clear pixels always beat cloudy fallbacks.
     ranked = scored.sort("roi_clear_fraction")
     mask_clouds = _mask_s2_clouds if dataset == "sentinel2" else _mask_landsat_clouds
-    image = ranked.mosaic().blend(ranked.map(mask_clouds).mosaic()).clip(roi)
+    image = ranked.mosaic().blend(ranked.map(mask_clouds).mosaic())
+    if clip_output:
+        image = image.clip(roi)
     coverage = 100 * _coverage_fraction(image, dataset, roi).getInfo()
     if coverage < 99:
         raise InsufficientCoverageError(
@@ -236,13 +238,15 @@ def _landsat_scale(img: ee.Image) -> ee.Image:
     return img.addBands(optical, None, True)
 
 
-def _s2_collection(start: str, end: str) -> ee.ImageCollection:
-    return (
+def _s2_collection(start: str, end: str, platform: str = "ALL") -> ee.ImageCollection:
+    collection = (
         ee.ImageCollection(S2_COLLECTION)
         .filterDate(start, end)
         .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 90))
-        .map(_scale_s2)
     )
+    if platform != "ALL":
+        collection = collection.filter(ee.Filter.eq("SPACECRAFT_NAME", platform))
+    return collection.map(_scale_s2)
 
 
 def _landsat_collection(collection_id: str, start: str, end: str) -> ee.ImageCollection:
@@ -405,19 +409,30 @@ def timeseries_collection(
 def list_timeseries_scenes(
     dataset: str, lon: float, lat: float, start_date: str, end_exclusive: str,
     polarization: str = "vvvh",
+    roi: ee.Geometry | None = None,
+    cloud_min: float | None = None,
+    cloud_max: float | None = None,
 ) -> list[dict]:
-    """Return JSON metadata for every scene whose footprint contains the center."""
+    """Return scene metadata; optional scene-cloud filters apply before enumeration."""
     point = ee.Geometry.Point([lon, lat])
-    collection = timeseries_collection(dataset, start_date, end_exclusive, polarization).filterBounds(point)
-    collection = collection.map(
-        lambda image: image.set("timeseries:contains_center", image.geometry().contains(point, ee.ErrorMargin(1)))
-    ).filter(ee.Filter.eq("timeseries:contains_center", True))
+    collection = timeseries_collection(dataset, start_date, end_exclusive, polarization).filterBounds(
+        roi if roi is not None else point)
+    if roi is None:
+        collection = collection.map(
+            lambda image: image.set("timeseries:contains_center", image.geometry().contains(point, ee.ErrorMargin(1)))
+        ).filter(ee.Filter.eq("timeseries:contains_center", True))
     source_properties = ["SPACECRAFT_NAME", "SPACECRAFT_ID", "LANDSAT_PRODUCT_ID",
                          "MGRS_TILE", "WRS_PATH", "WRS_ROW", "cadence",
                          "orbitProperties_pass", "relativeOrbitNumber_start",
                          "orbitNumber_start", "platform_number", "instrumentMode",
                          "transmitterReceiverPolarisation"]
     cloud_property = {"sentinel2": "CLOUDY_PIXEL_PERCENTAGE", "landsat": "CLOUD_COVER"}.get(dataset)
+
+    if cloud_property and (cloud_min is not None or cloud_max is not None):
+        if cloud_min is not None:
+            collection = collection.filter(ee.Filter.gte(cloud_property, cloud_min))
+        if cloud_max is not None:
+            collection = collection.filter(ee.Filter.lte(cloud_property, cloud_max))
 
     def metadata(value):
         image = ee.Image(value)
@@ -468,13 +483,14 @@ def best_s1_scene(
     start_date: str,
     end_date: str,
     polarization: str = "vvvh",
+    roi: ee.Geometry | None = None,
 ) -> SceneInfo | None:
     """Return the newest S1 GRD scene covering the point within the date range.
 
     Unlike optical, SAR penetrates clouds, so we simply take the most recent
     scene (no cloud scoring needed).
     """
-    point = ee.Geometry.Point([lon, lat])
+    point = roi if roi is not None else ee.Geometry.Point([lon, lat])
     coll = _s1_collection(start_date, end_date, polarization).filterBounds(point)
     best = _pick_s1_covering(coll, point)
     if best is None:
@@ -783,7 +799,7 @@ def _estimate_median_seconds(
 
 
 def _optical_collection(
-    dataset: str, start: str, end: str
+    dataset: str, start: str, end: str, platform: str = "ALL"
 ) -> tuple[ee.ImageCollection, str | None, float]:
     """Return (collection, cloud metadata property, scale) for a dataset."""
     if dataset == "sentinel2":
@@ -1169,17 +1185,19 @@ def best_scene(
     end_date: str,
     max_cloud_pct: float = 60.0,
     merge_scenes: bool = False,
+    roi: ee.Geometry | None = None,
 ) -> SceneInfo | None:
     """Select ≥99% coverage for optical point ROIs, optionally merging scenes."""
     bbox = point_bbox(lon, lat, radius_m)
+    selection = roi if roi is not None else bbox_to_ee_geom(bbox)
     if dataset in ("sentinel2", "landsat"):
         return _point_optical_scene(
-            dataset, bbox_to_ee_geom(bbox), start_date, end_date,
-            max_cloud_pct, merge_scenes,
+            dataset, selection, start_date, end_date,
+            max_cloud_pct, merge_scenes, **({"clip_output": False} if roi is not None else {}),
         )
     return best_scene_for_roi(
         dataset,
-        bbox_to_ee_geom(bbox),
+        selection,
         start_date,
         end_date,
         max_cloud_pct=max_cloud_pct,
@@ -1444,6 +1462,7 @@ def merge_band_tiffs(
     out_path,
     *,
     categorical: bool = False,
+    preserve_masks: bool = False,
 ) -> None:
     """Download per-band GeoTIFFs and merge them into one multi-band file.
 
@@ -1549,8 +1568,10 @@ def merge_band_tiffs(
             try:
                 # rio_merge defaults to nearest-neighbour, which is required
                 # for class labels and is also safe for the existing downloads.
-                arr, transform = rio_merge(srcs)
+                arr, transform = rio_merge(srcs, **({"nodata": float("nan"), "dtype": "float32"} if preserve_masks and not categorical else {}))
                 profile = srcs[0].profile.copy()
+                if preserve_masks and not categorical:
+                    profile.update(dtype="float32", nodata=float("nan"))
                 if categorical:
                     arr = arr.astype("uint8", copy=False)
                     profile.update(dtype="uint8", nodata=DYNAMIC_WORLD_NODATA)
@@ -1580,8 +1601,15 @@ def merge_band_tiffs(
                         f"Band {band} has size {src.width}x{src.height}, "
                         f"expected {width}x{height}"
                     )
-                stack[i] = src.read(1).astype(dtype)
+                if preserve_masks:
+                    fill = DYNAMIC_WORLD_NODATA if categorical else float("nan")
+                    stack[i] = src.read(1, masked=True).astype(dtype).filled(fill)
+                else:
+                    stack[i] = src.read(1).astype(dtype)
 
+        if preserve_masks:
+            profile.pop("blockxsize", None)
+            profile.pop("blockysize", None)
         profile.update(
             count=len(band_files),
             dtype="uint8" if categorical else "float32",
@@ -1590,6 +1618,9 @@ def merge_band_tiffs(
         )
         if categorical:
             profile.update(nodata=DYNAMIC_WORLD_NODATA)
+        elif preserve_masks:
+            nodata = float("nan")
+            profile.update(nodata=nodata)
         with rasterio.open(out_path, "w", **profile) as dst:
             dst.write(stack)
             for i, (band, _p) in enumerate(band_files, start=1):
