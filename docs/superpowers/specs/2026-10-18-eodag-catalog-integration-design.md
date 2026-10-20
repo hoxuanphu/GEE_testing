@@ -2,9 +2,9 @@
 
 **Date:** 2026-10-18
 
-**Status:** Architecture approved; detailed specification awaiting user review
+**Status:** Draft for review; implementation is not authorized until the MVP scope is approved
 
-**Scope:** Optional EODAG catalogue, metadata, collection discovery, and quicklook support
+**Scope:** Optional EODAG catalogue search and normalized metadata only in the first release; provider discovery, quicklook, and download handoff are gated follow-up releases
 
 ## Problem
 
@@ -14,22 +14,32 @@ EODAG can add provider configuration, common product metadata, collection discov
 
 ## Goals
 
+### MVP release: catalogue search and snapshots only
+
 1. Add an optional EODAG backend for catalogue search and normalized metadata.
 2. Support explicit Earth Search and Planetary Computer provider selection for Sentinel-2 L2A, with provider identity preserved in every result.
-3. Expose configured EODAG collections and provider capabilities without exposing credentials or transport URLs.
-4. Proxy provider quicklooks through the backend when a quicklook is available.
-5. Preserve current search semantics: inclusive dates, cloud bounds, 50-result pages, provider limits, `truncated` warnings, immutable snapshots, and missing metadata represented as `null`.
-6. Keep all existing GEE, CDSE, AWS, raster, mosaic, ZIP, and time-series download paths unchanged unless a later compatibility-tested feature explicitly opts into them.
-7. Allow EODAG to be disabled or absent with no import or startup failure in the existing installation.
+3. Preserve current search semantics: inclusive dates, cloud bounds, 50-result pages, provider limits, `truncated` warnings, immutable snapshots, and missing metadata represented as `null`.
+4. Add provider-aware capabilities with `download_capabilities.status=unsupported` for every EODAG result; MVP adds no EODAG download, quicklook, or provider discovery route.
+5. Keep all existing GEE, CDSE, AWS, raster, mosaic, ZIP, and time-series download paths unchanged.
+6. Allow EODAG to be disabled or absent with no import or startup failure in the existing installation.
 
-## Non-goals
+### Gated follow-up releases
+
+7. Add provider/collection discovery only after the MVP search contract is stable.
+8. Add bounded quicklook proxy only after a separate security review and provider smoke tests.
+9. Add Earth Search same-item download handoff only after identity-verification tests and live smoke evidence.
+10. Treat EODAG-native downloading and Planetary Computer downloading as separate designs, not extensions of the MVP.
+
+## Non-goals for the MVP
 
 - Replacing `app/cdse.py` or `app/aws_stac.py`.
-- Routing EODAG products into the current CDSE/AWS download endpoints by guessing that two IDs or collections are equivalent. Reusing the existing Earth Search downloader is allowed only after verifying the same provider-native item, as specified below.
-- Adding EODAG downloading, `.SAFE` construction, HTTP Range handling, COG crop, mosaic, or GEE export in this version.
+- Routing EODAG products into any existing download endpoint.
+- Adding EODAG downloading, quicklook proxying, provider discovery, `.SAFE` construction, HTTP Range handling, COG crop, mosaic, or GEE export.
 - Replacing GEE imagery selection, cloud masking, composites, time-series jobs, raster grids, or administrative boundary logic.
 - Automatic fallback from a user-selected EODAG provider to another provider. A search snapshot must remain reproducible and provider-specific.
 - Treating a missing cloud value, footprint, orbit, processing level, or quicklook as a value that can be inferred safely.
+
+Follow-up releases may address quicklook, discovery, and download only under the gates defined in the Goals and Rollout sections.
 
 ## Architecture
 
@@ -47,7 +57,7 @@ Existing scene-catalog API
                                   +-- quicklook fetch
 ```
 
-`app/eodag_adapter.py` is the only application module allowed to import EODAG. It owns EODAG initialization, provider allowlisting, collection mapping, search pagination, metadata conversion, product re-resolution, and quicklook retrieval. The adapter exposes application-shaped dictionaries and a small protocol so `scene_catalog.py` does not depend on EODAG product internals.
+`app/eodag_adapter.py` is the only application module allowed to import EODAG. In the MVP it owns lazy initialization, provider allowlisting, collection mapping, bounded search pagination, and metadata conversion. Product re-resolution, quicklook retrieval, and download handoff are explicitly outside the MVP and must not be added to this adapter until their follow-up release is approved. The adapter exposes application-shaped dictionaries and a small protocol so `scene_catalog.py` does not depend on EODAG product internals.
 
 EODAG is optional. The base `requirements.txt` remains sufficient for the existing application. A separate `requirements-eodag.txt` includes the base requirements and pins `eodag==4.9.2`, the release whose provider configuration and API were checked for this design. Installation is verified in a separate virtual environment before adopting that pin; a dependency or provider incompatibility blocks feature enablement. Installation must not alter the user's current virtual environment during implementation. The adapter must import EODAG lazily and report a clear disabled/unavailable status instead of failing `import app.main`.
 
@@ -62,10 +72,10 @@ EODAG_ENABLED=false
 EODAG_PROVIDERS=earth_search,planetary_computer
 EODAG_CONFIG_FILE=
 EODAG_MAX_RESULTS=4000
-EODAG_QUICKLOOK_MAX_BYTES=10485760
+EODAG_QUICKLOOK_MAX_BYTES=10485760  # reserved for the quicklook follow-up release
 ```
 
-`EODAG_ENABLED=false` is the compatibility default. `EODAG_PROVIDERS` is an administrator-controlled allowlist, restricted in this release to `earth_search` and `planetary_computer`. A request can select one allowlisted provider but cannot extend that allowlist. Provider-specific authentication and configuration remain in the explicitly configured EODAG file or environment variables; they are never accepted from the browser and never returned in API responses. EODAG configuration/cache files belong in an application-owned directory under `downloads/eodag`; the feature must not rewrite a user's unrelated global EODAG configuration. `EODAG_MAX_RESULTS` is validated in the range 1–4000 and applies only to explicit EODAG requests.
+`EODAG_ENABLED=false` is the compatibility default. The MVP reads only `EODAG_ENABLED`, `EODAG_PROVIDERS`, `EODAG_CONFIG_FILE`, and `EODAG_MAX_RESULTS`; `EODAG_QUICKLOOK_MAX_BYTES` is reserved and has no MVP behavior. `EODAG_PROVIDERS` is an administrator-controlled allowlist, restricted in this release to `earth_search` and `planetary_computer`. A request can select one allowlisted provider but cannot extend that allowlist. Provider-specific authentication and configuration remain in the explicitly configured EODAG file or environment variables; they are never accepted from the browser and never returned in API responses. EODAG configuration/cache files belong in an application-owned directory under `downloads/eodag`; the feature must not rewrite a user's unrelated global EODAG configuration. `EODAG_MAX_RESULTS` is validated in the range 1–4000 and applies only to explicit EODAG requests.
 
 The application's logical product is `sentinel2_l2a`. EODAG 4.9.2 maps Earth Search to `S2_MSI_L2A_COG` and Planetary Computer to `S2_MSI_L2A`; both use native collection `sentinel-2-l2a`. These identifiers are separate fields, not interchangeable collection IDs. The adapter records the actual provider, native collection, EODAG collection ID, and native item ID in each result. It does not assume that an Earth Search COG and a Planetary Computer asset have identical processing baseline, band layout, SCL values, or scaling.
 
@@ -96,10 +106,10 @@ EODAG results are converted to the existing scene-catalog row shape and these ad
   "bbox": [106.0, 10.0, 106.2, 10.2],
   "footprint": null,
   "asset_keys": ["B02", "B03", "B04", "B08", "SCL"],
-  "quicklook_available": true,
+  "quicklook_available": false,
   "download_capabilities": {
     "status": "unsupported",
-    "reason": "provider_download_not_integrated"
+    "reason": "eodag_mvp_catalogue_only"
   }
 }
 ```
@@ -120,7 +130,7 @@ Cloud bounds are pushed down only through provider queryables verified to expres
 
 Explicitly request descending sensing-time order from the selected provider before applying any result cap; Earth Search's checked EODAG configuration otherwise defaults to ascending order. Sort locally again for deterministic ties, but do not assume sorting a capped ascending subset recovers the newest acquisitions. If provider-side ordering cannot be established, report that limitation and mark capped/budget-limited results partial.
 
-The adapter uses 100 items per provider page and performs pagination until 4000 qualifying unique results (or a configured lower cap), confirmed exhaustion, a repeated-page condition, 200 pages, or a 120-second operation budget. Configure each provider's request timeout to at most the remaining operation budget and 30 seconds; this must constrain total elapsed time as well as socket inactivity, and no retry may outlive the operation budget. Provider page limits (500 Earth Search, 1000 Planetary Computer in the checked release) are distinct from the application result cap. De-duplicate by `(provider, native collection, native item ID)` only; do not merge acquisitions across providers or processing versions. The response records:
+The adapter uses 100 items per provider page and performs pagination until 4000 qualifying unique results (or a configured lower cap), confirmed exhaustion, a repeated-page condition, 200 pages, or a 120-second operation budget. Implement the budget with a monotonic deadline: before every provider call and page transition, compute `remaining = deadline - monotonic()` and fail or mark the result partial when `remaining <= 0`; pass `min(30, remaining)` to the provider request timeout. No retry or page transition may outlive the operation budget. Provider page limits (500 Earth Search, 1000 Planetary Computer in the checked release) are distinct from the application result cap. De-duplicate by `(provider, native collection, native item ID)` only; do not merge acquisitions across providers or processing versions. The response records:
 
 ```json
 {
@@ -139,9 +149,9 @@ For EODAG responses, `total` is the number of qualifying rows in the stored snap
 
 Results are filtered again in the adapter/catalogue boundary. A scene with an unknown cloud value is excluded from a cloud-range result, matching the current catalogue behavior; a valid `0` value remains valid. Results are sorted newest-first using timestamp, date, and stable product ID. The stored result order is immutable and page URLs continue to reference snapshot indices, so a later provider query cannot change what a user selected.
 
-## Collection and provider discovery API
+## Collection and provider discovery API (follow-up release, not MVP)
 
-Add these read-only endpoints:
+Do not add these endpoints in the MVP. After the MVP search contract and provider smoke tests are accepted, add these read-only endpoints:
 
 - `GET /api/eodag/status` returns `{enabled, installed, ready, configured_providers, supported_sources}` and a sanitized error code/message when unavailable. It is a local status check, performs no remote discovery, and uses package metadata to determine installation without constructing the SDK when disabled.
 - `GET /api/eodag/providers` returns only allowlisted provider names, descriptions, availability state, and supported logical collections.
@@ -151,9 +161,9 @@ Collection discovery lists only the two allowlisted providers. It may show other
 
 Discovery is cached per provider for 15 minutes, with one refresh at a time per provider. On refresh failure, a previous successful entry is returned with `stale=true`, its fetch time, and a sanitized warning. Without a previous entry, the explicit provider operation returns HTTP 502. Error states are cached for 30 seconds to prevent repeated failed requests. Disabled discovery endpoints return HTTP 503; status remains available. A failed provider must not make other providers or the existing CDSE/AWS endpoints unavailable. Errors contain provider and operation names but no request headers, tokens, signed URLs, or credential values.
 
-## Quicklook API
+## Quicklook API (follow-up release, not MVP)
 
-Add `GET /api/scene-catalog/{search_id}/quicklook/{index}`. It resolves the scene from the immutable snapshot, checks that `source=eodag` and `quicklook_available=true`, then asks the adapter to resolve the exact product by provider, EODAG collection, native collection, and native product ID. It never trusts a URL supplied by the client or a URL saved in the snapshot. Provider, collection, and item identity must match again after restart; a replacement/reprocessed item must not be substituted.
+Do not add a quicklook route, UI action, bounded image reader, or provider re-resolution in the MVP. After a separate security review and provider smoke tests, add `GET /api/scene-catalog/{search_id}/quicklook/{index}`. It resolves the scene from the immutable snapshot, checks that `source=eodag` and `quicklook_available=true`, then asks the adapter to resolve the exact product by provider, EODAG collection, native collection, and native product ID. It never trusts a URL supplied by the client or a URL saved in the snapshot. Provider, collection, and item identity must match again after restart; a replacement/reprocessed item must not be substituted.
 
 Fetch the provider's quicklook/thumbnail reference through an adapter-owned bounded HTTP reader; do not call an SDK download method that writes unbounded data before the application can check its size. Use EODAG authentication plugins only when that reference requires signing; signed references live only for the current operation. If no supported image reference can be fetched, report quicklook unavailable without falling back to a full-resolution band download.
 
@@ -162,6 +172,8 @@ The reader allows only configured HTTPS provider/asset hosts, rejects local/priv
 The UI shows an optional `Xem nhanh toàn cảnh` action for rows with `quicklook_available=true`; this does not change the existing preview button. Fetch only after user interaction, never eagerly for all 4000 rows. A quicklook error remains local to the row and does not clear results or trigger another search.
 
 ## Existing download and processing guarantees
+
+For the MVP, every EODAG row is catalogue-only and has no download URL. The MVP must not re-resolve products, proxy quicklooks, or redirect to CDSE/AWS/GEE download routes. Planetary Computer and Earth Search therefore both return `download_capabilities.status=unsupported` with reason `eodag_mvp_catalogue_only`.
 
 When EODAG is disabled, existing endpoints, response schemas, provider defaults, limits, and tests remain unchanged. When EODAG is enabled, only requests explicitly selecting `source=eodag` use it. A user selecting CDSE or AWS continues to use the current downloader, including CDSE Nodes band downloads, CDSE S3 object listing, HTTP Range chunking, `.SAFE` ZIP streaming, AWS COG window reads, province mosaics, and rotated grids.
 
@@ -173,9 +185,9 @@ For legacy snapshots without capabilities, preserve the current download URL and
 
 The current GEE `imagery.py`, `raster_grid.py`, `timeseries.py`, `admin_boundaries.py`, `commune_boundaries.py`, and raster export code are outside this change. A future Planetary Computer or EODAG download experiment requires a separate provider-specific design and compatibility checks.
 
-## Minimal UI integration
+## Minimal UI integration (follow-up release, not MVP)
 
-Keep the existing map, form layout, dataset choices, automatic best-scene mode, time-series mode, and legacy preview/download controls. Add optional controls next to the current Sentinel-2 catalogue source choice only when status is ready and manual scene listing is active: an EODAG provider selector and a supported collection selector populated by discovery. The product name identifies the provider and clearly marks Planetary Computer as catalogue/quicklook only. Do not replace the existing `s2_source` options used by `/api/s2/scenes` or province mosaic flows.
+Do not change the UI in the MVP. Keep the existing map, form layout, dataset choices, automatic best-scene mode, time-series mode, and legacy preview/download controls unchanged. After the MVP API and smoke tests are accepted, add optional controls next to the current Sentinel-2 catalogue source choice only when status is ready and manual scene listing is active: an EODAG provider selector and a supported collection selector populated by discovery. The product name identifies the provider and clearly marks catalogue-only results. Do not replace the existing `s2_source` options used by `/api/s2/scenes` or province mosaic flows.
 
 Put additive behavior in `static/eodag.js`, with small integration hooks in `static/index.html`. On status error, timeout, or disabled feature, omit the new controls and preserve existing rendering. Result rows show provider, processing level if known, capability-appropriate actions, missing metadata as `Không có dữ liệu`, and a warning for partial results. Insert provider text using `textContent`, not interpolated HTML. Preserve selection snapshots when users change source or ROI, and prevent a stale search/discovery/quicklook response from replacing a newer selection. Returning to an old result uses the saved provider and ROI rather than the current controls. No changes belong in the untracked `frontend/` analysis work.
 
@@ -194,41 +206,53 @@ Put additive behavior in `static/eodag.js`, with small integration hooks in `sta
 
 All tests use mocks or local fixtures; CI does not require provider credentials or network access.
 
-1. Adapter tests verify lazy import, disabled behavior, concurrent provider isolation, version-specific collection/native-ID mapping, inclusive dates, bbox geometry, cloud minimum/maximum, zero cloud, malformed/missing cloud/footprint, UTC normalization, duplicate IDs across pages, repeated pages, a matching scene appearing only on a later page, cap/page/deadline/partial-failure warnings, and no automatic fallback. Include a result set exceeding 1000 items to disprove an accidental per-page total cap.
-2. Contract tests verify that EODAG rows contain the canonical schema, no signed URL survives snapshot creation, and provider/collection/product identity is preserved.
-3. Discovery tests verify provider isolation, sanitized failures, collection capability output, and discovery caching.
-4. Quicklook tests verify snapshot-index lookup, restart re-resolution, identity mismatch, chunked bodies without content length, oversize images, private destinations/redirects, image format/dimension limits, missing quicklook behavior, cleanup, and rejection of client-supplied URLs. Assert no full raster download or GEE initialization occurs.
-5. Existing `tests/test_scene_catalog.py`, CDSE/AWS tests, API tests, imagery tests, raster tests, and time-series tests must remain green without EODAG installed.
-6. Capability tests verify Earth Search same-item handoff with original ROI/rotation, missing/mismatched baseline rejection, native-ID mismatch, Planetary Computer returning no download link and HTTP 409 on direct download, and legacy snapshots remaining usable after restart and with EODAG disabled.
-7. UI tests using local API fixtures cover optional installation visibility, provider/collection selection, stale responses, missing fields, quicklook failure, partial-result warnings, and capability-aware actions. Existing sources remain usable if status/discovery requests fail.
-8. An opt-in smoke test, documented separately from unit tests, checks one Earth Search and one Planetary Computer search/quicklook with the real pinned SDK in an isolated configured environment. Record provider, EODAG/native collection, native item ID, normalized metadata, pagination behavior, and whether a quicklook is available; do not download full scenes. Enabling Earth Search handoff also requires a smoke check of native identity verification. A failed live check is reported explicitly and blocks promotion of the affected capability, not the old application.
+1. MVP adapter tests verify lazy import, disabled behavior, concurrent provider isolation, version-specific collection/native-ID mapping, inclusive dates, bbox geometry, cloud minimum/maximum, zero cloud, malformed/missing cloud/footprint, UTC normalization, duplicate IDs across pages, repeated pages, a matching scene appearing only on a later page, cap/page/deadline/partial-failure warnings, and no automatic fallback. Include a result set exceeding 1000 items to disprove an accidental per-page total cap.
+2. MVP contract tests verify that EODAG rows contain the canonical schema, `quicklook_available=false`, `download_capabilities.status=unsupported`, no signed URL survives snapshot creation, and provider/collection/product identity is preserved.
+3. MVP integration tests verify `source=eodag` validation, explicit provider/collection mapping, no EODAG call on legacy requests, no download URL on EODAG pages, and no EODAG snapshot dispatch to CDSE/AWS/GEE download routes.
+4. Existing `tests/test_scene_catalog.py`, CDSE/AWS tests, API tests, imagery tests, raster tests, and time-series tests must remain green without EODAG installed.
+5. Follow-up discovery tests are deferred until the discovery release and must verify provider isolation, sanitized failures, collection capability output, and discovery caching.
+6. Follow-up quicklook and capability tests are deferred until their releases; they must cover the security and identity checks specified in those sections.
+7. An opt-in MVP smoke test, documented separately from unit tests, checks one Earth Search and one Planetary Computer search with the real pinned SDK in an isolated configured environment. Record provider, EODAG/native collection, native item ID, normalized metadata, pagination behavior, and completion/truncation reason; do not fetch quicklooks or download full scenes. A failed live check blocks only EODAG enablement, not the old application.
 
 Acceptance requires a fresh baseline of the current working tree (the earlier review observed 153 passing tests; this count is historical and must be re-measured at implementation time). Run the full old/new suite in two isolated environments: base dependencies with EODAG absent, and optional dependencies with EODAG installed. Verify both feature-disabled and feature-enabled paths, SDK-specific tests against the pinned SDK, `pip check`, and application startup on Windows/Python 3.12. No existing source may change behavior merely because `requirements-eodag.txt` is installed. Mock tests alone cannot establish that the pinned SDK calls and pagination work.
 
-For fixed local fixtures, legacy default searches must make zero EODAG calls, perform no EODAG startup discovery, preserve response semantics and stored snapshot paging, and keep raster band order/units/masks/nodata/grid output identical. Catalogue pages continue to load from SQLite without provider re-query. The new source adds provider-specific metadata, discovery, and quicklook; it does not replace a legacy function with a reduced-capability path. No global latency or data-quality improvement is claimed without measurements.
+For fixed local fixtures, legacy default searches must make zero EODAG calls, perform no EODAG startup discovery, preserve response semantics and stored snapshot paging, and keep raster band order/units/masks/nodata/grid output identical. Catalogue pages continue to load from SQLite without provider re-query. The MVP adds only provider-specific catalogue metadata and does not replace a legacy function with a reduced-capability path. No global latency or data-quality improvement is claimed without measurements.
 
 ## Rollout
 
-1. Ship the adapter, optional dependency file, configuration, endpoints, tests, and documentation with EODAG disabled.
-2. Enable Earth Search in a local environment and compare result counts, dates, cloud values, tile IDs, footprints, and quicklooks against the existing AWS path without changing the default UI source.
-3. Enable Planetary Computer separately and record provider-specific metadata differences; do not merge results across providers in one snapshot.
-4. Only after the comparison is stable may the UI expose an optional EODAG source selector. If the smoke evidence is absent, keep the feature disabled by default and document the remaining enablement check. Existing source choices remain the defaults.
-5. EODAG download support is a separate design and release decision.
+1. Ship only the MVP adapter, optional dependency file, configuration, API dispatch, tests, and documentation with EODAG disabled. Do not add discovery, quicklook, download handoff, or UI controls.
+2. In an isolated optional-dependency environment, run the two provider search smoke checks and record result identity, normalized metadata, pagination, and completion/truncation behavior.
+3. Compare Earth Search catalogue results with the existing AWS path without changing the default UI source; differences are documented, not silently reconciled.
+4. Enable EODAG only after the MVP smoke evidence and full two-environment test suite pass. If either provider fails, keep that provider disabled in `EODAG_PROVIDERS`; the old application remains unchanged.
+5. Propose discovery, quicklook, and download handoff as separate reviewable releases with their own acceptance evidence. EODAG download support remains a separate design and release decision.
 
 ## Implementation boundary
 
-Expected implementation files are `app/eodag_adapter.py` (SDK boundary), `app/catalog_models.py` (application contracts), `app/eodag_api.py` (status/discovery routes), `app/catalog_quicklook.py` (bounded image reader), `app/scene_catalog.py` (optional dispatch/snapshot actions), `app/main.py` (route registration before the static mount), `static/eodag.js`, minimal hooks in `static/index.html`, `.env.example`, `README.md`, `requirements-eodag.txt`, and focused adapter/catalogue/UI tests. Split the adapter further only if needed to keep SDK query conversion and metadata normalization understandable. Do not refactor the current catalogue's nested registration pattern or move the shared time-series store merely for this feature.
+### MVP files only
+
+Expected MVP implementation files are `app/eodag_adapter.py` (lazy SDK boundary, provider mapping, search pagination, metadata normalization), `app/catalog_models.py` (application contracts), `app/scene_catalog.py` (explicit EODAG dispatch and snapshot capability rules), `app/main.py` (only if route/model registration is required before the static mount), `.env.example`, `README.md`, `requirements-eodag.txt`, and focused adapter/catalogue/API tests. Do not add `app/eodag_api.py`, `app/catalog_quicklook.py`, `static/eodag.js`, or UI hooks in the MVP.
+
+### Follow-up files
+
+`app/eodag_api.py` and discovery tests belong to the discovery release. `app/catalog_quicklook.py` and quicklook/UI tests belong to the quicklook release. `static/eodag.js` and `static/index.html` hooks belong to the UI release. Download handoff changes require a separate provider-specific design. Split the adapter further only if needed to keep SDK query conversion and metadata normalization understandable. Do not refactor the current catalogue's nested registration pattern or move the shared time-series store merely for this feature.
 
 The implementation must not modify the current imagery, raster, time-series, CDSE download, AWS COG, or boundary algorithms. Work from the user's actual working tree, which currently has uncommitted changes; a checkout of HEAD alone omits relevant CDSE/S3 credential behavior. Capture a fresh baseline, preserve those changes, and isolate implementation using the worktree workflow without discarding or silently committing unrelated edits.
 
 ## Delivery slices for the implementation plan
 
+### MVP: catalogue-only
+
 1. Capture compatibility contracts and add optional dependency/configuration handling with no default-path changes.
 2. Implement the tested SDK adapter, metadata mapping, bounded search pagination, and safe snapshot integration.
-3. Add cached provider/collection discovery and optional API integration.
-4. Add bounded quicklook retrieval and provider-specific capability enforcement, including verified same-item Earth Search handoff.
-5. Add minimal optional catalogue controls and test graceful UI failure behavior.
-6. Verify both installation modes, run opt-in SDK/provider smoke checks, document evidence, and retain default-off rollback.
+3. Add explicit `source=eodag` validation and capability-aware snapshot/page behavior; keep all EODAG results non-downloadable and do not change the UI.
+4. Verify both installation modes, run opt-in SDK/provider search smoke checks, document evidence, and retain default-off rollback.
+
+### Follow-up releases, separately approved
+
+5. Add cached provider/collection discovery and optional API integration.
+6. Add bounded quicklook retrieval after security review.
+7. Add minimal optional catalogue controls and test graceful UI failure behavior.
+8. Add verified same-item Earth Search handoff only after a provider-specific compatibility review. EODAG-native downloading remains a separate design.
 
 The implementation plan must give each slice exact files, contract signatures, meaningful failing tests, validation commands, and promotion criteria. Writing application code is not authorized by approval of this specification alone; the current request is planning.
 

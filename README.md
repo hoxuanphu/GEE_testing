@@ -27,6 +27,198 @@ git lfs pull
 - Nếu mạng nội bộ yêu cầu CA riêng, bổ sung `vingroup_cas.pem` trên máy;
   `combined_cas.pem` được ứng dụng tạo cục bộ. Không commit chứng chỉ nội bộ.
 
+## Tên file ảnh GEE
+
+Tải SAR Sentinel-1 giữ nguyên **toàn bộ ID sản phẩm** (không cắt 40 ký tự),
+thêm phân cực xuất và ROI (tọa độ/bán kính, chữ nhật/góc xoay hoặc ID tỉnh/xã).
+Chọn SAR theo tỉnh/xã vẫn là một cảnh được chọn theo độ phủ, không phải ảnh ghép.
+Ảnh quang học tải một cảnh cũng giữ đầy đủ ID cảnh; tên composite vẫn mô tả vùng,
+khoảng ngày và phương pháp ghép. File tạm trên máy chủ dùng UUID ngắn, độc lập
+với tên tải xuống để tránh giới hạn đường dẫn Windows. Không thay đổi dữ liệu ảnh.
+
+## Tải DEM / DSM từ GEE
+
+Chọn nguồn **DEM — ALOS AW3D30**, **DEM — SRTM**, hoặc **DEM — Copernicus
+GLO-30**, chọn vùng theo điểm, chữ nhật (kể cả xoay), tỉnh hoặc xã, rồi bấm
+**Tải DEM GeoTIFF (30 m)**. Không áp dụng khoảng ngày, lọc mây hoặc time series.
+GeoTIFF một band `elevation`, Float32, độ cao mét, NoData -9999; vùng hành chính
+được cắt theo polygon. Chữ nhật xoay giữ lưới ROI; vùng lớn tự chia tile và ghép.
+Tên file DEM gồm nguồn, độ phân giải, ROI (tọa độ/kích thước/góc hoặc ID hành
+chính), thời điểm UTC và mã ngẫu nhiên 12 ký tự. Mỗi lượt tải có tên riêng;
+giao diện giữ tên do backend trả về, không thay bằng tên cố định. Các luồng tải
+khác không thay đổi.
+
+| Nguồn | Asset GEE | Band nguồn | Lưu ý |
+|---|---|---|---|
+| ALOS AW3D30 | `JAXA/ALOS/AW3D30/V4_1` | `DSM` | DSM gồm cây/công trình, mốc cao EGM96 |
+| SRTM | `USGS/SRTMGL1_003` | `elevation` | Phủ khoảng 56°S–60°N, mốc cao EGM96 |
+| Copernicus GLO-30 | `COPERNICUS/DEM/GLO30_2024_1` | `DEM` | DSM, mốc cao EGM2008 |
+
+Không phải DTM đất trống; các nguồn có thể khác mốc cao và thời kỳ thu nhận.
+Không nội suy lấp vùng thiếu. Xuất lưới 30 m không làm tăng độ chính xác gốc.
+API: `GET /api/dem/download?dataset=alos&lon=107&lat=11&radius_m=2000`;
+`dataset=alos|srtm|copernicus`, các trường ROI giống API tải GEE hiện có, không
+cần ngày. Cần cấu hình tài khoản GEE như các nguồn ảnh khác.
+
+## Lỗi kiểu dữ liệu khi liệt kê ảnh GEE
+
+Nếu gặp `'Element' object has no attribute 'select'`, cập nhật mã và khởi động
+lại backend. Luồng chuẩn bị ảnh catalogue/time-series ép lại `ee.Image` sau các
+phép biến đổi có `copyProperties`, vì SDK có thể trả `ee.Element` không có
+phương thức chọn băng. Việc ép kiểu không thay đổi băng, hệ số scale hoặc metadata.
+
+## ROI chữ nhật — giai đoạn 2 (API GEE)
+
+GEE hỗ trợ `selection_mode="rectangle"` với `center_lon`, `center_lat`,
+`width_m`, `height_m` và `rotation_deg`. Kích thước tính bằng mét, góc xoay theo
+chiều kim đồng hồ; không truyền đồng thời `lon`/`lat` hoặc ID tỉnh/xã.
+Ví dụ body cho `POST /api/scene`:
+
+```json
+{
+  "dataset": "sentinel2",
+  "selection_mode": "rectangle",
+  "center_lon": 107.1,
+  "center_lat": 11.2,
+  "width_m": 12000,
+  "height_m": 6000,
+  "rotation_deg": 25,
+  "start_date": "2026-09-19",
+  "end_date": "2026-10-19"
+}
+```
+
+Tìm kiếm, đánh giá độ phủ/mây và preview dùng polygon thật; link tải trong kết
+quả giữ thông số chữ nhật để xuất GeoTIFF theo lưới chữ nhật xoay. Sentinel-1
+GEE cũng hỗ trợ ROI này. Time series và các đường crop/tải CDSE/AWS/Esri
+đã hỗ trợ qua API ở giai đoạn 4; giao diện vẽ được bổ sung ở giai đoạn sau.
+
+### Giai đoạn 3: catalogue và snapshot chữ nhật
+
+`POST /api/scene-catalog` nhận cùng các trường chữ nhật ở ví dụ trên, thêm
+`cloud_min`/`cloud_max` nếu cần. Không truyền `radius_m`, `lon`, `lat`,
+`province_id` hoặc `commune_id` với mode chữ nhật.
+
+- `dataset=sentinel2|landsat`: GEE tìm các cảnh giao polygon thật, không tự
+  chọn ít mây hay tạo composite. Lọc mây dùng metadata toàn cảnh như catalogue cũ.
+- `dataset=s2, source=cdse|aws`: tìm theo bbox bao ngoài polygon xoay.
+  `dataset=s2aws` vẫn chọn AWS như trước.
+- `dataset=s2, source=eodag, provider=earth_search|planetary_computer`:
+  dùng bbox bao ngoài; vẫn cần bật/cài EODAG riêng và vẫn catalogue-only.
+- Snapshot lưu thông số chữ nhật, `roi_geometry`, `bbox` và lưới xuất GEE
+  (`output_grid`). Phân trang và mở lại sau restart không tìm lại provider.
+- Link tải đúng cảnh GEE dùng polygon/lưới đã lưu, cả góc 0° và góc xoay khác.
+- Từ giai đoạn 4, catalogue chữ nhật CDSE/AWS có link tải crop; redirect giữ
+  thông số chữ nhật đã lưu, không chuyển sang tỉnh/xã hoặc bỏ ROI. Snapshot
+  chữ nhật tạo ở giai đoạn 3 cũng dùng được các link này sau khi nâng cấp.
+  EODAG vẫn trả HTTP 409 catalogue-only.
+- Mode điểm/tỉnh/xã, link tải và snapshot cũ giữ nguyên hành vi.
+
+Kiểm thử: `.venv\Scripts\python.exe -m unittest tests.test_rectangle_catalog tests.test_scene_catalog tests.test_eodag_catalog`.
+
+### Giai đoạn 4: time series và tải/cắt theo chữ nhật (API)
+
+Các API sau nhận `selection_mode=rectangle` cùng `center_lon`, `center_lat`,
+`width_m`, `height_m`, `rotation_deg` như ví dụ. Không trộn với tâm/bán kính điểm
+hoặc ID hành chính. Góc 0° vẫn xuất đúng lưới rộng/cao độc lập.
+
+| API | Hành vi |
+|---|---|
+| `POST /api/timeseries/search` | Body thêm dataset, ngày và polarization khi cần; dùng polygon thật, snapshot giữ ROI/lưới. Các job xuất cùng một lưới kể cả khi cảnh đầu lỗi. |
+| `GET /api/s2/aws/download` | Query thêm `product_id`; đọc COG window + halo rồi resample về lưới chữ nhật. |
+| `GET /api/s2/bands` | Query thêm `product_id`, `action=download`, `bands`; dùng CDSE Nodes, giữ cơ chế token OData cũ, không tự chuyển sang S3. |
+| `GET /api/s1/crop` | Query thêm `product_id`, `scale_m` (10–500 m); warp measurement GRD có GCP trực tiếp về lưới chữ nhật. |
+| `GET /api/s1/crop-mosaic` | Query thêm `product_ids` (1–6 ID), `scale_m`; ghép các GRD trên cùng lưới chữ nhật. |
+| `POST /api/esri/jobs` | Body thêm zoom và giới hạn tile; snapshot/resume dùng polygon và lưới chữ nhật, tile phủ envelope cùng halo. |
+
+Time series giữ manifest/ZIP và mask dữ liệu thiếu như trước. Các băng phân loại
+(SCL, Dynamic World) dùng nearest-neighbor; dữ liệu liên tục dùng nội suy theo
+pipeline hiện tại. Crop GRD CDSE vẫn là số đo thô, không phải sigma0 đã hiệu chuẩn.
+ZIP sản phẩm gốc CDSE/S3 vẫn tải toàn sản phẩm, không cắt hay đóng gói lại theo ROI.
+EODAG vẫn catalogue-only.
+
+### Giai đoạn 5: vẽ và chỉnh ROI trên bản đồ
+
+Chọn **Vẽ hình chữ nhật (ROI)** trong chế độ chọn vùng, kéo trên bản đồ để vẽ.
+Sau khi vẽ, kéo tâm/thân để di chuyển, góc hoặc cạnh để thay đổi kích thước đối
+xứng quanh tâm, tay nắm xoay để đổi góc. Cũng có thể nhập tâm, chiều rộng, chiều
+cao và góc trực tiếp. **Esc** hủy thao tác đang kéo; các nút **Vẽ / vẽ lại**, **Xóa ROI**
+và **Xem toàn ROI** dùng để thay hoặc xem vùng chọn. Mỗi chiều tối đa 90 km;
+đây là hình chữ nhật theo hệ mét cục bộ, không phải hình chữ nhật trắc địa.
+
+- GEE quang học/Sentinel-1, catalogue S2, time series và Esri gửi cùng thông số
+  chữ nhật; không quy đổi thành vùng vuông tâm/bán kính. Sửa ROI làm vô hiệu
+  kết quả đang chờ; phản hồi cũ không ghi đè lựa chọn mới.
+- Kết quả catalogue giữ link snapshot với vùng đã tìm. ZIP nguyên sản phẩm
+  được ghi rõ không cắt ROI. Tải crop CDSE Nodes vẫn cần xác thực OData riêng.
+- Tìm kiếm chữ nhật S1 GRD/SLC, cặp InSAR và Sentinel-3 chưa có API tìm vùng
+  phù hợp nên được báo chưa hỗ trợ. Với S1 GRD có thể nhập UUID sản phẩm đã biết
+  để tạo link crop/mosaic chữ nhật; không áp dụng cho SLC.
+- Esri có lựa chọn riêng **Hình chữ nhật ROI đang chỉnh ở trên**; bbox nhập tay
+  vẫn là một mode độc lập. Không nhầm ROI đang chỉnh với vùng của job cũ.
+- Khởi động lại backend để nạp API mới, sau đó Ctrl+F5 để tải các script mới.
+  Backend cũ chưa hỗ trợ `rectangle` sẽ không chạy được chỉ bằng tải lại trang.
+
+Kiểm thử giao diện: `node --test tests/test_rectangle_ui.cjs tests/test_admin_map.cjs`.
+
+### Giai đoạn 6: kiểm chứng tích hợp ROI
+
+- Chạy toàn bộ test Python: `.venv\Scripts\python.exe -m unittest discover tests`.
+  Các test SDK/smoke EODAG có thể được skip khi chưa cài SDK hoặc chưa opt-in;
+  không coi các test này là đã kiểm chứng provider thật.
+- `tests/test_rectangle_e2e.py` gọi HTTP tìm ảnh rồi đi theo link tải trả về
+  cho Sentinel-2, Landsat và Sentinel-1 GEE ở góc 0°, 25°, 90°, 360°.
+  Provider được mock; raster được xuất thật từ fixture. Kiểm tra shape, affine,
+  CRS, mask, pixel 0 hợp lệ, halo và dọn file trung gian.
+- Đã sửa lỗi tích hợp Sentinel-1 GEE download: góc 0° phải dùng polygon chữ nhật,
+  không dùng tọa độ điểm rỗng. Export GEE lấy thêm halo, không clip mất pixel
+  nội suy trước khi warp; lưới đích vẫn giữ đúng footprint ROI.
+- Smoke ngày 2026-10-19: trình duyệt tìm AWS thật được 2 cảnh tại ROI tâm
+  107.14828, 11.17714, rộng 200 m, cao 100 m, xoay 25°, ngày 01–10/10/2026.
+  Tải cảnh `S2C_48PYT_20261008_0_L2A` qua link snapshot trả HTTP 200;
+  GeoTIFF có 10 hàng × 20 cột, B02/B03/B04/B08/SCL, CRS và affine khớp ROI,
+  mask băng đầu hợp lệ 100%. Đây là kiểm tra hình học/tải, không xác nhận ảnh ít mây.
+- Browser kiểm tra sửa kích thước không đổi snapshot cũ, ẩn kết quả cũ và chuyển
+  lại mode điểm/xã hoạt động. Live GEE bị Web Gateway công ty chặn ngay bước
+  khởi tạo; chưa xác minh live export GEE, CDSE hoặc Esri trong đợt kiểm tra này.
+  Không tắt TLS hoặc vượt chính sách mạng để khắc phục.
+
+Kiểm thử: `.venv\Scripts\python.exe -m unittest tests.test_rectangle_downloads tests.test_rectangle_catalog tests.test_esri_rectangle tests.test_rotated_exports tests.test_timeseries`.
+
+## Đo thời gian tìm ảnh GEE
+
+`POST /api/scene` và `POST /api/composite-plan` trả header `Server-Timing`
+(milliseconds) và `X-Search-Request-ID`. Giao diện hiển thị thời gian chờ phản hồi
+và từng giai đoạn ngay dưới trạng thái tìm kiếm:
+
+- `ee_init`: khởi tạo/xác thực Earth Engine; lần đầu trong process có thể chậm.
+- `selection`: chuẩn bị vùng điểm/tỉnh/xã.
+- `scene_search`: chọn ảnh hoặc tạo composite, gồm các truy vấn GEE bên trong.
+- `preview_url`: xin URL preview, không gồm thời gian trình duyệt tải ảnh PNG.
+- `composite_plan`: truy vấn lập kế hoạch, là request riêng trước khi xác nhận.
+- `total`: thời gian backend từ lúc nhận request đến khi bắt đầu trả response,
+  gồm validation, chờ thread worker và serialize; không gồm mạng tới trình duyệt.
+
+Terminal Uvicorn ghi dòng `search_timing` với mã request, route, HTTP status và
+thời lượng, không ghi tọa độ, credential hoặc URL provider. Các giai đoạn được
+đo cả khi thất bại; chưa đến giai đoạn nào thì header không có giai đoạn đó.
+Không thay đổi thuật toán chọn ảnh, số lần gọi GEE hoặc nội dung JSON trả về.
+Để nhận header backend mới, khởi động lại server; Ctrl+F5 để nhận giao diện mới.
+Kiểm thử: `.venv\Scripts\python.exe -m unittest tests.test_request_timing`.
+
+## Địa giới hành chính trên bản đồ
+
+- Địa giới 34 tỉnh/thành được bật khi mở bản đồ, có tên khi rê chuột;
+  bật/tắt tại mục **Địa giới tỉnh/thành** trong bộ chọn lớp bản đồ.
+- Chế độ **Theo địa phận hành chính** cho phép chọn tỉnh trong danh sách hoặc
+  bấm trực tiếp trên bản đồ. Ở chế độ điểm, bấm bản đồ vẫn chọn tọa độ như cũ.
+- Chế độ **Theo xã/phường** có ô tìm tên xã/phường hoặc tỉnh/thành, hỗ trợ nhập
+  không dấu. Chọn một đơn vị để tải và tô ranh giới, tự phóng bản đồ đến vùng đó.
+  Chỉ tải hình học của đơn vị được chọn, không tải toàn bộ ranh giới xã cả nước.
+- Đổi xã/phường hoặc chế độ sẽ bỏ hình học cũ; phản hồi đến muộn không thay thế
+  lựa chọn mới. Nếu tải lỗi, thông báo hiện ngay dưới danh sách xã/phường.
+- Kiểm thử tương tác địa giới không cần cài thêm gói: `node --test tests/test_admin_map.cjs`.
+
 ## Kiểm tra đúng lượt tải và góc xoay
 
 Ảnh đã tải và job Esri cũ không thay đổi khi chỉnh góc trên bản đồ. Sau khi đổi góc cần tìm ảnh/tạo lượt tải mới. Kết quả GEE hiển thị **Góc lưới xuất**; trạng thái Esri hiển thị góc đã lưu của job và cảnh báo khi đó là job bbox Bắc–Nam cũ. GeoTIFF xoay có các hệ số affine ngoài đường chéo khác 0 (trừ góc trùng trục); phần mềm GIS vẫn có thể hiển thị bản đồ hướng Bắc do tôn trọng georeference.
@@ -39,6 +231,51 @@ git lfs pull
 - % mây là metadata toàn cảnh, không phải % mây riêng vùng chọn. Cảnh không có metadata mây bị loại khỏi khoảng lọc; 0% là giá trị hợp lệ.
 - Catalogue ngoài GEE có giới hạn an toàn: CDSE tối đa 500 kết quả, AWS tối đa 4.000. Khi chạm giới hạn, giao diện yêu cầu thu hẹp khoảng ngày; không trình bày danh sách bị giới hạn là đầy đủ.
 - **Time series** là chế độ độc lập, vẫn lấy mọi cảnh theo hành vi cũ, không chịu bộ lọc này. Sentinel-1/NICFI/Dynamic World không hiện tùy chọn mây mới.
+
+## Optional EODAG catalogue MVP (API only)
+
+EODAG is disabled by default and is not needed for existing GEE/CDSE/AWS searches
+or downloads. Install `requirements-eodag.txt` in a **separate** environment; it
+includes the base requirements and pins EODAG 4.9.2. Do not upgrade the running
+application's environment to try this feature.
+
+- Set `EODAG_ENABLED=true` only after isolated SDK/provider smoke checks pass.
+- `EODAG_PROVIDERS=earth_search,planetary_computer` is the administrator allowlist.
+- `EODAG_CONFIG_FILE` optionally names a server-side configuration file. Local SDK
+  configuration/cache belongs under `downloads/eodag`, not global user config.
+- `EODAG_MAX_RESULTS=4000` accepts 1–4000; pages request 100 provider items, with
+  a 200-page/120-second budget and per-request timeout at most 30 seconds, no retries.
+- `EODAG_QUICKLOOK_MAX_BYTES=10485760` is reserved and ignored in this release.
+
+POST `/api/scene-catalog` with `dataset=s2`, `source=eodag`, a required `provider`,
+and normal selection/date/cloud fields. Optional `eodag_collection` must be
+`S2_MSI_L2A_COG` for Earth Search or `S2_MSI_L2A` for Planetary Computer; native
+collection is `sentinel-2-l2a` for both. Provider/collection fields are rejected on
+legacy requests; EODAG cannot be combined with `s2aws` or GEE datasets.
+
+Dates include the end day; filtering uses the selection bbox (not exact polygon
+coverage). Missing cloud values are excluded, metadata is not harmonized or
+inferred, and scenes remain provider-specific immutable snapshots, 50 per page.
+`total` counts stored qualifying scenes. Inspect `parameters.completion`,
+`truncated`, `truncation_reason`, and `warnings` before treating a result as complete.
+Disabled/missing SDK/config returns 503; first-page provider failure returns 502;
+a failure after successful pages returns a partial snapshot. There is no provider
+fallback, discovery, quicklook, UI, or download handoff. EODAG rows never have a
+`download_url`; direct snapshot download attempts return 409.
+
+Offline verification: `python -m unittest discover -s tests -q` in both isolated
+base and optional environments, then `python -m pip check`. For opt-in live
+catalogue-only checks run `python -m unittest discover -s tests -p test_eodag_smoke.py -v`
+with `EODAG_SMOKE=true` and `EODAG_ENABLED=true`. The smoke test prints identity,
+metadata, and completion evidence for each provider; it never fetches assets.
+Live provider failures block EODAG enablement, not the default application.
+
+Implementation validation in this workspace: base-only offline tests pass. Optional
+installation could not complete because the package proxy returned HTTP 403
+`MediaTypeBlocked` for a dependency wheel (after using the existing corporate CA).
+Real SDK/provider checks therefore remain unverified; keep EODAG disabled until
+those checks pass. The existing base environment also reports unrelated missing
+`google-crc32c` and an `opentelemetry-api` version conflict in `pip check`.
 
 ## Nguồn dữ liệu
 
@@ -75,8 +312,9 @@ Copernicus Sentinel.
 
 ### Độ phủ và ghép cảnh theo vị trí
 
-Sentinel-2/Landsat chỉ chọn cảnh có dữ liệu trên **≥99% bbox** ở chế độ
-ảnh đơn, rồi xếp hạng theo tỷ lệ pixel ít mây. Độ phủ tính trên mask của tất
+Sentinel-2/Landsat chỉ chọn cảnh có dữ liệu trên **≥99% ROI** ở chế độ
+ảnh đơn (bbox với điểm không xoay; polygon với ROI xoay/chữ nhật), rồi xếp hạng
+theo tỷ lệ pixel ít mây. Độ phủ tính trên mask của tất
 cả các băng xuất; phần ngoài footprint được tính là thiếu dữ liệu.
 Nếu không có cảnh đạt ngưỡng, app báo để bật **Ghép nhiều cảnh** (mặc định tắt).
 Khi bật, app ghép các cảnh trong khoảng ngày và ngưỡng mây scene hiện có,
@@ -85,6 +323,25 @@ Các pixel có thể khác ngày chụp; kết quả ghép vẫn phải phủ �
 Preview và tải GeoTIFF cùng dùng lựa chọn này; API nhận `merge_scenes: true`
 ở `/api/scene` và `merge_scenes=true` ở `/api/download/{dataset}`.
 Không thay đổi luồng time series, tỉnh/xã, NICFI, Dynamic World hoặc SAR.
+
+Tìm ảnh Sentinel-2/Landsat theo điểm hoặc ROI chữ nhật tính độ phủ và điểm
+ít mây **tuần tự từng cảnh**, không đặt `reduceRegion()` trong `collection.map()`.
+Ảnh đơn bỏ qua phép tính mây nếu cảnh không đạt độ phủ; ghép cảnh chỉ kiểm tra
+độ phủ của mosaic cuối. Điểm đã tính được giữ trong bộ nhớ của request và sắp
+xếp phía Python, không gắn biểu thức tổng hợp vào ảnh preview/tải xuống.
+Các request cùng tiến trình chia sẻ khóa tính điểm để tránh fan-out gây
+`Too many concurrent aggregations`. Không cắt bớt danh sách ứng viên theo
+metadata mây toàn cảnh: tiêu chí ≥99% và ít mây nhất trên ROI vẫn được giữ.
+Khoảng ngày dài vẫn có thể chậm vì phải đánh giá mọi cảnh; đây không phải cache
+xuyên request và không thay đổi hạn mức Earth Engine của project.
+
+Smoke GEE trực tiếp ngày 2026-10-19: ROI tâm 105.193488, 20.785500, kích thước
+38.019 × 19.600 km, khoảng ngày 19/09–19/10/2026. Ảnh đơn trả thông báo không
+có cảnh phủ ≥99% (không còn lỗi aggregation). Bật ghép trả HTTP 200 sau 37,37 s,
+16 cảnh, độ phủ 100%; preview 512 × 247 tải thành công. ROI nhỏ 200 × 100 m,
+xoay 25° tại cùng tâm/ngày, tìm ảnh đơn trả HTTP 200 sau 18,79 s, cảnh
+`20260929T032539_20260929T033813_T48QWH`, độ phủ 100%. Chưa tải GeoTIFF lớn
+trong phép kiểm tra này.
 
 Ở chế độ tỉnh, `/api/composite-plan` chỉ lập kế hoạch cho composite
 Sentinel-2/Landsat dạng phản xạ; Dynamic World tự động tạo composite mode và
@@ -315,20 +572,26 @@ Ngoài S2/Landsat qua GEE, app còn tìm và tải ảnh radar Sentinel-1 (IW GR
 từ Copernicus Data Space Ecosystem (CDSE):
 
 - **Tìm kiếm** dùng OData catalogue public — không cần tài khoản.
-- **Tải về** cần token password-grant: đăng ký miễn phí tại
-  [dataspace.copernicus.eu](https://dataspace.copernicus.eu/), rồi điền email +
-  mật khẩu đăng nhập CDSE vào `.env`:
+- **Tải ZIP qua S3 và cắt GRD qua S3** chỉ dùng key tạo sẵn, không cần
+  tài khoản/mật khẩu. Đăng nhập [S3 Keys Manager](https://eodata-s3keysmanager.dataspace.copernicus.eu/),
+  chọn **Add Credentials**, chọn ngày hết hạn và lưu Secret Key (chỉ hiện một lần).
+  Điền vào `.env` cục bộ (đã được Git bỏ qua) hoặc biến môi trường backend:
 
-  ```
-  CDSE_USERNAME=you@example.com
-  CDSE_PASSWORD=...
+  ```dotenv
+  Access_Key_S3=<access-key>
+  Secret_Key_S3=<secret-key>
   ```
 
-  Lưu ý: OAuth Client ID/Secret tạo trên dashboard
-  (https://shapps.dataspace.copernicus.eu/dashboard/#/account/settings) là
-  credential của **Sentinel Hub** — token của nó bị endpoint tải ZIP OData từ chối
-  với lỗi `DAT-ZIP-609 "Token audience not allowed"`. Tài khoản phải tắt 2FA
-  thì mới lấy token bằng password-grant được.
+  `.env.example` chỉ chứa mẫu và không được app nạp. Không đưa key thật vào Git,
+  frontend hoặc log. App không tự tạo/xoá key và không dùng mật khẩu dự phòng
+  khi thiếu key. Sau khi thay key, khởi động lại backend. HTTP 403 cần kiểm tra
+  key hết hạn, bị thu hồi hoặc quyền truy cập; app không tự cấp lại key.
+  ZIP được app đóng gói từ các object S3, không đảm bảo giống từng byte ZIP OData.
+- **Endpoint OData cũ** vẫn cần token password-grant (`CDSE_USERNAME`,
+  `CDSE_PASSWORD`) và độc lập với S3; S3 key không xác thực được endpoint này.
+  OAuth Client ID/Secret của Sentinel Hub cũng không thay thế token OData.
+  CDSE hỗ trợ 2FA qua `totp`, nhưng luồng OData cũ trong app chưa hỗ trợ trường này;
+  không nên tắt 2FA để dùng luồng cũ, hãy dùng S3.
 
 Lưu ý: sản phẩm S1 là file ZIP GRD **đầy đủ của cảnh** (~1–2 GB, footprint ~250 km),
 không cắt theo vùng chọn như S2/Landsat. Mỗi cảnh thường có 2 bản: chuẩn `.SAFE`
