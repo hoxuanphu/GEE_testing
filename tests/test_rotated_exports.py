@@ -197,4 +197,5 @@ class TestGEERotatedMerge(RasterCase):
             response = main.download("sentinel2", "2026-01-01", "2026-01-02", lon=107, lat=10,
                                      radius_m=100, rotation_deg=360)
         warp.assert_not_called()
-        self.assertEqual(Path(response.path).name, "sentinel2_scene_2026-01-01.tif")
+        self.assertEqual(response.filename, "sentinel2_scene_2026-01-01.tif")
+        self.assertRegex(Path(response.path).name, r"^[a-f0-9]{32}\.tif$")

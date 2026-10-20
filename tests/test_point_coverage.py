@@ -21,12 +21,17 @@ class PointCoverageTests(unittest.TestCase):
         collection = mock.Mock()
         collection.filterBounds.return_value.filter.return_value = collection
         collection.size.return_value.getInfo.return_value = 2
-        collection.map.return_value.filter.return_value.size.return_value.getInfo.return_value = 0
+        coverage = mock.Mock()
+        coverage.getInfo.return_value = 0.98
         with mock.patch.object(imagery, '_optical_collection', return_value=(collection, 'cloud', 10)), \
-             mock.patch.object(imagery, 'ee') as ee:
+             mock.patch.object(imagery, '_coverage_fraction', return_value=coverage), \
+             mock.patch.object(imagery, '_s2_clear_fraction') as clear, \
+             mock.patch.object(imagery, 'ee'):
             with self.assertRaises(imagery.InsufficientCoverageError):
                 imagery._point_optical_scene('sentinel2', 'roi', '2026-01-01', '2026-02-01', 60, False)
-        ee.Filter.gte.assert_called_once_with('roi_coverage', 0.99)
+        self.assertEqual(coverage.getInfo.call_count, 2)
+        clear.assert_not_called()
+        collection.map.assert_not_called()
 
     def test_point_routes_use_same_merge_flag_and_return_coverage(self):
         scene = imagery.SceneInfo('sentinel2', 'collection', 'scene', '2026-01-01', -1, mock.Mock(),
@@ -54,18 +59,20 @@ class PointCoverageTests(unittest.TestCase):
         collection = mock.Mock()
         collection.filterBounds.return_value.filter.return_value = collection
         collection.size.return_value.getInfo.return_value = 2
-        ranked = collection.map.return_value.sort.return_value
-        ranked.aggregate_array.side_effect = [mock.Mock(getInfo=lambda: ['a', 'b']),
-                                               mock.Mock(getInfo=lambda: [1767225600000, 1767312000000])]
         coverage = mock.Mock()
         coverage.getInfo.return_value = 1.0
         with mock.patch.object(imagery, '_optical_collection', return_value=(collection, 'cloud', 10)), \
              mock.patch.object(imagery, '_coverage_fraction', return_value=coverage), \
-             mock.patch.object(imagery, 'ee'):
+             mock.patch.object(imagery, 'ee') as ee:
+            ee.Dictionary.return_value.getInfo.return_value = {
+                'scene_id': 'scene', 'timestamp': 1767225600000,
+                'cloud_pct': 10, 'clear_fraction': 0.9,
+            }
+            ranked = ee.ImageCollection.fromImages.return_value
             result = imagery._point_optical_scene('sentinel2', 'roi', '2026-01-01', '2026-02-01', 60, True)
             self.assertEqual(result.scene_count, 2)
             self.assertEqual(result.coverage_pct, 100)
-            collection.map.return_value.sort.assert_called_once_with('roi_clear_fraction')
+            collection.map.assert_not_called()
             ranked.mosaic.return_value.blend.assert_called_once_with(ranked.map.return_value.mosaic.return_value)
             ranked.map.assert_called_once_with(imagery._mask_s2_clouds)
             coverage.getInfo.return_value = 0.15

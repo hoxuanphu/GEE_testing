@@ -19,6 +19,34 @@ from pydantic import ValidationError  # noqa: E402
 from app import main  # noqa: E402
 
 
+class TestS3OnlyAPI(unittest.TestCase):
+    def test_missing_keys_fail_before_network_or_password_auth(self):
+        with mock.patch.object(main, "get_s3_credentials", side_effect=RuntimeError("S3 credentials missing")), \
+                mock.patch.object(main, "get_token") as token, \
+                mock.patch.object(main, "get_product_s3_path") as path:
+            response = TestClient(main.app).get(
+                "/api/s1/s3/download", params={"product_id": "12345678-1234-1234-1234-123456789abc"}
+            )
+        self.assertEqual(response.status_code, 400)
+        token.assert_not_called()
+        path.assert_not_called()
+
+    def test_zip_uses_s3_keys_without_password_auth(self):
+        import io
+        import zipfile
+
+        with mock.patch.object(main, "get_s3_credentials", return_value=("access", "secret")), \
+                mock.patch.object(main, "get_token") as token, \
+                mock.patch.object(main, "get_product_s3_path", return_value="/eodata/example.SAFE"), \
+                mock.patch.object(main, "s3_list_product_files", return_value=[]):
+            response = TestClient(main.app).get(
+                "/api/s1/s3/download", params={"product_id": "12345678-1234-1234-1234-123456789abc"}
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(zipfile.is_zipfile(io.BytesIO(response.content)))
+        token.assert_not_called()
+
+
 class TestTimeSeriesAPI(unittest.TestCase):
     def setUp(self):
         import uuid

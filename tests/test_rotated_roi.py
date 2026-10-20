@@ -15,7 +15,7 @@ from rasterio.transform import from_origin
 from rasterio.warp import transform
 
 from app import main, aws_stac
-from app.geo import point_roi
+from app.geo import RectangleROI, point_roi
 from app.raster_grid import build_rotated_grid, warp_to_grid
 from app.timeseries import align_timeseries_raster, TimeSeriesStore
 
@@ -156,6 +156,65 @@ class TestRotationAPI(RasterCase):
         self.assertFalse(polygon.call_args.kwargs["geodesic"])
         self.assertEqual(polygon.call_args.args[0], point_roi(107, 10, 100, 30)[0]["coordinates"])
 
+    def test_rectangle_request_and_resolver_use_true_polygon(self):
+        body = dict(
+            selection_mode="rectangle", center_lon=107, center_lat=10,
+            width_m=200, height_m=100, rotation_deg=30,
+            start_date="2026-01-01", end_date="2026-01-02",
+        )
+        request = main.SceneRequest(**body)
+        self.assertEqual(request.selection_mode, "rectangle")
+        expected = RectangleROI(**{key: body[key] for key in (
+            "center_lon", "center_lat", "width_m", "height_m", "rotation_deg")})
+        with mock.patch("ee.Geometry.Polygon", return_value="roi") as polygon:
+            roi, bbox, province = main._resolve_selection(
+                "rectangle", None, None, None, None, rotation_deg=30,
+                center_lon=107, center_lat=10, width_m=200, height_m=100,
+            )
+        self.assertEqual(roi, "roi")
+        self.assertEqual(bbox, expected.bbox)
+        self.assertEqual(polygon.call_args.args[0], expected.geometry["coordinates"])
+        self.assertFalse(polygon.call_args.kwargs["geodesic"])
+
+    def test_rectangle_request_rejects_mixed_or_incomplete_fields(self):
+        valid = dict(
+            selection_mode="rectangle", center_lon=107, center_lat=10,
+            width_m=200, height_m=100,
+            start_date="2026-01-01", end_date="2026-01-02",
+        )
+        with self.assertRaises(ValueError):
+            main.SceneRequest(**{**valid, "center_lat": None})
+        with self.assertRaises(ValueError):
+            main.SceneRequest(**{**valid, "lon": 107})
+        with self.assertRaises(ValueError):
+            main.SceneRequest(**{**valid, "selection_mode": "province", "province_id": "x", "center_lon": 107})
+
+    def test_rectangle_scene_uses_polygon_for_search_preview_and_download_url(self):
+        body = dict(
+            selection_mode="rectangle", center_lon=107, center_lat=10,
+            width_m=200, height_m=100, rotation_deg=30,
+            start_date="2026-01-01", end_date="2026-01-02",
+        )
+        rectangle = RectangleROI(**{key: body[key] for key in (
+            "center_lon", "center_lat", "width_m", "height_m", "rotation_deg")})
+        scene = SimpleNamespace(
+            ee_object=mock.Mock(), scene_id="scene", date="2026-01-01", cloud_pct=0,
+            coverage_pct=100, scene_count=None, scenes=(), estimated_seconds=None,
+        )
+        with mock.patch.object(main, "_ensure_ee"), \
+             mock.patch("ee.Geometry.Polygon", return_value="roi"), \
+             mock.patch.object(main, "best_scene", return_value=scene) as best, \
+             mock.patch.object(main, "preview_rgb", return_value="preview") as preview:
+            response = self.client.post("/api/scene", json=body)
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(payload["selection_mode"], "rectangle")
+        self.assertEqual(payload["roi_geometry"], rectangle.geometry)
+        self.assertIn("selection_mode=rectangle", payload["download_url"])
+        self.assertEqual(best.call_args.kwargs["roi"], "roi")
+        self.assertEqual(best.call_args.kwargs["bbox"], rectangle.bbox)
+        self.assertEqual(preview.call_args.args[3], "roi")
+
     def test_scene_response_polygon_url_and_preview(self):
         geometry, bbox = point_roi(107, 10, 100, 30)
         scene = SimpleNamespace(ee_object=mock.Mock(), scene_id="scene", date="2026-01-01", cloud_pct=0,
@@ -169,6 +228,62 @@ class TestRotationAPI(RasterCase):
         self.assertIn("rotation_deg=30", response.json()["download_url"])
         self.assertEqual(best.call_args.kwargs["roi"], "roi")
         self.assertEqual(preview.call_args.args[3], "roi")
+
+    def test_rectangle_download_uses_polygon_search_and_halo_grid(self):
+        rectangle = RectangleROI(
+            center_lon=107, center_lat=10, width_m=200, height_m=100, rotation_deg=30
+        )
+        scene = SimpleNamespace(ee_object=object(), scene_id="scene", date="2026-01-01")
+
+        def merge(urls, destination, **kwargs):
+            shutil.copyfile(self.source(), destination)
+
+        body = dict(
+            selection_mode="rectangle", center_lon=107, center_lat=10,
+            width_m=200, height_m=100, rotation_deg=30,
+            start_date="2026-01-01", end_date="2026-01-02",
+        )
+        with mock.patch.object(main, "_ensure_ee"), \
+             mock.patch.object(main, "_DOWNLOADS_DIR", self.root), \
+             mock.patch.object(main, "_resolve_selection", return_value=("roi", rectangle.bbox, None)), \
+             mock.patch.object(main, "best_scene", return_value=scene), \
+             mock.patch.object(main, "download_geotiff", return_value=[]) as download, \
+             mock.patch.object(main, "merge_band_tiffs", side_effect=merge), \
+             mock.patch.object(main, "warp_to_grid", wraps=warp_to_grid) as warp:
+            response = self.client.get("/api/download/sentinel2", params=body)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIsNone(download.call_args.args[4])
+        self.assertLess(download.call_args.args[2].west, rectangle.bbox.west)
+        warp.assert_called_once()
+        self.assertEqual(warp.call_args.args[2]["width"], 20)
+        self.assertEqual(warp.call_args.args[2]["height"], 10)
+        self.assertEqual(warp.call_args.args[2], rectangle.output_grid(main.S2_SCALE))
+        self.assertIn("_rect107.00000_10.00000_w200_h100_a30.tif", response.headers["content-disposition"])
+
+    def test_s1_rectangle_download_uses_polygon_even_at_zero_degrees(self):
+        for angle in (0, 30):
+            with self.subTest(angle=angle):
+                rectangle = RectangleROI(center_lon=107, center_lat=10,
+                                         width_m=200, height_m=100, rotation_deg=angle)
+                scene = SimpleNamespace(ee_object=object(), scene_id='s1', date='2026-01-01')
+                def merge(urls, destination, **kwargs):
+                    shutil.copyfile(self.source(), destination)
+                with mock.patch.object(main, '_ensure_ee'), \
+                     mock.patch.object(main, '_DOWNLOADS_DIR', self.root), \
+                     mock.patch.object(main, '_resolve_selection', return_value=('polygon', rectangle.bbox, None)), \
+                     mock.patch.object(main, 'best_s1_scene', return_value=scene) as best, \
+                     mock.patch.object(main, 'download_geotiff', return_value=[]) as download, \
+                     mock.patch.object(main, 'merge_band_tiffs', side_effect=merge):
+                    response = self.client.get('/api/s1gee/download', params={
+                        'selection_mode': 'rectangle', **rectangle.model_dump(),
+                        'start_date': '2026-01-01', 'end_date': '2026-01-02'})
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(best.call_args.kwargs['roi'], 'polygon')
+                self.assertEqual(best.call_args.args[:3], (107, 10, 100))
+                self.assertIsNone(download.call_args.args[4])
+                self.assertLess(download.call_args.args[2].west, rectangle.bbox.west)
+                with rasterio.MemoryFile(response.content) as mem, mem.open() as dst:
+                    self.assertEqual(dst.shape, (10, 20))
 
     def test_gee_download_warps_once_with_halo_without_polygon_clip(self):
         geometry, bbox = point_roi(107, 10, 100, 30)

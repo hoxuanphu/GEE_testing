@@ -320,7 +320,9 @@ class TestTimeSeriesImagery(unittest.TestCase):
             with self.subTest(dataset=dataset, collection=collection):
                 asset_id = collection + "/exact-scene"
                 image = imagery.load_timeseries_scene(asset_id, dataset)
-                self.ee.Image.assert_called_with(asset_id)
+                self.ee.Image.assert_any_call(asset_id)
+                self.assertEqual([call.args[0] for call in self.ee.Image.call_args_list
+                                  if isinstance(call.args[0], str)][-1], asset_id)
                 self.assertIn(operation, image.operations)
                 self.assertIn(("select", (imagery.timeseries_source_metadata(dataset)["bands"],)), image.operations)
                 self.assertFalse({"log10", "updateMask", "mosaic", "median"} & {op[0] for op in image.operations})
