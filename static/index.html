@@ -53,6 +53,18 @@
   #time_series_enabled { width: auto; margin-right: 6px; }
   #map { flex: 1; }
   .hint { font-size: 11px; color: #64748b; }
+  #rectangleSelection { border:1px solid #475569; padding:10px; border-radius:8px; }
+  #s1list a { white-space:normal; overflow-wrap:anywhere; max-width:160px; }
+  #s1list > div, #s1list > div > div { flex-wrap:wrap; }
+  #rectangleSelection[hidden], #rectangleGrd[hidden] { display:none; }
+  #rectangleSelection .row { margin-bottom:6px; }
+  #rectangleError { color:#fbbf24; font-size:12px; margin-top:6px; }
+  #rectangleStats { color:#38bdf8; font-size:12px; overflow-wrap:anywhere; }
+  .rectangle-drawing { cursor:crosshair; touch-action:none; }
+  .leaflet-interactive[data-roi-handle] { touch-action:none; }
+  .rectangle-handle { display:block; width:18px; height:18px; border:2px solid #0f172a; background:#fbbf24; border-radius:3px; color:#0f172a; text-align:center; line-height:14px; cursor:crosshair; touch-action:none; }
+  .rectangle-handle.move { cursor:move; }
+  .rectangle-handle.rotate { border-radius:50%; background:#38bdf8; cursor:grab; }
 </style>
 </head>
 <body>
@@ -65,10 +77,36 @@
     <label>Che do chon vung</label>
     <select id="selection_mode">
       <option value="point">Theo vi tri</option>
+      <option value="rectangle">Vẽ hình chữ nhật (ROI)</option>
       <option value="province">Theo dia phan hanh chinh (34 tinh/thanh)</option>
       <option value="commune">Theo xa/phuong</option>
     </select>
   </div>
+
+  <section id="rectangleSelection" hidden aria-label="Chỉnh hình chữ nhật ROI">
+    <button id="rectangleDraw" type="button">Vẽ / vẽ lại hình chữ nhật</button>
+    <div class="hint">Kéo trên bản đồ để vẽ. Kéo tâm/thân để di chuyển, góc/cạnh để đổi kích thước đối xứng quanh tâm, nút xanh để xoay. Esc hủy thao tác.</div>
+    <div class="row">
+      <div><label for="rect_center_lon">Tâm: kinh độ</label><input id="rect_center_lon" type="number" step="any" min="-180" max="180" /></div>
+      <div><label for="rect_center_lat">Tâm: vĩ độ</label><input id="rect_center_lat" type="number" step="any" min="-85.05112878" max="85.05112878" /></div>
+    </div>
+    <div class="row">
+      <div><label for="rect_width_m">Rộng (m, ≤90.000)</label><input id="rect_width_m" type="number" step="any" min="0" max="90000" /></div>
+      <div><label for="rect_height_m">Cao (m, ≤90.000)</label><input id="rect_height_m" type="number" step="any" min="0" max="90000" /></div>
+    </div>
+    <label for="rect_rotation_deg">Góc xoay (0–360°, chiều kim đồng hồ)</label><input id="rect_rotation_deg" type="number" step="any" min="0" max="360" value="0" />
+    <div id="rectangleStats" role="status" aria-live="polite"></div>
+    <div id="rectangleError" role="alert"></div>
+    <div class="row"><button id="rectangleClear" type="button">Xóa ROI</button><button id="rectangleFit" type="button">Xem toàn ROI</button></div>
+    <div class="hint">Kích thước/diện tích theo mét cục bộ, không phải hình chữ nhật trắc địa. Tìm bên ngoài GEE dùng bao ngoài; tải crop giữ đúng khung xoay. ZIP nguyên sản phẩm không cắt ROI.</div>
+    <div id="rectangleGrd" hidden>
+      <label for="rectangleGrdIds">S1 GRD: ID sản phẩm đã biết (1–6 UUID, ngăn bằng dấu phẩy)</label>
+      <input id="rectangleGrdIds" type="text" placeholder="UUID cảnh GRD" />
+      <button id="rectangleGrdCrop" type="button">Cắt / ghép GRD theo ROI</button>
+      <a id="rectangleGrdDownload" hidden>Tải GeoTIFF GRD (snapshot ROI)</a>
+      <div class="hint">Tìm GRD theo khung chưa được API hỗ trợ. Crop cần ID đã biết; giá trị measurement thô, chưa hiệu chuẩn σ0. Không dùng ID SLC.</div>
+    </div>
+  </section>
 
   <div id="provinceSelection" style="display:none">
     <label>Tinh/thanh pho</label>
@@ -79,7 +117,9 @@
   </div>
 
   <div id="communeSelection" style="display:none">
-    <label>Xa/phuong</label>
+    <label for="commune_search">Tìm xã/phường hoặc tỉnh/thành</label>
+    <input id="commune_search" type="search" placeholder="Nhập tên, có thể không dấu" />
+    <label for="commune_id">Xã/phường</label>
     <select id="commune_id">
       <option value="">Dang tai danh sach xa/phuong...</option>
     </select>
@@ -102,6 +142,9 @@
       <option value="landsat">Landsat 8/9 SR (30 m)</option>
       <option value="nicfi">Planet NICFI (4.77 m, composite tháng)</option>
       <option value="dynamic_world">Dynamic World land cover (10 m)</option>
+      <option value="dem_alos">DEM — ALOS AW3D30 (DSM, ~30 m)</option>
+      <option value="dem_srtm">DEM — SRTM (30 m)</option>
+      <option value="dem_copernicus">DEM — Copernicus GLO-30 (DSM, ~30 m)</option>
       <option value="s1gee">Sentinel-1 SAR GEE (10 m, VV/VH)</option>
       <option value="s1">Sentinel-1 GRD CDSE (ZIP cảnh đầy đủ)</option>
       <option value="s1slc">Sentinel-1 SLC CDSE (InSAR)</option>
@@ -163,7 +206,8 @@
     <div class="hint" id="compositeHint">Medoid giữ màu của cảnh gốc gần trung vị; app ưu tiên các cảnh ít sương/khói để tránh ảnh xám, phai. Base-score đặt cảnh trong nhất làm nền cho mỗi tile, các cảnh dự phòng chỉ lấp pixel bị mask mây. Mosaic ổn định chọn một cảnh trong cho mỗi tile và mask mây trước khi ghép. Mosaic nguyên gốc giống Mosaic ổn định nhưng KHÔNG mask mây — ảnh giữ nguyên mây như cảnh vệ tinh gốc (đẹp thị giác).</div>
   </div>
 
-  <div class="row">
+  <div id="demHint" class="hint" hidden>Độ cao theo mét, GeoTIFF Float32, NoData -9999. ALOS và Copernicus là DSM (gồm cây/công trình), không phải DTM đất trống. Không lọc ngày/mây. SRTM phủ khoảng 56°S–60°N. Vùng lớn có thể cần chờ tải/ghép tile.</div>
+  <div class="row" id="dateSelection">
     <div>
       <label>Ngày bắt đầu</label>
       <input id="start_date" type="date" />
@@ -194,12 +238,12 @@
   </div>
 
   <div id="timeSeriesSelection">
-    <label><input id="time_series_enabled" type="checkbox" /> Time series (GEE, theo vị trí)</label>
-    <div class="hint" id="timeSeriesHint">Lấy mọi cảnh, không lọc ngưỡng mây; NICFI là composite theo kỳ. Chỉ tải ZIP sau khi xác nhận. ROI là bbox; cảnh chứa tâm không bảo đảm phủ đủ bbox.</div>
+    <label><input id="time_series_enabled" type="checkbox" /> Time series (GEE, điểm / hình chữ nhật)</label>
+    <div class="hint" id="timeSeriesHint">Lấy mọi cảnh, không lọc ngưỡng mây; NICFI là composite theo kỳ. Chỉ tải ZIP sau khi xác nhận. ROI giữ đúng khung xoay; cảnh không bảo đảm phủ đủ ROI.</div>
   </div>
 
   <div id="cloudSelection">
-    <label><input id="least_cloud_enabled" type="checkbox" checked style="width:auto" /> Tự chọn ảnh ít mây nhất</label>
+    <label><input id="least_cloud_enabled" type="checkbox" checked style="width:auto" /> <span id="leastCloudLabel">Tự chọn ảnh ít mây nhất</span></label>
     <div id="cloudRange" hidden>
       <div class="row">
         <div><label for="cloud_min">Mây tối thiểu (%)</label><input id="cloud_min" type="number" min="0" max="100" step="1" value="0" /></div>
@@ -215,6 +259,7 @@
   </section>
   <button id="btnSearch">Tìm ảnh (ít mây nhất)</button>
   <div id="status"></div>
+  <div id="searchTiming" class="hint" role="status" aria-live="polite"></div>
 
   <div id="plan">
     <div id="planMeta"></div>
@@ -241,6 +286,7 @@
     <label>Vùng tải Esri</label>
     <select id="esriMode">
       <option value="point">Vị trí + bán kính vùng tải</option>
+      <option value="rectangle">Hình chữ nhật ROI đang chỉnh ở trên</option>
       <option value="bbox">Khung tọa độ WGS84 (nhập riêng)</option>
       <option value="commune">Xã/phường đang chọn ở trên</option>
     </select>
@@ -306,6 +352,7 @@ if (typeof L === 'undefined') {
   document.write('<script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js"><\/script>');
 }
 </script>
+<script src="/rectangle.js?v=rectangle-1"></script>
 <script>
 const $ = id => document.getElementById(id);
 
@@ -334,13 +381,18 @@ const layers = {
     })
 };
 layers['Vệ tinh (Esri)'].addTo(map);
-L.control.layers(layers).addTo(map);
+const mapLayerControl = L.control.layers(layers).addTo(map);
 
 let marker = null;
 let roiLayer = null;
 let provinceLayer = null;
 let selectedProvinceId = null;
 let communesLoaded = false;
+let communeLayer = null;
+let communeRequest = null;
+let communeRows = [];
+let provincesPromise = null;
+let communesPromise = null;
 const pointSelection = $('lon').closest('#sidebar > div');
 const radiusSelection = $('radius_m').closest('#sidebar > div');
 
@@ -390,31 +442,58 @@ async function loadProvinces() {
     provinceLayer = L.geoJSON(geojson, {
       style: provinceStyle,
       onEachFeature: (feature, layer) => {
-        layer.bindTooltip(feature.properties.name, {sticky: true});
+        const label = document.createElement('span');
+        label.textContent = feature.properties.name;
+        layer.bindTooltip(label, {sticky: true});
         layer.on('click', event => {
+          if ($('selection_mode').value !== 'province') return;
           L.DomEvent.stopPropagation(event);
-          selectProvince(feature.properties.id);
+          $('province_id').value = feature.properties.id;
+          $('province_id').dispatchEvent(new Event('change', {bubbles: true}));
         });
       }
-    }).addTo(map);
+    });
+    mapLayerControl.addOverlay(provinceLayer, 'Địa giới tỉnh/thành');
+    provinceLayer.addTo(map);
+    selectProvince($('province_id').value, false);
   } catch (error) {
-    $('provinceInfo').textContent = 'Khong the tai dia gioi: ' + error.message;
+    $('provinceInfo').textContent = 'Không thể tải địa giới: ' + error.message;
   }
+}
+
+function ensureProvinces() {
+  if (!provincesPromise) {
+    provincesPromise = loadProvinces().finally(() => { provincesPromise = null; });
+  }
+  return provincesPromise;
 }
 
 async function setSelectionMode() {
   const provinceMode = $('selection_mode').value === 'province';
   const communeMode = $('selection_mode').value === 'commune';
   const administrativeMode = provinceMode || communeMode;
-  pointSelection.style.display = administrativeMode ? 'none' : '';
-  radiusSelection.style.display = administrativeMode ? 'none' : '';
-  $('rotationSelection').style.display = administrativeMode ? 'none' : '';
+  const rectangleMode = $('selection_mode').value === 'rectangle';
+  if (typeof rectangleEditor !== 'undefined') rectangleEditor.setActive(rectangleMode);
+  if (administrativeMode || rectangleMode) {
+    if (marker) { map.removeLayer(marker); marker = null; }
+    if (roiLayer) { map.removeLayer(roiLayer); roiLayer = null; }
+  }
+  pointSelection.style.display = administrativeMode || rectangleMode ? 'none' : '';
+  radiusSelection.style.display = administrativeMode || rectangleMode ? 'none' : '';
+  $('rotationSelection').style.display = administrativeMode || rectangleMode ? 'none' : '';
   $('provinceSelection').style.display = provinceMode ? '' : 'none';
   $('communeSelection').style.display = communeMode ? '' : 'none';
   updateCompositeVisibility();
-  if (provinceMode) await loadProvinces();
-  if (communeMode) await loadCommunes();
-  if (!provinceMode && provinceLayer && map.hasLayer(provinceLayer)) map.removeLayer(provinceLayer);
+  if (!communeMode) {
+    if (communeRequest) communeRequest.abort();
+    if (communeLayer) map.removeLayer(communeLayer);
+    communeLayer = null;
+  }
+  await ensureProvinces();
+  if (communeMode) {
+    await ensureCommunes();
+    if ($('selection_mode').value === 'commune') await selectCommune($('commune_id').value);
+  }
 }
 
 async function loadCommunes() {
@@ -423,16 +502,70 @@ async function loadCommunes() {
     const res = await fetch('/api/admin/communes');
     if (!res.ok) throw new Error('Khong the tai danh sach xa/phuong');
     const data = await res.json();
-    $('commune_id').innerHTML = '<option value="">Chon xa/phuong</option>';
-    for (const commune of data.communes) {
-      const option = document.createElement('option');
-      option.value = commune.id;
-      option.textContent = `${commune.name} — ${commune.province_name}`;
-      $('commune_id').appendChild(option);
-    }
+    communeRows = data.communes;
     communesLoaded = true;
+    filterCommunes();
   } catch (error) {
     $('communeInfo').textContent = 'Khong the tai danh sach: ' + error.message;
+  }
+}
+
+function ensureCommunes() {
+  if (!communesPromise) {
+    communesPromise = loadCommunes().finally(() => { communesPromise = null; });
+  }
+  return communesPromise;
+}
+
+function placeSearchText(value) {
+  return value.normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/đ/g, 'd').replace(/Đ/g, 'D').toLowerCase();
+}
+
+function filterCommunes() {
+  const select = $('commune_id');
+  const selected = select.value;
+  const query = placeSearchText($('commune_search').value.trim());
+  select.replaceChildren(new Option('Chọn xã/phường', ''));
+  for (const commune of communeRows) {
+    const label = `${commune.name} — ${commune.province_name}`;
+    if (commune.id === selected || placeSearchText(label).includes(query)) {
+      select.add(new Option(label, commune.id));
+    }
+  }
+  select.value = selected;
+}
+
+async function selectCommune(communeId) {
+  if (communeRequest) communeRequest.abort();
+  if (communeLayer) map.removeLayer(communeLayer);
+  communeLayer = null;
+  if (!communeId || $('selection_mode').value !== 'commune') {
+    $('communeInfo').textContent = 'Chọn xã/phường để xem địa giới trên bản đồ.';
+    return;
+  }
+  const request = new AbortController();
+  communeRequest = request;
+  $('communeInfo').textContent = 'Đang tải địa giới xã/phường…';
+  try {
+    const response = await fetch(`/api/admin/communes/${encodeURIComponent(communeId)}`, {signal: request.signal});
+    if (!response.ok) throw new Error('Không thể tải địa giới xã/phường');
+    const feature = await response.json();
+    if (request.signal.aborted || $('selection_mode').value !== 'commune' || $('commune_id').value !== communeId) return;
+    const label = document.createElement('span');
+    label.textContent = `${feature.properties.name} — ${feature.properties.province_name}`;
+    communeLayer = L.geoJSON(feature, {
+      style: {color: '#fbbf24', weight: 3, fillColor: '#2563eb', fillOpacity: 0.18},
+      onEachFeature: (_feature, layer) => layer.bindTooltip(label, {sticky: true}),
+    }).addTo(map);
+    communeLayer.bringToFront();
+    map.fitBounds(communeLayer.getBounds(), {padding: [30, 30]});
+    $('communeInfo').textContent = label.textContent;
+  } catch (error) {
+    if (!request.signal.aborted && $('selection_mode').value === 'commune' && $('commune_id').value === communeId) {
+      $('communeInfo').textContent = 'Không thể tải địa giới: ' + error.message;
+    }
+  } finally {
+    if (communeRequest === request) communeRequest = null;
   }
 }
 
@@ -488,10 +621,26 @@ function renderCompositePlan(data) {
   $('plan').style.display = 'block';
 }
 
+function displaySearchTiming(response, started) {
+  const labels = {ee_init: 'Khởi tạo GEE', selection: 'Chuẩn bị vùng', scene_search: 'Chọn ảnh', preview_url: 'Tạo URL preview', composite_plan: 'Lập kế hoạch', total: 'Tổng backend'};
+  const parts = [`Chờ phản hồi: ${((performance.now() - started) / 1000).toFixed(2)} s`];
+  for (const metric of (response.headers.get('Server-Timing') || '').split(',')) {
+    const match = metric.trim().match(/^(\w+);dur=([\d.]+)$/);
+    if (match && labels[match[1]]) parts.push(`${labels[match[1]]}: ${(Number(match[2]) / 1000).toFixed(2)} s`);
+  }
+  const requestId = response.headers.get('X-Search-Request-ID');
+  if (requestId) parts.push(`Mã đo: ${requestId}`);
+  $('searchTiming').textContent = parts.join(' · ');
+}
+
 async function requestCompositePlan(body) {
+  const version = searchGeneration;
+  const started = performance.now();
+  $('searchTiming').textContent = 'Đang đo thời gian lập kế hoạch…';
   const res = await fetch('/api/composite-plan', {
     method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
   });
+  if (version === searchGeneration) displaySearchTiming(res, started);
   if (!res.ok) {
     const err = await res.json().catch(() => ({detail: res.statusText}));
     throw new Error(formatError(err) || 'Không thể lập kế hoạch composite');
@@ -511,7 +660,7 @@ let timeSeriesController = null;
 let timeSeriesSearching = false;
 
 function timeSeriesAvailable() {
-  return $('selection_mode').value === 'point' && TIME_SERIES_DATASETS.has($('dataset').value);
+  return ['point', 'rectangle'].includes($('selection_mode').value) && TIME_SERIES_DATASETS.has($('dataset').value);
 }
 
 function invalidateTimeSeries() {
@@ -544,7 +693,7 @@ function updateTimeSeriesVisibility() {
   if (!available) $('time_series_enabled').checked = false;
   $('timeSeriesSelection').style.display = available ? '' : 'none';
   $('pointMergeSelection').style.display =
-    $('selection_mode').value === 'point' && ['sentinel2', 'landsat'].includes($('dataset').value)
+    ['point', 'rectangle'].includes($('selection_mode').value) && ['sentinel2', 'landsat'].includes($('dataset').value)
     && !$('time_series_enabled').checked ? '' : 'none';
   $('btnSearch').textContent = $('time_series_enabled').checked
     ? 'Tìm ảnh time series' : ['sentinel2', 'landsat', 's2', 's2aws'].includes($('dataset').value) && !$('least_cloud_enabled').checked
@@ -748,13 +897,10 @@ function pointQuery(lon, lat) {
     `&rotation_deg=${encodeURIComponent(rotationValue() ?? 0)}`;
 }
 
-function pointDownloadQuery() {
-  return `&lon=${encodeURIComponent($('lon').value)}&lat=${encodeURIComponent($('lat').value)}` +
-    `&radius_m=${encodeURIComponent(Number($('radius_m').value) || 2000)}&rotation_deg=${encodeURIComponent(rotationValue() ?? 0)}`;
-}
-
 function renderResponseRoi(data) {
-  if (!data.roi_geometry || data.selection_mode !== 'point') return;
+  if (!data.roi_geometry || !['point', 'rectangle'].includes(data.selection_mode)) return;
+  // Rectangle editing layers remain authoritative; preview geometry must not remove handles.
+  if (data.selection_mode === 'rectangle') { rectangleEditor.render(); return; }
   if (roiLayer) map.removeLayer(roiLayer);
   roiLayer = L.geoJSON(data.roi_geometry, {color: '#38bdf8', weight: 2, fillOpacity: 0.05}).addTo(map);
   map.fitBounds(roiLayer.getBounds(), {padding: [30, 30]});
@@ -773,6 +919,7 @@ function updatePositionMap(recenter = true) {
   if (positionMapFrame) cancelAnimationFrame(positionMapFrame);
   positionMapFrame = requestAnimationFrame(() => {
     positionMapFrame = null;
+    if ($('selection_mode').value !== 'point') return;
     const polygon = pointRoiPolygon();
     if (roiLayer) { map.removeLayer(roiLayer); roiLayer = null; }
     if (!polygon) {
@@ -792,8 +939,7 @@ function updatePositionMap(recenter = true) {
 }
 
 function setPosition(lat, lon) {
-  invalidateTimeSeries();
-  updateCloudSelection();
+  invalidateSearchResults();
   $('lat').value = lat.toFixed(5);
   $('lon').value = lon.toFixed(5);
   updatePositionMap();
@@ -829,6 +975,9 @@ $('selection_mode').addEventListener('change', setSelectionMode);
 $('dataset').addEventListener('change', updateCompositeVisibility);
 $('slc_mode').addEventListener('change', updateSlcVisibility);
 $('province_id').addEventListener('change', e => selectProvince(e.target.value));
+$('commune_id').addEventListener('change', e => selectCommune(e.target.value));
+$('commune_search').addEventListener('input', filterCommunes);
+ensureProvinces();
 
 // Body request /api/scene cho dataset quang học (S2/Landsat/NICFI).
 function opticalSceneBody(selectionMode, provinceId, communeId, lon, lat) {
@@ -842,7 +991,7 @@ function opticalSceneBody(selectionMode, provinceId, communeId, lon, lat) {
     end_date: $('end_date').value,
     radius_m: parseFloat($('radius_m').value) || 2000,
     rotation_deg: rotationValue(),
-    merge_scenes: selectionMode === 'point' && ['sentinel2', 'landsat'].includes($('dataset').value)
+    merge_scenes: ['point', 'rectangle'].includes(selectionMode) && ['sentinel2', 'landsat'].includes($('dataset').value)
       && $('merge_scenes').checked
   };
   if (selectionMode === 'province') {
@@ -850,19 +999,64 @@ function opticalSceneBody(selectionMode, provinceId, communeId, lon, lat) {
       ? $('composite_method').value
       : 'mosaic';
   }
+  if (selectionMode === 'rectangle') return RectangleROI.body(body, rectangleEditor.get());
+  if (selectionMode !== 'point') body.rotation_deg = 0;
   return body;
 }
 
 let pendingCompositeBody = null;
 let sceneCatalog = null;
 let sceneCatalogGeneration = 0;
+let searchGeneration = 0;
+function invalidateSearchResults() {
+  searchGeneration++;
+  invalidateTimeSeries();
+  updateCloudSelection();
+  for (const id of ['result', 's1result', 'plan']) $(id).style.display = 'none';
+  $('rectangleGrdDownload').hidden = true;
+  $('preview').removeAttribute('src');
+  pendingCompositeBody = null;
+  $('searchTiming').textContent = '';
+  $('status').textContent = '';
+  $('btnSearch').disabled = false;
+}
+const rectangleEditor = new RectangleROI.Controller({map, L, element:$, onChange:invalidateSearchResults});
+for (const input of document.querySelectorAll('#sidebar input, #sidebar select')) {
+  if (input.id.startsWith('esri') || input.id.startsWith('rect_') || input.id === 'rectangleGrdIds') continue;
+  for (const event of ['input', 'change']) input.addEventListener(event, invalidateSearchResults);
+}
+$('rectangleGrdCrop').addEventListener('click', () => {
+  try {
+    if ($('selection_mode').value !== 'rectangle' || $('dataset').value !== 's1') throw new Error('Chọn hình chữ nhật và S1 GRD trước.');
+    const rect = rectangleEditor.get();
+    const ids = $('rectangleGrdIds').value.split(',').map(id => id.trim());
+    if (ids.length < 1 || ids.length > 6 || ids.some(id => !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id))) throw new Error('Nhập 1–6 UUID GRD hợp lệ, ngăn bằng dấu phẩy.');
+    const link = $('rectangleGrdDownload');
+    link.href = ids.length === 1
+      ? `/api/s1/crop?product_id=${encodeURIComponent(ids[0])}&${RectangleROI.query(rect)}`
+      : `/api/s1/crop-mosaic?product_ids=${ids.map(encodeURIComponent).join(',')}&${RectangleROI.query(rect)}`;
+    link.textContent = `Tải GeoTIFF ${ids.length} cảnh GRD (snapshot ROI ${rect.width_m.toFixed(1)} × ${rect.height_m.toFixed(1)} m, ${rect.rotation_deg.toFixed(2)}°)`;
+    link.hidden = false;
+    $('status').textContent = 'Liên kết giữ ROI tại thời điểm tạo; tải measurement thô, chưa hiệu chuẩn σ0.';
+  } catch (error) { $('status').textContent = error.message; }
+});
+$('rectangleGrdIds').addEventListener('input', () => { $('rectangleGrdDownload').hidden = true; });
+window.addEventListener('pagehide', () => rectangleEditor.cancel());
 function updateCloudSelection() {
+  const dem = $('dataset').value.startsWith('dem_');
+  $('demHint').hidden = !dem;
+  $('dateSelection').style.display = dem ? 'none' : '';
+  if (dem) $('pointMergeSelection').style.display = 'none';
+  else $('pointMergeSelection').style.display = ['point', 'rectangle'].includes($('selection_mode').value) ? '' : 'none';
+  const rectangleExternal = $('selection_mode').value === 'rectangle' && ['s2', 's2aws'].includes($('dataset').value);
+  $('leastCloudLabel').textContent = rectangleExternal ? 'Liệt kê mọi % mây (tìm theo bao ngoài ROI)' : 'Tự chọn ảnh ít mây nhất';
+  $('rectangleGrd').hidden = $('selection_mode').value !== 'rectangle' || $('dataset').value !== 's1';
   const supported = ['sentinel2', 'landsat', 's2', 's2aws'].includes($('dataset').value);
   const timeSeries = $('time_series_enabled').checked && timeSeriesAvailable();
   $('cloudSelection').hidden = !supported || timeSeries;
   const listing = supported && !timeSeries && !$('least_cloud_enabled').checked;
   $('cloudRange').hidden = !listing;
-  $('btnSearch').textContent = listing ? 'Liệt kê ảnh theo % mây' : timeSeries ? 'Tìm chuỗi thời gian' : 'Tìm ảnh (ít mây nhất)';
+  $('btnSearch').textContent = dem ? 'Tải DEM GeoTIFF (30 m)' : listing ? 'Liệt kê ảnh theo % mây' : timeSeries ? 'Tìm chuỗi thời gian' : rectangleExternal ? 'Liệt kê ảnh (bao ngoài ROI)' : 'Tìm ảnh (ít mây nhất)';
   sceneCatalog = null;
   sceneCatalogGeneration++;
   $('sceneCatalogResults').hidden = true;
@@ -871,16 +1065,38 @@ function renderSceneCatalog(data) {
   sceneCatalog = data;
   $('sceneCatalogResults').hidden = false;
   $('sceneCatalogMeta').textContent = `${data.total} ảnh — ${data.total ? data.offset + 1 : 0}–${data.offset + data.scenes.length}; mây ${data.parameters.cloud_min}–${data.parameters.cloud_max}%` +
-    (data.parameters.truncated ? ' — Đã chạm giới hạn catalogue; thu hẹp khoảng ngày để xem đủ ảnh.' : '');
+    (data.parameters.truncated ? ' — Đã chạm giới hạn catalogue; thu hẹp khoảng ngày để xem đủ ảnh.' : '') +
+    (data.parameters.selection_mode === 'rectangle' && ['aws', 'cdse'].includes(data.parameters.source)
+      ? ' — Tìm theo bao ngoài ROI; cảnh có thể chỉ giao một phần khung xoay. Crop dùng snapshot hình chữ nhật.' : '');
   const container = $('sceneCatalogRows'); container.replaceChildren();
   data.scenes.forEach(scene => {
     const row = document.createElement('div'); row.style.cssText = 'border-top:1px solid #334155;padding:8px 0;overflow-wrap:anywhere';
     const label = document.createElement('div');
     label.textContent = `${scene.date || ''} | Mây: ${scene.cloud_pct == null ? 'không rõ' : scene.cloud_pct + '%'} | ${scene.platform || ''}`;
     const id = document.createElement('div'); id.textContent = scene.asset_id || scene.name || scene.id;
-    const link = document.createElement('a'); link.textContent = 'Tải ảnh này (GeoTIFF)'; link.href = scene.download_url;
-    link.style.color = '#38bdf8';
-    row.append(label, id, link); container.appendChild(row);
+    row.append(label, id);
+    if (scene.download_url) {
+      const link = document.createElement('a'); link.textContent = 'Tải ảnh này (GeoTIFF, snapshot ROI)'; link.href = scene.download_url;
+      link.style.color = '#38bdf8';
+      row.appendChild(link);
+    } else {
+      const note = document.createElement('div'); note.textContent = 'Nguồn catalogue này chưa hỗ trợ tải/cắt ROI.'; row.appendChild(note);
+    }
+    const params = data.parameters || {};
+    if (params.selection_mode === 'rectangle' && ['aws', 'cdse'].includes(params.source) && scene.id) {
+      const rect = params.rectangle || params;
+      const crop = document.createElement('a');
+      crop.href = (params.source === 'aws' ? '/api/s2/aws/download?' : '/api/s2/bands?action=download&') +
+        `product_id=${encodeURIComponent(scene.id)}&${RectangleROI.query(rect)}`;
+      crop.textContent = params.source === 'aws' ? ' · AWS crop ROI' : ' · CDSE bands crop ROI';
+      crop.style.color = '#38bdf8'; row.appendChild(crop);
+      if (params.source === 'cdse') {
+        const raw = document.createElement('a');
+        raw.href = `/api/s2/download?product_id=${encodeURIComponent(scene.id)}&filename=${encodeURIComponent((scene.name || scene.id) + '.zip')}`;
+        raw.textContent = ' · ZIP nguyên sản phẩm (không cắt ROI)'; raw.style.color = '#4ade80'; row.appendChild(raw);
+      }
+    }
+    container.appendChild(row);
   });
   $('sceneCatalogPrev').disabled = data.offset === 0;
   $('sceneCatalogNext').disabled = data.offset + data.scenes.length >= data.total;
@@ -895,7 +1111,8 @@ async function searchSceneCatalog(offset = null) {
     if (offset !== null && sceneCatalog) {
       response = await fetch(`/api/scene-catalog/${encodeURIComponent(sceneCatalog.search_id)}?offset=${offset}&limit=50`);
     } else {
-      const min = $('cloud_min').value.trim(), max = $('cloud_max').value.trim();
+      const allClouds = $('selection_mode').value === 'rectangle' && ['s2', 's2aws'].includes($('dataset').value) && $('least_cloud_enabled').checked;
+      const min = allClouds ? '0' : $('cloud_min').value.trim(), max = allClouds ? '100' : $('cloud_max').value.trim();
       if (!min || !max || !Number.isFinite(Number(min)) || !Number.isFinite(Number(max)) || Number(min) < 0 || Number(max) > 100 || Number(min) > Number(max))
         throw new Error('Nhập khoảng mây hợp lệ: 0 ≤ tối thiểu ≤ tối đa ≤ 100.');
       const mode = $('selection_mode').value;
@@ -912,7 +1129,7 @@ async function searchSceneCatalog(offset = null) {
     $('status').textContent = data.total ? 'Chọn ảnh cụ thể để tải; không tự chọn lại ảnh ít mây nhất.' : 'Không có ảnh phù hợp khoảng ngày và % mây.';
   } catch (error) {
     if (token === sceneCatalogGeneration) $('status').textContent = 'Lỗi: ' + error.message;
-  } finally { btn.disabled = false; }
+  } finally { if (token === sceneCatalogGeneration) btn.disabled = false; }
 }
 $('sceneCatalogPrev').addEventListener('click', () => sceneCatalog && searchSceneCatalog(Math.max(0, sceneCatalog.offset - 50)));
 $('sceneCatalogNext').addEventListener('click', () => sceneCatalog && searchSceneCatalog(sceneCatalog.offset + 50));
@@ -925,13 +1142,18 @@ for (const id of ['lon', 'lat', 'radius_m', 'rotation_deg', 'rotation_slider', '
 updateCloudSelection();
 
 $('btnSearch').addEventListener('click', async () => {
+  $('searchTiming').textContent = '';
   const selectionMode = $('selection_mode').value;
   const provinceId = $('province_id').value;
   const communeId = $('commune_id').value;
   const administrativeMode = ['province', 'commune'].includes(selectionMode);
-  const lon = administrativeMode ? 0 : parseFloat($('lon').value);
-  const lat = administrativeMode ? 0 : parseFloat($('lat').value);
-  if (!isFinite(lon) || !isFinite(lat) || (!administrativeMode && rotationValue() === null)) {
+  const rectangleMode = selectionMode === 'rectangle';
+  if (rectangleMode) {
+    try { rectangleEditor.get(); } catch (error) { $('status').textContent = error.message; return; }
+  }
+  const lon = administrativeMode || rectangleMode ? null : parseFloat($('lon').value);
+  const lat = administrativeMode || rectangleMode ? null : parseFloat($('lat').value);
+  if (!isFinite(lon) || !isFinite(lat) || (selectionMode === 'point' && rotationValue() === null)) {
     $('status').textContent = 'Vui lòng nhập tọa độ và góc xoay hợp lệ (0–360°).'; return;
   }
   if (!isFinite(lon) || !isFinite(lat)) { $('status').textContent = 'Vui lòng chọn vị trí trước.'; return; }
@@ -950,18 +1172,57 @@ $('btnSearch').addEventListener('click', async () => {
   $('plan').style.display = 'none';
   pendingCompositeBody = null;
 
+  if (dataset.startsWith('dem_')) {
+    const version = searchGeneration;
+    const btn = $('btnSearch'); btn.disabled = true;
+    $('status').textContent = 'Đang tải và ghép DEM từ GEE…';
+    try {
+      const body = opticalSceneBody(selectionMode, provinceId, communeId, lon, lat);
+      const keys = ['selection_mode', 'lon', 'lat', 'radius_m', 'rotation_deg', 'center_lon', 'center_lat', 'width_m', 'height_m', 'province_id', 'commune_id'];
+      const params = new URLSearchParams({dataset: dataset.slice(4)});
+      for (const key of keys) if (body[key] != null) params.set(key, body[key]);
+      const response = await fetch('/api/dem/download?' + params);
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({detail: response.statusText}));
+        throw new Error(formatError(error));
+      }
+      const blob = await response.blob();
+      if (version !== searchGeneration) return;
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a'); link.href = url;
+      const disposition = response.headers.get('Content-Disposition') || '';
+      const serverFilename = disposition.match(/filename="([^"]+)"/);
+      link.download = serverFilename ? serverFilename[1] : `${dataset}_30m_${Date.now()}_${crypto.randomUUID()}.tif`;
+      document.body.appendChild(link); link.click(); link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+      $('status').textContent = 'Đã tải DEM GeoTIFF (độ cao mét, NoData -9999).';
+    } catch (error) {
+      if (version === searchGeneration) $('status').textContent = 'Lỗi: ' + error.message;
+    } finally { btn.disabled = false; }
+    return;
+  }
+
   if ($('time_series_enabled').checked && timeSeriesAvailable()) {
-    return searchTimeSeries({
+    const body = {
       selection_mode: selectionMode, dataset, lon, lat,
       start_date: $('start_date').value,
       end_date: $('end_date').value,
       radius_m: parseFloat($('radius_m').value),
       rotation_deg: rotationValue(),
       polarization: 'vvvh'
-    });
+    };
+    return searchTimeSeries(rectangleMode ? RectangleROI.body(body, rectangleEditor.get()) : body);
   }
 
-  if (['sentinel2', 'landsat', 's2', 's2aws'].includes(dataset) && !$('least_cloud_enabled').checked) {
+  if (rectangleMode && ['s1', 's1slc', 's3'].includes(dataset)) {
+    $('status').textContent = dataset === 's1'
+      ? 'API tìm S1 GRD chưa hỗ trợ bao ngoài ROI. Dùng ID GRD đã biết ở phần hình chữ nhật để cắt/ghép, hoặc chuyển chế độ điểm để tìm.'
+      : dataset === 's1slc' ? 'Tìm SLC / cặp InSAR chưa hỗ trợ bbox hình chữ nhật; hãy chuyển sang chế độ điểm. Không tự bỏ ROI.'
+      : 'Tìm Sentinel-3 chưa hỗ trợ bbox hình chữ nhật; hãy chuyển sang chế độ điểm. ZIP chỉ tải nguyên sản phẩm, không cắt ROI.';
+    return;
+  }
+
+  if ((rectangleMode && ['s2', 's2aws'].includes(dataset)) || (['sentinel2', 'landsat', 's2', 's2aws'].includes(dataset) && !$('least_cloud_enabled').checked)) {
     return searchSceneCatalog();
   }
 
@@ -989,16 +1250,18 @@ $('btnSearch').addEventListener('click', async () => {
   // danh sách scene từng tile) và CHỜ người dùng xác nhận trước khi chạy.
   if (administrativeMode && ['sentinel2', 'landsat'].includes(dataset)) {
     const btn = $('btnSearch');
+    const version = ++searchGeneration;
     btn.disabled = true; $('status').textContent = 'Đang lập kế hoạch composite…';
     try {
       const plan = await requestCompositePlan(body);
+      if (version !== searchGeneration) return;
       renderCompositePlan(plan);
       pendingCompositeBody = body;
       $('status').textContent = 'Nhấn "Xác nhận và chạy" để tiếp tục.';
     } catch (e) {
-      $('status').textContent = 'Lỗi: ' + e.message;
+      if (version === searchGeneration) $('status').textContent = 'Lỗi: ' + e.message;
     } finally {
-      btn.disabled = false;
+      if (version === searchGeneration) btn.disabled = false;
     }
     return;
   }
@@ -1007,18 +1270,23 @@ $('btnSearch').addEventListener('click', async () => {
 });
 
 async function runSceneSearch(body) {
+  const version = ++searchGeneration;
   const btn = $('btnSearch');
   btn.disabled = true; $('status').textContent = 'Đang truy vấn Earth Engine…';
+  $('searchTiming').textContent = 'Đang đo thời gian truy vấn…';
+  const started = performance.now();
   try {
     const res = await fetch('/api/scene', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(body)
     });
+    if (version === searchGeneration) displaySearchTiming(res, started);
     if (!res.ok) {
       const err = await res.json().catch(() => ({detail: res.statusText}));
       throw new Error(formatError(err) || 'Query failed');
     }
     const data = await res.json();
+    if (version !== searchGeneration) return;
     if (body.selection_mode === 'point' && body.rotation_deg % 360) {
       const actual = Number(data.rotation_deg);
       const linked = new URL(data.download_url, location.origin).searchParams.get('rotation_deg');
@@ -1050,9 +1318,9 @@ async function runSceneSearch(body) {
 
     $('result').style.display = 'block';
   } catch (e) {
-    $('status').textContent = 'Lỗi: ' + e.message;
+    if (version === searchGeneration) $('status').textContent = 'Lỗi: ' + e.message;
   } finally {
-    btn.disabled = false;
+    if (version === searchGeneration) btn.disabled = false;
   }
 }
 
@@ -1071,6 +1339,7 @@ $('cancelComposite').addEventListener('click', () => {
 });
 
 async function searchS1Gee(lon, lat) {
+  const version = ++searchGeneration;
   const selectionMode = $('selection_mode').value;
   const provinceId = $('province_id').value;
   const communeId = $('commune_id').value;
@@ -1078,7 +1347,7 @@ async function searchS1Gee(lon, lat) {
   btn.disabled = true; $('status').textContent = 'Đang truy vấn Sentinel-1 trên Earth Engine…';
   $('result').style.display = 'none';
   try {
-    const body = {
+    let body = {
       lon, lat,
       selection_mode: selectionMode,
       province_id: selectionMode === 'province' ? provinceId : null,
@@ -1089,6 +1358,8 @@ async function searchS1Gee(lon, lat) {
       rotation_deg: rotationValue(),
       polarization: 'vvvh'
     };
+    if (selectionMode === 'rectangle') body = RectangleROI.body(body, rectangleEditor.get());
+    else if (selectionMode !== 'point') body.rotation_deg = 0;
     const res = await fetch('/api/s1gee/scene', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(body)
@@ -1098,6 +1369,7 @@ async function searchS1Gee(lon, lat) {
       throw new Error(formatError(err) || 'Query failed');
     }
     const data = await res.json();
+    if (version !== searchGeneration) return;
 
     $('status').textContent = '';
     $('meta').innerHTML =
@@ -1112,13 +1384,14 @@ async function searchS1Gee(lon, lat) {
 
     $('result').style.display = 'block';
   } catch (e) {
-    $('status').textContent = 'Lỗi: ' + e.message;
+    if (version === searchGeneration) $('status').textContent = 'Lỗi: ' + e.message;
   } finally {
-    btn.disabled = false;
+    if (version === searchGeneration) btn.disabled = false;
   }
 }
 
 async function searchS1(lon, lat) {
+  const version = ++searchGeneration;
   const btn = $('btnSearch');
   btn.disabled = true; $('status').textContent = 'Đang tìm kiếm trên Copernicus catalogue…';
   try {
@@ -1130,6 +1403,7 @@ async function searchS1(lon, lat) {
       throw new Error(formatError(err) || 'Search failed');
     }
     const data = await res.json();
+    if (version !== searchGeneration) return;
     $('status').textContent = '';
     $('s1meta').innerHTML = `Tìm thấy <b>${data.count}</b> ảnh Sentinel-1 IW GRD (mới nhất trước):`;
 
@@ -1144,13 +1418,13 @@ async function searchS1(lon, lat) {
       const btns = document.createElement('div');
       btns.style.cssText = 'display:flex; gap:6px; flex-shrink:0;';
       const a = document.createElement('a');
-      a.href = `/api/s1/download?product_id=${p.id}&filename=${encodeURIComponent(p.name + '.zip')}` + pointDownloadQuery();
-      a.textContent = 'Tải ZIP';
+      a.href = `/api/s1/download?product_id=${p.id}&filename=${encodeURIComponent(p.name + '.zip')}`;
+      a.textContent = 'ZIP nguyên sản phẩm (không cắt ROI)';
       a.style.cssText = 'background:#059669; color:#fff; text-decoration:none; padding:6px 10px; border-radius:6px; font-weight:600;';
       // GRD ZIP ~1.7 GB vượt ngưỡng proxy 300MB — nút S3 tải theo chunk
       const b = document.createElement('a');
-      b.href = `/api/s1/s3/download?product_id=${p.id}&filename=${encodeURIComponent(p.name + '.zip')}` + pointDownloadQuery();
-      b.textContent = 'S3';
+      b.href = `/api/s1/s3/download?product_id=${p.id}&filename=${encodeURIComponent(p.name + '.zip')}`;
+      b.textContent = 'S3 ZIP nguyên sản phẩm (không cắt ROI)';
       b.title = 'Tải qua S3 eodata theo chunk 250MB — vượt giới hạn proxy 300MB, nhanh hơn ~8x';
       b.style.cssText = 'background:#f59e0b; color:#fff; text-decoration:none; padding:6px 10px; border-radius:6px; font-weight:600;';
       btns.appendChild(a); btns.appendChild(b);
@@ -1168,9 +1442,9 @@ async function searchS1(lon, lat) {
     }
     $('s1result').style.display = 'block';
   } catch (e) {
-    $('status').textContent = 'Lỗi: ' + e.message;
+    if (version === searchGeneration) $('status').textContent = 'Lỗi: ' + e.message;
   } finally {
-    btn.disabled = false;
+    if (version === searchGeneration) btn.disabled = false;
   }
 }
 
@@ -1179,6 +1453,7 @@ async function searchS1(lon, lat) {
 // ---------------------------------------------------------------
 
 async function searchS2(lon, lat, source) {
+  const version = ++searchGeneration;
   const btn = $('btnSearch');
   btn.disabled = true; $('status').textContent = 'Đang tìm kiếm Sentinel-2 L2A…';
   try {
@@ -1190,6 +1465,7 @@ async function searchS2(lon, lat, source) {
       throw new Error(formatError(err) || 'Search failed');
     }
     const data = await res.json();
+    if (version !== searchGeneration) return;
     $('status').textContent = '';
     const srcLabel = source === 'aws'
       ? 'AWS STAC (COG per-band, không cần tài khoản)'
@@ -1227,7 +1503,7 @@ async function searchS2(lon, lat, source) {
         // thành GeoTIFF đa lớp như đường AWS.
         const a = document.createElement('a');
         a.href = `/api/s2/download?product_id=${p.id}&filename=${encodeURIComponent(p.name + '.zip')}`;
-        a.textContent = 'Tải ZIP';
+        a.textContent = 'ZIP nguyên sản phẩm (không cắt ROI)';
         a.style.cssText = 'flex-shrink:0; background:#059669; color:#fff; text-decoration:none; padding:6px 10px; border-radius:6px; font-weight:600;';
         const b = document.createElement('a');
         const dlLon = $('lon').value || map.getCenter().lng;
@@ -1242,7 +1518,7 @@ async function searchS2(lon, lat, source) {
         // từng object trên S3 eodata theo chunk 250 MB rồi ghép thành 1 ZIP
         const c = document.createElement('a');
         c.href = `/api/s2/s3/download?product_id=${encodeURIComponent(p.id)}&filename=${encodeURIComponent(p.name + '.zip')}`;
-        c.textContent = 'S3';
+        c.textContent = 'S3 ZIP nguyên sản phẩm (không cắt ROI)';
         c.title = 'Tải ZIP đầy đủ qua S3 eodata theo chunk 250MB — vượt giới hạn proxy 300MB';
         c.style.cssText = 'flex-shrink:0; background:#f59e0b; color:#fff; text-decoration:none; padding:6px 10px; border-radius:6px; font-weight:600;';
         const btns = document.createElement('div');
@@ -1254,9 +1530,9 @@ async function searchS2(lon, lat, source) {
     }
     $('s1result').style.display = 'block';
   } catch (e) {
-    $('status').textContent = 'Lỗi: ' + e.message;
+    if (version === searchGeneration) $('status').textContent = 'Lỗi: ' + e.message;
   } finally {
-    btn.disabled = false;
+    if (version === searchGeneration) btn.disabled = false;
   }
 }
 
@@ -1277,7 +1553,7 @@ function provinceSceneDownloadLink(p, dataset) {
     a.style.background = '#0ea5e9';
   } else if (dataset === 's2' || dataset === 's3') {
     a.href = `/api/s2/download?product_id=${p.id}&filename=${encodeURIComponent(p.name + '.zip')}`;
-    a.textContent = 'Tải ZIP';
+    a.textContent = 'ZIP nguyên sản phẩm (không cắt ROI)';
     a.style.background = '#059669';
     if (dataset === 's2') {
       // Thêm nút tải band qua Nodes API cho S2 CDSE ở chế độ tỉnh
@@ -1290,7 +1566,7 @@ function provinceSceneDownloadLink(p, dataset) {
       // ZIP đầy đủ qua S3 eodata — lọt ngưỡng proxy 300MB
       const c = document.createElement('a');
       c.href = `/api/s2/s3/download?product_id=${encodeURIComponent(p.id)}&filename=${encodeURIComponent(p.name + '.zip')}`;
-      c.textContent = 'S3';
+      c.textContent = 'S3 ZIP nguyên sản phẩm (không cắt ROI)';
       c.title = 'Tải ZIP đầy đủ qua S3 eodata theo chunk 250MB — vượt giới hạn proxy 300MB';
       c.style.background = '#f59e0b';
       const wrap = document.createElement('div');
@@ -1303,12 +1579,12 @@ function provinceSceneDownloadLink(p, dataset) {
     }
   } else if (dataset === 's1slc') {
     a.href = `/api/s1/download?product_id=${encodeURIComponent(p.id)}&filename=${encodeURIComponent(p.name + '.zip')}`;
-    a.textContent = 'Tải SLC ZIP';
+    a.textContent = 'SLC ZIP nguyên sản phẩm (không cắt ROI)';
     a.style.background = '#7c3aed';
     // SLC ZIP ~7.5 GB bị gateway treo — thêm nút tải qua S3 (chunk 250MB)
     const b = document.createElement('a');
     b.href = `/api/s1/s3/download?product_id=${encodeURIComponent(p.id)}&filename=${encodeURIComponent(p.name + '.zip')}`;
-    b.textContent = 'S3';
+    b.textContent = 'S3 ZIP nguyên sản phẩm (không cắt ROI)';
     b.title = 'Tải qua S3 eodata theo chunk 250MB — vượt giới hạn proxy 300MB, nhanh hơn ~8x';
     b.style.background = '#f59e0b';
     const wrap = document.createElement('div');
@@ -1320,12 +1596,12 @@ function provinceSceneDownloadLink(p, dataset) {
     return wrap;
   } else {
     a.href = `/api/s1/download?product_id=${encodeURIComponent(p.id)}&filename=${encodeURIComponent(p.name + '.zip')}`;
-    a.textContent = 'Tải ZIP';
+    a.textContent = 'ZIP nguyên sản phẩm (không cắt ROI)';
     a.style.background = '#059669';
     // GRD ZIP ~1.7 GB cũng vượt ngưỡng proxy — thêm nút S3
     const b = document.createElement('a');
     b.href = `/api/s1/s3/download?product_id=${encodeURIComponent(p.id)}&filename=${encodeURIComponent(p.name + '.zip')}`;
-    b.textContent = 'S3';
+    b.textContent = 'S3 ZIP nguyên sản phẩm (không cắt ROI)';
     b.title = 'Tải qua S3 eodata theo chunk 250MB — vượt giới hạn proxy 300MB, nhanh hơn ~8x';
     b.style.background = '#f59e0b';
     // Cắt theo biên tỉnh: tải measurement VV/VH từ S3, warp GCP → WGS84,
@@ -1356,6 +1632,7 @@ function provinceSceneDownloadLink(p, dataset) {
 }
 
 async function searchProvinceScenes(dataset) {
+  const version = ++searchGeneration;
   const btn = $('btnSearch');
   const provinceId = $('province_id').value;
   btn.disabled = true; $('status').textContent = 'Đang quét mọi scene phủ tỉnh…';
@@ -1369,6 +1646,7 @@ async function searchProvinceScenes(dataset) {
       throw new Error(formatError(err) || 'Search failed');
     }
     const data = await res.json();
+    if (version !== searchGeneration) return;
     $('status').textContent = '';
     const isTilePass = dataset === 's2' || dataset === 's2aws';
     const groupLabel = isTilePass ? 'lượt quay (pass)' : 'ngày quay';
@@ -1463,13 +1741,14 @@ async function searchProvinceScenes(dataset) {
     }
     $('s1result').style.display = 'block';
   } catch (e) {
-    $('status').textContent = 'Lỗi: ' + e.message;
+    if (version === searchGeneration) $('status').textContent = 'Lỗi: ' + e.message;
   } finally {
-    btn.disabled = false;
+    if (version === searchGeneration) btn.disabled = false;
   }
 }
 
 async function searchS3(lon, lat) {
+  const version = ++searchGeneration;
   const btn = $('btnSearch');
   btn.disabled = true; $('status').textContent = 'Đang tìm kiếm Sentinel-3 trên CDSE…';
   try {
@@ -1482,6 +1761,7 @@ async function searchS3(lon, lat) {
       throw new Error(formatError(err) || 'Search failed');
     }
     const data = await res.json();
+    if (version !== searchGeneration) return;
     $('status').textContent = '';
     $('s1meta').innerHTML = `Tìm thấy <b>${data.count}</b> ảnh Sentinel-3 <b>${data.product_type}</b> (mới nhất trước):`;
 
@@ -1495,16 +1775,16 @@ async function searchS3(lon, lat) {
         `<span style="color:#94a3b8; font-size:11px;">${p.name.slice(0, 48)}… · ${p.size_gb.toFixed(2)} GB</span>`;
       const a = document.createElement('a');
       a.href = `/api/s2/download?product_id=${p.id}&filename=${encodeURIComponent(p.name + '.zip')}`;
-      a.textContent = 'Tải ZIP';
+      a.textContent = 'ZIP nguyên sản phẩm (không cắt ROI)';
       a.style.cssText = 'flex-shrink:0; background:#059669; color:#fff; text-decoration:none; padding:6px 10px; border-radius:6px; font-weight:600;';
       div.appendChild(info); div.appendChild(a);
       list.appendChild(div);
     }
     $('s1result').style.display = 'block';
   } catch (e) {
-    $('status').textContent = 'Lỗi: ' + e.message;
+    if (version === searchGeneration) $('status').textContent = 'Lỗi: ' + e.message;
   } finally {
-    btn.disabled = false;
+    if (version === searchGeneration) btn.disabled = false;
   }
 }
 
@@ -1523,12 +1803,12 @@ function slcDownloadLink(p) {
   wrap.style.cssText = 'display:flex; gap:6px; flex-shrink:0;';
   const a = document.createElement('a');
   a.href = `/api/s1/download?product_id=${encodeURIComponent(p.id)}&filename=${encodeURIComponent(p.name + '.zip')}`;
-  a.textContent = 'Tải SLC ZIP';
+  a.textContent = 'SLC ZIP nguyên sản phẩm (không cắt ROI)';
   a.style.cssText = 'background:#7c3aed; color:#fff; text-decoration:none; padding:6px 10px; border-radius:6px; font-weight:600;';
   // ZIP SLC ~7.5 GB bị gateway treo — nút S3 tải theo chunk 250MB
   const b = document.createElement('a');
   b.href = `/api/s1/s3/download?product_id=${encodeURIComponent(p.id)}&filename=${encodeURIComponent(p.name + '.zip')}`;
-  b.textContent = 'S3';
+  b.textContent = 'S3 ZIP nguyên sản phẩm (không cắt ROI)';
   b.title = 'Tải qua S3 eodata theo chunk 250MB — vượt giới hạn proxy 300MB, nhanh hơn ~8x';
   b.style.cssText = 'background:#f59e0b; color:#fff; text-decoration:none; padding:6px 10px; border-radius:6px; font-weight:600;';
   wrap.appendChild(a); wrap.appendChild(b);
@@ -1545,6 +1825,7 @@ function slcMetaText(p) {
 }
 
 async function searchS1Slc(lon, lat) {
+  const version = ++searchGeneration;
   const btn = $('btnSearch');
   btn.disabled = true; $('status').textContent = 'Đang tìm SLC trên Copernicus catalogue…';
   try {
@@ -1556,6 +1837,7 @@ async function searchS1Slc(lon, lat) {
       throw new Error(formatError(err) || 'Search failed');
     }
     const data = await res.json();
+    if (version !== searchGeneration) return;
     $('status').textContent = '';
     $('s1meta').innerHTML = `Tìm thấy <b>${data.count}</b> ảnh Sentinel-1 IW SLC (mới nhất trước). ` +
       `ZIP nguyên cảnh ~4–8 GB — dữ liệu pha cho InSAR.`;
@@ -1575,13 +1857,14 @@ async function searchS1Slc(lon, lat) {
     }
     $('s1result').style.display = 'block';
   } catch (e) {
-    $('status').textContent = 'Lỗi: ' + e.message;
+    if (version === searchGeneration) $('status').textContent = 'Lỗi: ' + e.message;
   } finally {
-    btn.disabled = false;
+    if (version === searchGeneration) btn.disabled = false;
   }
 }
 
 async function searchS1Pairs(lon, lat) {
+  const version = ++searchGeneration;
   const btn = $('btnSearch');
   btn.disabled = true; $('status').textContent = 'Đang tìm cặp SLC cho InSAR…';
   try {
@@ -1596,6 +1879,7 @@ async function searchS1Pairs(lon, lat) {
       throw new Error(formatError(err) || 'Search failed');
     }
     const data = await res.json();
+    if (version !== searchGeneration) return;
     $('status').textContent = '';
     $('s1meta').innerHTML = `Gợi ý <b>${data.count}</b> cặp SLC (Δt nhỏ nhất trước — mất tương quan chậm hơn).` +
       ` <span style="color:#fbbf24;">Baseline vuông góc chưa có trong catalogue CDSE</span> — kiểm tra thêm bằng SNAP/ASF nếu cần.`;
@@ -1633,12 +1917,12 @@ async function searchS1Pairs(lon, lat) {
     }
     $('s1result').style.display = 'block';
   } catch (e) {
-    $('status').textContent = 'Lỗi: ' + e.message;
+    if (version === searchGeneration) $('status').textContent = 'Lỗi: ' + e.message;
   } finally {
-    btn.disabled = false;
+    if (version === searchGeneration) btn.disabled = false;
   }
 }
 </script>
-<script src="/esri.js?v=rotated-grid-2"></script>
+<script src="/esri.js?v=rectangle-1"></script>
 </body>
 </html>

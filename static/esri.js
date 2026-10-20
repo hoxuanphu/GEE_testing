@@ -25,7 +25,9 @@
     const angle = Number(job.request?.rotation_deg) || 0;
     const gridNote = job.request?.bbox
       ? ' — Job bbox cũ/khung nhập riêng, lưới Bắc–Nam. Đổi góc không thay đổi file job này; tạo lượt tải mới.'
-      : ` — Góc lưới của job: ${angle}°; giữ nguyên theo thời điểm tạo job.`;
+      : job.request?.selection_mode === 'rectangle'
+        ? ` — ROI job: ${job.request.width_m} × ${job.request.height_m} m, tâm ${job.request.center_lon}, ${job.request.center_lat}, ${angle}°; snapshot lúc tạo, chỉnh ROI không đổi file này.`
+        : ` — Góc lưới của job: ${angle}°; giữ nguyên theo thời điểm tạo job.`;
     el('esriStatus').textContent = `${job.status}: ${progress.processed || 0}/${progress.total || 0} tile; thành công ${progress.succeeded || 0}, lỗi ${progress.failed || 0}, cache ${progress.cached || 0}` + (job.error ? ` — ${job.error}` : '') + (job.status === 'partial' ? ' — Ảnh chưa đầy đủ; có thể thử lại các tile thiếu.' : '') + gridNote;
     el('esriDownload').hidden = !['completed', 'partial'].includes(job.status);
     el('esriDownload').href = `/api/esri/jobs/${encodeURIComponent(job.job_id)}/download`;
@@ -50,8 +52,13 @@
   el('esriMode').addEventListener('change', async () => {
     const commune = el('esriMode').value === 'commune';
     const point = el('esriMode').value === 'point';
-    el('esriBboxFields').hidden = commune || point;
+    const rectangle = el('esriMode').value === 'rectangle';
+    el('esriBboxFields').hidden = commune || point || rectangle;
     el('esriPointInfo').hidden = !point;
+    if (rectangle) {
+      el('selection_mode').value = 'rectangle';
+      el('selection_mode').dispatchEvent(new Event('change'));
+    }
     if (point) {
       el('selection_mode').value = 'point';
       el('selection_mode').dispatchEvent(new Event('change'));
@@ -60,6 +67,13 @@
       el('selection_mode').value = 'commune';
       el('selection_mode').dispatchEvent(new Event('change'));
     }
+  });
+  el('selection_mode').addEventListener('change', () => {
+    const mode = el('selection_mode').value;
+    if (!['point', 'rectangle', 'commune'].includes(mode)) return;
+    el('esriMode').value = mode;
+    el('esriBboxFields').hidden = true;
+    el('esriPointInfo').hidden = mode !== 'point';
   });
   el('esriMapBounds').addEventListener('click', () => {
     const bounds = map.getBounds();
@@ -74,7 +88,12 @@
     el('esriStart').disabled = true;
     try {
       const body = {zoom: Number(el('esriZoom').value), workers: Number(el('esriWorkers').value), max_tiles: Number(el('esriMaxTiles').value)};
-      if (el('esriMode').value === 'commune') {
+      if (el('esriMode').value === 'rectangle') {
+        if (el('selection_mode').value !== 'rectangle') throw new Error('Chọn và vẽ hình chữ nhật trước khi tải.');
+        Object.assign(body, RectangleROI.body({}, rectangleEditor.get()));
+      } else if (el('selection_mode').value === 'rectangle' && el('esriMode').value !== 'bbox') {
+        throw new Error('ROI đang là hình chữ nhật: chọn cùng chế độ Esri để không thay bằng bán kính điểm.');
+      } else if (el('esriMode').value === 'commune') {
         body.commune_id = el('commune_id').value;
         if (!body.commune_id) throw new Error('Chọn xã/phường trước khi tải.');
       } else if (el('esriMode').value === 'point') {
