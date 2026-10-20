@@ -11,22 +11,55 @@ from rasterio.crs import CRS
 from rasterio.enums import Resampling
 from rasterio.vrt import WarpedVRT
 
-from .geo import point_roi
+from .geo import RectangleROI, point_roi
+
+
+def _build_rotated_grid(center_lon, center_lat, width_m, height_m, rotation_deg, scale_m) -> dict:
+    if not math.isfinite(scale_m) or scale_m <= 0:
+        raise ValueError("scale_m must be finite and positive")
+    columns = max(1, math.ceil(width_m / scale_m))
+    rows = max(1, math.ceil(height_m / scale_m))
+    pixel_width = width_m / columns
+    pixel_height = height_m / rows
+    t = math.radians(rotation_deg % 360)
+    c, s = math.cos(t), math.sin(t)
+    half_width, half_height = width_m / 2, height_m / 2
+    crs = CRS.from_string(
+        f"+proj=eqc +lat_ts={center_lat} +lat_0={center_lat} +lon_0={center_lon} "
+        f"+R={111320 * 180 / math.pi} +units=m +no_defs")
+    return {
+        "crs": crs.to_wkt(),
+        "transform": [
+            pixel_width * c,
+            -pixel_height * s,
+            -half_width * c + half_height * s,
+            -pixel_width * s,
+            -pixel_height * c,
+            half_width * s + half_height * c,
+        ],
+        "width": columns,
+        "height": rows,
+        "actual_pixel_size_m": pixel_width if columns == rows else (pixel_width, pixel_height),
+        "actual_pixel_width_m": pixel_width,
+        "actual_pixel_height_m": pixel_height,
+    }
 
 
 def build_rotated_grid(lon, lat, radius_m, rotation_deg, scale_m) -> dict:
     point_roi(lon, lat, radius_m, rotation_deg)
-    if not math.isfinite(scale_m) or scale_m <= 0:
-        raise ValueError("scale_m must be finite and positive")
-    n = max(1, math.ceil(2 * radius_m / scale_m))
-    p = 2 * radius_m / n
-    t = math.radians(rotation_deg % 360)
-    c, s, r = math.cos(t), math.sin(t), radius_m
-    crs = CRS.from_string(
-        f"+proj=eqc +lat_ts={lat} +lat_0={lat} +lon_0={lon} "
-        f"+R={111320 * 180 / math.pi} +units=m +no_defs")
-    return {"crs": crs.to_wkt(), "transform": [p*c, -p*s, -r*c+r*s, -p*s, -p*c, r*s+r*c],
-            "width": n, "height": n, "actual_pixel_size_m": p}
+    return _build_rotated_grid(lon, lat, 2 * radius_m, 2 * radius_m, rotation_deg, scale_m)
+
+
+def build_rectangle_grid(roi: RectangleROI, scale_m: float) -> dict:
+    """Build a pixel-aligned rotated grid whose footprint is exactly ``roi``."""
+    return _build_rotated_grid(
+        roi.center_lon,
+        roi.center_lat,
+        roi.width_m,
+        roi.height_m,
+        roi.rotation_deg,
+        scale_m,
+    )
 
 
 def grid_profile(grid, count=1, dtype="float32", nodata=float("nan")) -> dict:

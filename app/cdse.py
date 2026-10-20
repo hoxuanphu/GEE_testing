@@ -1,7 +1,9 @@
 """Copernicus Data Space Ecosystem (CDSE) client — Sentinel-1 SAR data.
 
 - Search (OData catalogue) is public, no auth needed.
-- Download requires a password-grant token (client_id=cdse-public) with the
+- S3 downloads use pre-provisioned Access_Key_S3 / Secret_Key_S3 only.
+  No password fallback or automatic key creation/deletion is performed.
+- Legacy OData download requires a password-grant token (client_id=cdse-public) with the
   CDSE portal username/password (CDSE_USERNAME / CDSE_PASSWORD in .env).
   Dashboard OAuth clients (CDSE_CLIENT_ID/SECRET) are Sentinel Hub credentials
   and are rejected by the OData download endpoint ("Token audience not allowed").
@@ -732,7 +734,6 @@ def download_s2_band_file(
 
 _S3_ENDPOINT = "https://eodata.dataspace.copernicus.eu"
 _S3_HOST = "eodata.dataspace.copernicus.eu"
-_S3_KEYS_URL = "https://s3-keys-manager.cloudferro.com/api/user/credentials"
 _S3_REGION = "default"
 _S3_SERVICE = "s3"
 _S3_BUCKET = "eodata"
@@ -753,36 +754,24 @@ def _reset_s3_creds_cache() -> None:
 
 
 def get_s3_credentials(force_new: bool = False) -> tuple[str, str]:
-    """Lấy credentials S3 (có cache) qua s3-keys-manager.
+    """Read pre-provisioned S3 keys only; never create or delete credentials.
 
-    Cache trong bộ nhớ process: mỗi request download không tạo key mới
-    (tài khoản CDSE giới hạn ~10 key). Nếu POST bị 403 (đầy key) thì tự
-    xoá TOÀN BỘ key cũ rồi thử lại.
+    force_new reloads local configuration, not credentials on the server.
     """
     global _S3_CREDS_CACHE
     if _S3_CREDS_CACHE and not force_new:
         return _S3_CREDS_CACHE
 
-    token = get_token()
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-    resp = requests.post(_S3_KEYS_URL, headers=headers, timeout=60)
-    if resp.status_code == 403:
-        # Hết chỗ — xoá tất cả key cũ rồi tạo lại
-        lst = requests.get(_S3_KEYS_URL, headers=headers, timeout=60)
-        if lst.status_code == 200:
-            for c in lst.json().get("credentials", []):
-                try:
-                    requests.delete(
-                        f"{_S3_KEYS_URL}/access_id/{c['access_id']}",
-                        headers=headers,
-                        timeout=60,
-                    )
-                except Exception:
-                    pass  # key nào xoá không được thì bỏ qua
-        resp = requests.post(_S3_KEYS_URL, headers=headers, timeout=60)
-    resp.raise_for_status()
-    d = resp.json()
-    _S3_CREDS_CACHE = (d["access_id"], d["secret"])
+    _ensure_env()
+    access_key = os.getenv("Access_Key_S3", "").strip()
+    secret = os.getenv("Secret_Key_S3", "").strip()
+    if not access_key or not secret:
+        raise RuntimeError(
+            "S3 credentials missing: set Access_Key_S3 and Secret_Key_S3 "
+            "in .env or the server environment (not .env.example). "
+            "CDSE username/password fallback is disabled for S3."
+        )
+    _S3_CREDS_CACHE = (access_key, secret)
     return _S3_CREDS_CACHE
 
 
@@ -850,24 +839,11 @@ def s3_list_product_files(product_id: str, creds: tuple[str, str] | None = None)
     """Liệt kê mọi object trong product .SAFE trên S3 (tên + dung lượng).
 
     Trả về [{key, size, rel}] — rel là đường dẫn tương đối trong .SAFE.
-    Nếu S3 trả 403 (key bị process khác xoá do chạm giới hạn 10 key),
-    tự tạo lại credentials rồi thử lại một lần.
+    Credentials must be provisioned outside the application.
     """
-    global _S3_CREDS_CACHE
     if creds is None:
         creds = get_s3_credentials()
-    for attempt in (1, 2):
-        try:
-            return _s3_list_product_files(product_id, creds)
-        except requests.HTTPError as exc:
-            if attempt == 1 and exc.response is not None \
-                    and exc.response.status_code == 403:
-                # Key đã bị xoá (vd: process khác dọn key khi đầy) → tạo mới
-                _reset_s3_creds_cache()
-                creds = get_s3_credentials(force_new=True)
-                continue
-            raise
-    raise RuntimeError("unreachable")
+    return _s3_list_product_files(product_id, creds)
 
 
 def _s3_list_product_files(
@@ -943,7 +919,6 @@ def iter_s3_object(
         requests.exceptions.ConnectionError,  # bao gồm cả SSLError
         requests.exceptions.Timeout,
         requests.exceptions.ChunkedEncodingError,
-        _S3AccessDenied,  # 403: key có thể bị xoá bởi process khác
     )
     _backoffs = (3, 7, 15, 30, 60)
 
@@ -956,10 +931,6 @@ def iter_s3_object(
         while emitted < chunk_len:
             pos = offset + emitted
             try:
-                # 403 giữa chừng = cached key bị xoá → nạp key mới rồi ký lại
-                fresh = _S3_CREDS_CACHE
-                if fresh is not None and (access_key, secret) != fresh:
-                    access_key, secret = fresh
                 headers = _sigv4_headers(
                     access_key, secret, "GET", canonical_uri, payload_hash,
                     extra_headers={"range": f"bytes={pos}-{chunk_end}"},
@@ -975,8 +946,7 @@ def iter_s3_object(
                     code = resp.status_code
                     resp.close()
                     if code == 403:
-                        # key không còn hợp lệ — process khác có thể vừa dọn
-                        # key; raise inner riêng để refresh credentials
+                        # Denied credentials require operator action, not retries.
                         raise _S3AccessDenied(f"HTTP 403 {body}")
                     if code in (429, 500, 502, 503, 504):
                         # lỗi tạm thời phía S3/proxy → cho retry
@@ -997,22 +967,11 @@ def iter_s3_object(
                     raise requests.exceptions.ChunkedEncodingError(
                         f"chunk thiếu: {emitted}/{chunk_len} bytes"
                     )
-            except _S3AccessDenied:
-                # Key cũ bị xoá (process khác dọn key khi đầy) → tạo key mới
-                # NGAY rồi thử lại, không ăn backoff dài
-                _reset_s3_creds_cache()
-                access_key, secret = get_s3_credentials(force_new=True)
-                attempt += 1
-                if attempt > max_attempts:
-                    raise RuntimeError(
-                        f"S3 GET {key.rsplit('/', 1)[-1]}: 403 persists "
-                        f"sau {max_attempts} lần refresh credentials"
-                    )
-                print(
-                    f"[s3-403] {key.rsplit('/', 1)[-1]}: credentials bị "
-                    f"invalid → đã tạo key mới, thử lại (lần {attempt})",
-                    flush=True,
-                )
+            except _S3AccessDenied as exc:
+                raise RuntimeError(
+                    "S3 access denied (HTTP 403). Check S3 key expiry, "
+                    "permissions and configuration; keys are never recreated automatically."
+                ) from exc
             except _transient as exc:
                 attempt += 1
                 if attempt > max_attempts:

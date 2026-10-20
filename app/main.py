@@ -19,6 +19,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .request_timing import SearchTimingMiddleware, measure_call
 from .esri import EsriRequest, EsriService, BusyError as EsriBusyError
 from .timeseries import BusyError, TimeSeriesService, TimeSeriesStore
 from .imagery import list_timeseries_scenes, timeseries_source_metadata
@@ -56,7 +57,14 @@ from .admin_boundaries import (
 )
 from .commune_boundaries import Commune, commune_feature, get_commune, list_communes
 from .ee_session import init_ee
-from .geo import Bbox, bbox_to_ee_geom, point_roi, source_bbox
+from .geo import (
+    MAX_RECTANGLE_DIMENSION_M,
+    Bbox,
+    RectangleROI,
+    bbox_to_ee_geom,
+    point_roi,
+    source_bbox,
+)
 from .raster_grid import build_rotated_grid, warp_to_grid, grid_profile, write_grid_band
 from .imagery import (
     LANDSAT_SCALE,
@@ -110,6 +118,7 @@ async def _lifespan(application):
 
 
 app = FastAPI(title="GEE Surface Reflectance Downloader", version="0.1.0", lifespan=_lifespan)
+app.add_middleware(SearchTimingMiddleware)
 
 app.add_middleware(
     CORSMiddleware,
@@ -124,6 +133,49 @@ _DOWNLOADS_DIR.mkdir(exist_ok=True)
 
 _MAX_RADIUS_M = 45_000.0
 _DEFAULT_DAYS = 30
+
+
+def _rectangle_model(
+    center_lon: float | None,
+    center_lat: float | None,
+    width_m: float | None,
+    height_m: float | None,
+    rotation_deg: float,
+) -> RectangleROI:
+    values = (center_lon, center_lat, width_m, height_m)
+    if any(value is None for value in values):
+        raise ValueError(
+            "rectangle selection requires center_lon, center_lat, width_m and height_m"
+        )
+    return RectangleROI(
+        center_lon=center_lon,
+        center_lat=center_lat,
+        width_m=width_m,
+        height_m=height_m,
+        rotation_deg=rotation_deg,
+    )
+
+
+def _validate_selection_fields(
+    selection_mode: str,
+    lon: float | None,
+    lat: float | None,
+    radius_m: float | None,
+    center_lon: float | None,
+    center_lat: float | None,
+    width_m: float | None,
+    height_m: float | None,
+    rotation_deg: float,
+) -> None:
+    rectangle_values = (center_lon, center_lat, width_m, height_m)
+    if selection_mode == "rectangle":
+        if lon is not None or lat is not None:
+            raise ValueError("rectangle selection uses center_lon and center_lat")
+        _rectangle_model(center_lon, center_lat, width_m, height_m, rotation_deg)
+    elif any(value is not None for value in rectangle_values):
+        raise ValueError("rectangle fields are only supported for rectangle selection")
+    elif selection_mode == "point" and lon is not None and lat is not None:
+        point_roi(lon, lat, radius_m, rotation_deg)
 
 # Import rasterio NGAY ở main thread: trên Windows, lần import đầu tiên
 # trong worker thread (threadpool FastAPI) bị lỗi DLL "handle is invalid"
@@ -157,17 +209,33 @@ class PointSelectionRequest(BaseModel):
     @model_validator(mode="after")
     def valid_rotation(self):
         self.rotation_deg %= 360
-        if self.selection_mode != "point" and self.rotation_deg:
-            raise ValueError("rotation_deg is only supported for point selection")
-        if self.selection_mode == "point" and self.lon is not None and self.lat is not None:
-            point_roi(self.lon, self.lat, self.radius_m, self.rotation_deg)
+        if self.selection_mode not in ("point", "rectangle") and self.rotation_deg:
+            raise ValueError("rotation_deg is only supported for point or rectangle selection")
+        try:
+            _validate_selection_fields(
+                self.selection_mode,
+                getattr(self, "lon", None),
+                getattr(self, "lat", None),
+                getattr(self, "radius_m", None),
+                getattr(self, "center_lon", None),
+                getattr(self, "center_lat", None),
+                getattr(self, "width_m", None),
+                getattr(self, "height_m", None),
+                self.rotation_deg,
+            )
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
         return self
 
 
 class SceneRequest(PointSelectionRequest):
-    selection_mode: Literal["point", "province", "commune"] = "point"
+    selection_mode: Literal["point", "rectangle", "province", "commune"] = "point"
     lon: float | None = Field(None, ge=-180, le=180, description="Longitude (degrees)")
     lat: float | None = Field(None, ge=-90, le=90, description="Latitude (degrees)")
+    center_lon: float | None = Field(None, ge=-180, le=180)
+    center_lat: float | None = Field(None, ge=-90, le=90)
+    width_m: float | None = Field(None, gt=0, le=MAX_RECTANGLE_DIMENSION_M)
+    height_m: float | None = Field(None, gt=0, le=MAX_RECTANGLE_DIMENSION_M)
     province_id: str | None = Field(None, min_length=1, max_length=20)
     commune_id: str | None = Field(None, min_length=1, max_length=20)
     dataset: str = Field(
@@ -203,7 +271,7 @@ class SceneResponse(BaseModel):
     bands: list[str]
     preview_url: str | None = None
     download_url: str | None = None
-    selection_mode: Literal["point", "province", "commune"]
+    selection_mode: Literal["point", "rectangle", "province", "commune"]
     province_id: str | None = None
     province_name: str | None = None
     commune_id: str | None = None
@@ -238,17 +306,34 @@ def _resolve_selection(
     selection_mode: str,
     lon: float | None,
     lat: float | None,
-    radius_m: float,
+    radius_m: float | None,
     province_id: str | None,
     commune_id: str | None = None,
     rotation_deg: float = 0,
+    center_lon: float | None = None,
+    center_lat: float | None = None,
+    width_m: float | None = None,
+    height_m: float | None = None,
 ) -> tuple[object, Bbox, Province | Commune | None]:
     """Resolve a trusted point or local administrative polygon into an ROI."""
     if not math.isfinite(rotation_deg) or not 0 <= rotation_deg <= 360:
         raise HTTPException(400, "rotation_deg must be finite and between 0 and 360")
     rotation_deg %= 360
-    if selection_mode != "point" and rotation_deg:
-        raise HTTPException(400, "rotation_deg is only supported for point selection")
+    if selection_mode not in ("point", "rectangle") and rotation_deg:
+        raise HTTPException(400, "rotation_deg is only supported for point or rectangle selection")
+    if selection_mode == "rectangle":
+        try:
+            rectangle = _rectangle_model(
+                center_lon, center_lat, width_m, height_m, rotation_deg
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        import ee
+        return (
+            ee.Geometry.Polygon(rectangle.geometry["coordinates"], geodesic=False),
+            rectangle.bbox,
+            None,
+        )
     if selection_mode == "commune":
         if not commune_id:
             raise HTTPException(400, "commune_id is required for commune selection")
@@ -296,10 +381,14 @@ def _bbox_dict(bbox: Bbox) -> dict[str, float]:
 
 class TimeSeriesRequest(PointSelectionRequest):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
-    selection_mode: Literal["point"] = "point"
+    selection_mode: Literal["point", "rectangle"] = "point"
     dataset: Literal["sentinel2", "landsat", "nicfi", "dynamic_world", "s1gee"]
-    lon: float = Field(..., ge=-180, le=180)
-    lat: float = Field(..., ge=-90, le=90)
+    lon: float | None = Field(None, ge=-180, le=180)
+    lat: float | None = Field(None, ge=-90, le=90)
+    center_lon: float | None = Field(None, ge=-180, le=180)
+    center_lat: float | None = Field(None, ge=-90, le=90)
+    width_m: float | None = Field(None, gt=0, le=MAX_RECTANGLE_DIMENSION_M)
+    height_m: float | None = Field(None, gt=0, le=MAX_RECTANGLE_DIMENSION_M)
     radius_m: float = Field(2000.0, gt=0, le=_MAX_RADIUS_M)
     start_date: str
     end_date: str
@@ -315,6 +404,10 @@ class TimeSeriesRequest(PointSelectionRequest):
 
     @model_validator(mode="after")
     def valid_interval(self):
+        if self.selection_mode == 'point' and (self.lon is None or self.lat is None):
+            raise ValueError('lon and lat are required for point selection')
+        if self.selection_mode == 'rectangle' and 'radius_m' in self.model_fields_set:
+            raise ValueError('rectangle selection uses width_m and height_m, not radius_m')
         if self.start_date > self.end_date:
             raise ValueError("start_date must not exceed end_date")
         if self.end_date == "9999-12-31":
@@ -340,18 +433,33 @@ class TimeSeriesJobRequest(BaseModel):
 @app.post("/api/timeseries/search")
 def search_timeseries(body: TimeSeriesRequest) -> dict:
     _ensure_ee()
-    roi, bbox, _ = _resolve_selection("point", body.lon, body.lat, body.radius_m, None, rotation_deg=body.rotation_deg)
+    rectangle = (_rectangle_model(body.center_lon, body.center_lat, body.width_m,
+                                  body.height_m, body.rotation_deg)
+                 if body.selection_mode == 'rectangle' else None)
+    rectangle_args = ({field: getattr(body, field) for field in
+                       ('center_lon', 'center_lat', 'width_m', 'height_m')} if rectangle else {})
+    roi, bbox, _ = _resolve_selection(body.selection_mode, body.lon, body.lat, body.radius_m,
+                                     None, rotation_deg=body.rotation_deg, **rectangle_args)
     end_exclusive = (dt.date.fromisoformat(body.end_date) + dt.timedelta(days=1)).isoformat()
     try:
-        scenes = list_timeseries_scenes(body.dataset, body.lon, body.lat,
+        scenes = list_timeseries_scenes(body.dataset,
+                                       rectangle.center_lon if rectangle else body.lon,
+                                       rectangle.center_lat if rectangle else body.lat,
                                        body.start_date, end_exclusive, body.polarization,
-                                       **({"roi": roi} if body.rotation_deg else {}))
+                                       **({"roi": roi} if rectangle or body.rotation_deg else {}))
         parameters = body.model_dump()
+        if rectangle is None:
+            for field in ('center_lon', 'center_lat', 'width_m', 'height_m'):
+                parameters.pop(field, None)
         parameters.update(timeseries_source_metadata(body.dataset, body.polarization))
         parameters["bbox"] = vars(bbox)
         parameters["crs"] = "EPSG:4326"
-        parameters["roi_geometry"] = point_roi(body.lon, body.lat, body.radius_m, body.rotation_deg)[0]
-        if body.rotation_deg:
+        parameters["roi_geometry"] = (rectangle.geometry if rectangle else
+                                      point_roi(body.lon, body.lat, body.radius_m, body.rotation_deg)[0])
+        if rectangle is not None:
+            parameters['rectangle'] = rectangle.model_dump()
+            parameters['output_grid'] = rectangle.output_grid(parameters['scale_m'])
+        elif body.rotation_deg:
             parameters["output_grid"] = build_rotated_grid(body.lon, body.lat, body.radius_m,
                                                           body.rotation_deg, parameters["scale_m"])
         scenes = [TimeSeriesSceneResponse.model_validate(scene).model_dump() for scene in scenes]
@@ -502,12 +610,22 @@ def admin_commune(commune_id: str) -> dict:
 
 @app.post("/api/scene", response_model=SceneResponse)
 def find_scene(req: SceneRequest) -> SceneResponse:
-    _ensure_ee()
+    measure_call("ee_init", _ensure_ee)
     if req.start_date > req.end_date:
         raise HTTPException(400, "start_date must be <= end_date")
 
-    roi, bbox, province = _resolve_selection(
-        req.selection_mode, req.lon, req.lat, req.radius_m, req.province_id, req.commune_id, req.rotation_deg
+    roi, bbox, province = measure_call("selection", _resolve_selection,
+        req.selection_mode,
+        req.lon,
+        req.lat,
+        req.radius_m,
+        req.province_id,
+        req.commune_id,
+        req.rotation_deg,
+        req.center_lon,
+        req.center_lat,
+        req.width_m,
+        req.height_m,
     )
 
     # Inclusive end date for GEE filterDate (shift by +1 day)
@@ -517,7 +635,7 @@ def find_scene(req: SceneRequest) -> SceneResponse:
 
     try:
         if province is not None:
-            scene = best_scene_for_roi(
+            scene = measure_call("scene_search", best_scene_for_roi,
                 req.dataset,
                 roi,
                 req.start_date,
@@ -526,15 +644,17 @@ def find_scene(req: SceneRequest) -> SceneResponse:
                 composite_method=req.composite_method,
             )
         else:
-            scene = best_scene(
+            scene = measure_call("scene_search", best_scene,
                 dataset=req.dataset,
-                lon=req.lon,
-                lat=req.lat,
-                radius_m=req.radius_m,
+                lon=req.center_lon if req.selection_mode == "rectangle" else req.lon,
+                lat=req.center_lat if req.selection_mode == "rectangle" else req.lat,
+                radius_m=(max(req.width_m, req.height_m) / 2
+                          if req.selection_mode == "rectangle" else req.radius_m),
                 start_date=req.start_date,
                 end_date=end_exclusive,
                 merge_scenes=req.merge_scenes,
-                roi=roi if req.rotation_deg else None,
+                roi=roi if req.selection_mode in ("rectangle",) or req.rotation_deg else None,
+                bbox=bbox if req.selection_mode == "rectangle" else None,
             )
     except InsufficientCoverageError:
         raise
@@ -572,8 +692,13 @@ def find_scene(req: SceneRequest) -> SceneResponse:
         bands = ["SR_B2", "SR_B3", "SR_B4", "SR_B5", "SR_B6", "SR_B7"]
 
     try:
-        preview_url = preview_rgb(
-            scene.ee_object, req.dataset, bbox, roi if province is not None or req.rotation_deg else None
+        preview_url = measure_call(
+            "preview_url",
+            preview_rgb,
+            scene.ee_object,
+            req.dataset,
+            bbox,
+            roi if province is not None or req.selection_mode == "rectangle" or req.rotation_deg else None,
         )
     except Exception:
         preview_url = None
@@ -587,6 +712,12 @@ def find_scene(req: SceneRequest) -> SceneResponse:
         )
         download_params = (
             f"?{selection_query}"
+            f"&start_date={req.start_date}&end_date={req.end_date}"
+        )
+    elif req.selection_mode == "rectangle":
+        download_params = (
+            f"?selection_mode=rectangle&center_lon={req.center_lon}&center_lat={req.center_lat}"
+            f"&width_m={req.width_m}&height_m={req.height_m}&rotation_deg={req.rotation_deg}"
             f"&start_date={req.start_date}&end_date={req.end_date}"
         )
     else:
@@ -607,7 +738,15 @@ def find_scene(req: SceneRequest) -> SceneResponse:
         date=scene.date,
         cloud_pct=scene.cloud_pct,
         bbox=bbox_dict,
-        roi_geometry=province.geometry if province else point_roi(req.lon, req.lat, req.radius_m, req.rotation_deg)[0],
+        roi_geometry=(
+            province.geometry
+            if province
+            else _rectangle_model(
+                req.center_lon, req.center_lat, req.width_m, req.height_m, req.rotation_deg
+            ).geometry
+            if req.selection_mode == "rectangle"
+            else point_roi(req.lon, req.lat, req.radius_m, req.rotation_deg)[0]
+        ),
         rotation_deg=req.rotation_deg,
         scale_m=_scale_for(req.dataset),
         bands=bands,
@@ -634,7 +773,7 @@ def find_scene(req: SceneRequest) -> SceneResponse:
 @app.post("/api/composite-plan")
 def plan_composite(req: SceneRequest) -> dict:
     """Preview the cost and scenes before running a province composite."""
-    _ensure_ee()
+    measure_call("ee_init", _ensure_ee)
     if req.start_date > req.end_date:
         raise HTTPException(400, "start_date must be <= end_date")
     if req.selection_mode not in ("province", "commune"):
@@ -642,12 +781,12 @@ def plan_composite(req: SceneRequest) -> dict:
     if req.dataset not in ("sentinel2", "landsat"):
         raise HTTPException(400, "Composite planning is only available for Sentinel-2 or Landsat")
 
-    roi, _bbox, _province = _resolve_selection(
+    roi, _bbox, _province = measure_call("selection", _resolve_selection,
         req.selection_mode, req.lon, req.lat, req.radius_m, req.province_id, req.commune_id, req.rotation_deg
     )
     end_exclusive = (dt.date.fromisoformat(req.end_date) + dt.timedelta(days=1)).isoformat()
     try:
-        plan = composite_plan(
+        plan = measure_call("composite_plan", composite_plan,
             req.dataset, roi, req.start_date, end_exclusive, req.composite_method
         )
     except Exception as exc:
@@ -662,9 +801,13 @@ def download(
     dataset: str,
     start_date: str,
     end_date: str,
-    selection_mode: Literal["point", "province", "commune"] = "point",
+    selection_mode: Literal["point", "rectangle", "province", "commune"] = "point",
     lon: float | None = None,
     lat: float | None = None,
+    center_lon: float | None = None,
+    center_lat: float | None = None,
+    width_m: float | None = None,
+    height_m: float | None = None,
     radius_m: float = 2000.0,
     province_id: str | None = None,
     commune_id: str | None = None,
@@ -680,7 +823,17 @@ def download(
             400, "dataset must be sentinel2, landsat, nicfi or dynamic_world"
         )
     roi, bbox, province = _resolve_selection(
-        selection_mode, lon, lat, radius_m, province_id, commune_id, rotation_deg
+        selection_mode,
+        lon,
+        lat,
+        radius_m,
+        province_id,
+        commune_id,
+        rotation_deg,
+        center_lon,
+        center_lat,
+        width_m,
+        height_m,
     )
 
     end_exclusive = (
@@ -701,27 +854,45 @@ def download(
     else:
         scene = best_scene(
             dataset=dataset,
-            lon=lon,
-            lat=lat,
-            radius_m=radius_m,
+            lon=center_lon if selection_mode == "rectangle" else lon,
+            lat=center_lat if selection_mode == "rectangle" else lat,
+            radius_m=(max(width_m, height_m) / 2
+                      if selection_mode == "rectangle" else radius_m),
             start_date=start_date,
             end_date=end_exclusive,
             merge_scenes=merge_scenes,
-            roi=roi if rotation_deg % 360 else None,
+            roi=roi if selection_mode == "rectangle" or rotation_deg % 360 else None,
+            bbox=bbox if selection_mode == "rectangle" else None,
         )
     if scene is None:
         raise HTTPException(404, "No scene found for this point/date range")
 
     scale = _scale_for(dataset)
-    output_grid = build_rotated_grid(lon, lat, radius_m, rotation_deg, scale) if rotation_deg % 360 else None
+    rectangle = (
+        _rectangle_model(center_lon, center_lat, width_m, height_m, rotation_deg)
+        if selection_mode == "rectangle"
+        else None
+    )
+    output_grid = (
+        rectangle.output_grid(scale)
+        if rectangle is not None
+        else build_rotated_grid(lon, lat, radius_m, rotation_deg, scale)
+        if rotation_deg % 360
+        else None
+    )
     if output_grid:
-        bbox = source_bbox(bbox, scale, lat)
+        bbox = source_bbox(
+            bbox,
+            scale,
+            rectangle.center_lat if rectangle is not None else lat,
+        )
     band_urls = download_geotiff(
         scene.ee_object,
         dataset,
         bbox,
         scale,
         roi if province is not None else None,
+        # Keep the interpolation halo for rectangle grids; warp applies the final footprint.
         # Medoid/base-score có graph nhiều scene; tile quá lớn có thể chết
         # "User memory limit exceeded" lúc fetch, nên chia sẵn theo diện tích.
         max_tile_pixels=MEDOID_MAX_TILE_PIXELS
@@ -738,10 +909,16 @@ def download(
         )
         fname = f"{dataset}_{province.id}_{start_date}_{end_date}_{method_tag}.tif"
     else:
-        fname = f"{dataset}_{scene.scene_id[:40]}_{scene.date}.tif"
+        fname = f"{dataset}_{scene.scene_id}_{scene.date}.tif"
     if output_grid:
-        fname = f"{Path(fname).stem}_pt{lon:.5f}_{lat:.5f}_r{radius_m:g}_a{rotation_deg % 360:g}.tif"
-    out = _DOWNLOADS_DIR / (f"{uuid.uuid4().hex}_{fname}" if output_grid else fname)
+        if rectangle is not None:
+            fname = (
+                f"{Path(fname).stem}_rect{rectangle.center_lon:.5f}_{rectangle.center_lat:.5f}"
+                f"_w{rectangle.width_m:g}_h{rectangle.height_m:g}_a{rectangle.rotation_deg:g}.tif"
+            )
+        else:
+            fname = f"{Path(fname).stem}_pt{lon:.5f}_{lat:.5f}_r{radius_m:g}_a{rotation_deg % 360:g}.tif"
+    out = _DOWNLOADS_DIR / f"{uuid.uuid4().hex}.tif"
     raw = out.with_suffix(".source.tif") if output_grid else out
     try:
         merge_band_tiffs(
@@ -767,14 +944,100 @@ def download(
 
 
 # ---------------------------------------------------------------------------
+# Static elevation products (no date or cloud filtering).
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/dem/download")
+def dem_download(
+    dataset: Literal["alos", "srtm", "copernicus"] = "alos",
+    selection_mode: Literal["point", "rectangle", "province", "commune"] = "point",
+    lon: float | None = None,
+    lat: float | None = None,
+    radius_m: float = 2000.0,
+    center_lon: float | None = None,
+    center_lat: float | None = None,
+    width_m: float | None = None,
+    height_m: float | None = None,
+    rotation_deg: float = 0.0,
+    province_id: str | None = None,
+    commune_id: str | None = None,
+):
+    import ee
+    from .dem import elevation_filename, elevation_image, finalize_elevation
+
+    try:
+        _validate_selection_fields(selection_mode, lon, lat, radius_m,
+                                   center_lon, center_lat, width_m, height_m, rotation_deg)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    _ensure_ee()
+    roi, bbox, _ = _resolve_selection(
+        selection_mode, lon, lat, radius_m, province_id, commune_id,
+        rotation_deg, center_lon, center_lat, width_m, height_m,
+    )
+    rectangle = (_rectangle_model(center_lon, center_lat, width_m, height_m, rotation_deg)
+                 if selection_mode == "rectangle" else None)
+    grid = (rectangle.output_grid(30) if rectangle else
+            build_rotated_grid(lon, lat, radius_m, rotation_deg, 30)
+            if rotation_deg % 360 else None)
+    if grid:
+        bbox = source_bbox(bbox, 30, rectangle.center_lat if rectangle else lat)
+    if rectangle:
+        region_tag = (f"rect_lon{rectangle.center_lon:.5f}_lat{rectangle.center_lat:.5f}"
+                      f"_w{rectangle.width_m:g}_h{rectangle.height_m:g}_a{rectangle.rotation_deg:g}")
+    elif selection_mode == "point":
+        region_tag = f"pt_lon{lon:.5f}_lat{lat:.5f}_r{radius_m:g}_a{rotation_deg % 360:g}"
+    else:
+        region_tag = f"{selection_mode}_{province_id if selection_mode == 'province' else commune_id}"
+    filename = elevation_filename(dataset, region_tag)
+    out = _DOWNLOADS_DIR / filename
+    raw = out.with_suffix(".source.tif") if grid else out
+    try:
+        image = elevation_image(dataset, roi)
+        if dataset == "srtm" and (bbox.south < -56 or bbox.north > 60):
+            raise HTTPException(400, "SRTM chỉ phủ khoảng 56°S–60°N. Chọn ALOS hoặc Copernicus.")
+        has_data = image.reduceRegion(
+            reducer=ee.Reducer.count(), geometry=roi,
+            scale=30, maxPixels=100_000_000, bestEffort=True,
+        ).get("elevation").getInfo()
+        if not has_data:
+            raise HTTPException(404, "Không có dữ liệu độ cao tại vùng đã chọn.")
+        urls = download_geotiff(image, "dem", bbox, 30, None if grid else roi,
+                                max_tile_pixels=4_000_000)
+        merge_band_tiffs(urls, raw, preserve_masks=True)
+        finalize_elevation(raw)
+        if grid:
+            warp_to_grid(raw, out, grid)
+            finalize_elevation(out)
+    except HTTPException:
+        out.unlink(missing_ok=True)
+        raise
+    except ValueError as exc:
+        out.unlink(missing_ok=True)
+        raise HTTPException(404, str(exc)) from exc
+    except Exception as exc:
+        out.unlink(missing_ok=True)
+        raise HTTPException(502, f"Không thể tải DEM từ GEE: {exc}") from exc
+    finally:
+        if grid:
+            raw.unlink(missing_ok=True)
+    return FileResponse(out, media_type="image/tiff", filename=filename)
+
+
+# ---------------------------------------------------------------------------
 # Sentinel-1 SAR trên GEE (không cần tài khoản CDSE)
 # ---------------------------------------------------------------------------
 
 
 class S1SceneRequest(PointSelectionRequest):
-    selection_mode: Literal["point", "province", "commune"] = "point"
+    selection_mode: Literal["point", "rectangle", "province", "commune"] = "point"
     lon: float | None = Field(None, ge=-180, le=180)
     lat: float | None = Field(None, ge=-90, le=90)
+    center_lon: float | None = Field(None, ge=-180, le=180)
+    center_lat: float | None = Field(None, ge=-90, le=90)
+    width_m: float | None = Field(None, gt=0, le=MAX_RECTANGLE_DIMENSION_M)
+    height_m: float | None = Field(None, gt=0, le=MAX_RECTANGLE_DIMENSION_M)
     province_id: str | None = Field(None, min_length=1, max_length=20)
     commune_id: str | None = Field(None, min_length=1, max_length=20)
     start_date: str = Field(..., description="YYYY-MM-DD")
@@ -800,7 +1063,17 @@ def find_s1_scene(req: S1SceneRequest):
         raise HTTPException(400, "start_date must be <= end_date")
 
     roi, bbox, province = _resolve_selection(
-        req.selection_mode, req.lon, req.lat, req.radius_m, req.province_id, req.commune_id, req.rotation_deg
+        req.selection_mode,
+        req.lon,
+        req.lat,
+        req.radius_m,
+        req.province_id,
+        req.commune_id,
+        req.rotation_deg,
+        req.center_lon,
+        req.center_lat,
+        req.width_m,
+        req.height_m,
     )
 
     end_exclusive = (
@@ -813,13 +1086,14 @@ def find_s1_scene(req: S1SceneRequest):
             )
         else:
             scene = best_s1_scene(
-                lon=req.lon,
-                lat=req.lat,
-                radius_m=req.radius_m,
+                lon=req.center_lon if req.selection_mode == "rectangle" else req.lon,
+                lat=req.center_lat if req.selection_mode == "rectangle" else req.lat,
+                radius_m=(max(req.width_m, req.height_m) / 2
+                          if req.selection_mode == "rectangle" else req.radius_m),
                 start_date=req.start_date,
                 end_date=end_exclusive,
                 polarization=req.polarization,
-                roi=roi if req.rotation_deg else None,
+                roi=roi if req.selection_mode == "rectangle" or req.rotation_deg else None,
             )
     except Exception as exc:
         raise HTTPException(502, f"Earth Engine query failed: {exc}") from exc
@@ -838,7 +1112,10 @@ def find_s1_scene(req: S1SceneRequest):
 
     try:
         preview_url = preview_rgb(
-            scene.ee_object, "s1gee", bbox, roi if province is not None or req.rotation_deg else None
+            scene.ee_object,
+            "s1gee",
+            bbox,
+            roi if province is not None or req.selection_mode == "rectangle" or req.rotation_deg else None,
         )
     except Exception:
         preview_url = None
@@ -854,6 +1131,13 @@ def find_s1_scene(req: S1SceneRequest):
             f"&start_date={req.start_date}&end_date={req.end_date}"
             f"&polarization={req.polarization}"
         )
+    elif req.selection_mode == "rectangle":
+        download_params = (
+            f"?selection_mode=rectangle&center_lon={req.center_lon}&center_lat={req.center_lat}"
+            f"&width_m={req.width_m}&height_m={req.height_m}&rotation_deg={req.rotation_deg}"
+            f"&start_date={req.start_date}&end_date={req.end_date}"
+            f"&polarization={req.polarization}"
+        )
     else:
         download_params = (
             f"?selection_mode=point&lon={req.lon}&lat={req.lat}&radius_m={req.radius_m}&rotation_deg={req.rotation_deg}"
@@ -866,7 +1150,15 @@ def find_s1_scene(req: S1SceneRequest):
         "date": scene.date,
         "cloud_pct": scene.cloud_pct,
         "bbox": _bbox_dict(bbox),
-        "roi_geometry": province.geometry if province else point_roi(req.lon, req.lat, req.radius_m, req.rotation_deg)[0],
+        "roi_geometry": (
+            province.geometry
+            if province
+            else _rectangle_model(
+                req.center_lon, req.center_lat, req.width_m, req.height_m, req.rotation_deg
+            ).geometry
+            if req.selection_mode == "rectangle"
+            else point_roi(req.lon, req.lat, req.radius_m, req.rotation_deg)[0]
+        ),
         "rotation_deg": req.rotation_deg,
         "scale_m": S1_SCALE,
         "bands": bands,
@@ -884,9 +1176,13 @@ def find_s1_scene(req: S1SceneRequest):
 def s1gee_download(
     start_date: str,
     end_date: str,
-    selection_mode: Literal["point", "province", "commune"] = "point",
+    selection_mode: Literal["point", "rectangle", "province", "commune"] = "point",
     lon: float | None = None,
     lat: float | None = None,
+    center_lon: float | None = None,
+    center_lat: float | None = None,
+    width_m: float | None = None,
+    height_m: float | None = None,
     radius_m: float = 2000.0,
     polarization: str = "vvvh",
     province_id: str | None = None,
@@ -898,7 +1194,17 @@ def s1gee_download(
     if polarization not in ("vvvh", "vv", "hhhv", "hh"):
         raise HTTPException(400, "polarization must be vvvh|vv|hhhv|hh")
     roi, bbox, province = _resolve_selection(
-        selection_mode, lon, lat, radius_m, province_id, commune_id, rotation_deg
+        selection_mode,
+        lon,
+        lat,
+        radius_m,
+        province_id,
+        commune_id,
+        rotation_deg,
+        center_lon,
+        center_lat,
+        width_m,
+        height_m,
     )
 
     end_exclusive = (
@@ -907,25 +1213,54 @@ def s1gee_download(
     if province is not None:
         scene = best_s1_scene_for_roi(roi, start_date, end_exclusive, polarization)
     else:
-        scene = best_s1_scene(lon, lat, radius_m, start_date, end_exclusive, polarization,
-                              roi=roi if rotation_deg % 360 else None)
+        scene = best_s1_scene(
+            center_lon if selection_mode == 'rectangle' else lon,
+            center_lat if selection_mode == 'rectangle' else lat,
+            max(width_m, height_m) / 2 if selection_mode == 'rectangle' else radius_m,
+            start_date, end_exclusive, polarization,
+            roi=roi if selection_mode == 'rectangle' or rotation_deg % 360 else None,
+        )
     if scene is None:
         raise HTTPException(404, "No Sentinel-1 scene found for this point/date range")
 
-    output_grid = build_rotated_grid(lon, lat, radius_m, rotation_deg, S1_SCALE) if rotation_deg % 360 else None
+    rectangle = (
+        _rectangle_model(center_lon, center_lat, width_m, height_m, rotation_deg)
+        if selection_mode == "rectangle"
+        else None
+    )
+    output_grid = (
+        rectangle.output_grid(S1_SCALE)
+        if rectangle is not None
+        else build_rotated_grid(lon, lat, radius_m, rotation_deg, S1_SCALE)
+        if rotation_deg % 360
+        else None
+    )
     if output_grid:
-        bbox = source_bbox(bbox, S1_SCALE, lat)
+        bbox = source_bbox(
+            bbox, S1_SCALE, rectangle.center_lat if rectangle is not None else lat
+        )
     band_urls = download_geotiff(
-        scene.ee_object, "s1gee", bbox, S1_SCALE, roi if province is not None else None
+        scene.ee_object,
+        "s1gee",
+        bbox,
+        S1_SCALE,
+        roi if province is not None else None,
     )
 
+    fname = f"{scene.scene_id}_{polarization}.tif"
     if province is not None:
-        fname = f"s1gee_{province.id}_{start_date}_{end_date}.tif"
-    else:
-        fname = f"s1gee_{scene.scene_id[:40]}_{scene.date}.tif"
+        fname = f"{Path(fname).stem}_{selection_mode}_{province.id}.tif"
+    elif not output_grid:
+        fname = f"{Path(fname).stem}_pt{lon:.5f}_{lat:.5f}_r{radius_m:g}.tif"
     if output_grid:
-        fname = f"{Path(fname).stem}_pt{lon:.5f}_{lat:.5f}_r{radius_m:g}_a{rotation_deg % 360:g}.tif"
-    out = _DOWNLOADS_DIR / (f"{uuid.uuid4().hex}_{fname}" if output_grid else fname)
+        if rectangle is not None:
+            fname = (
+                f"{Path(fname).stem}_rect{rectangle.center_lon:.5f}_{rectangle.center_lat:.5f}"
+                f"_w{rectangle.width_m:g}_h{rectangle.height_m:g}_a{rectangle.rotation_deg:g}.tif"
+            )
+        else:
+            fname = f"{Path(fname).stem}_pt{lon:.5f}_{lat:.5f}_r{radius_m:g}_a{rotation_deg % 360:g}.tif"
+    out = _DOWNLOADS_DIR / f"{uuid.uuid4().hex}.tif"
     raw = out.with_suffix(".source.tif") if output_grid else out
     try:
         merge_band_tiffs(band_urls, raw, **({"preserve_masks": True} if output_grid else {}))
@@ -1174,21 +1509,16 @@ def _s3_zip_response(product_id: str, filename: str | None = None):
 
     if not _PRODUCT_ID_RE.match(product_id):
         raise HTTPException(400, "product_id không hợp lệ")
-    _ensure_cdse_creds()
+    try:
+        creds = get_s3_credentials()
+    except RuntimeError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
     # Lấy thông tin product trước khi stream (fail sớm, rõ ràng)
     try:
         s3_path = get_product_s3_path(product_id)
     except Exception as exc:
         raise HTTPException(502, f"Không lấy được S3Path: {exc}") from exc
-
-    try:
-        creds = get_s3_credentials()
-    except Exception as exc:
-        raise HTTPException(502, f"Tạo S3 credentials thất bại: {exc}") from exc
-
-    # Chờ key được install trên object storage (doc CDSE khuyến nghị ~5s)
-    time.sleep(5)
 
     try:
         files = s3_list_product_files(product_id, creds)
@@ -1268,6 +1598,7 @@ def _s1_grd_mosaic_product(
     height: int,
     out,
     tmp_dir: Path,
+    dst_crs="EPSG:4326",
 ) -> None:
     """Warp measurement GRD của 1 product vào mảng `out` dùng chung (WGS84).
 
@@ -1311,7 +1642,7 @@ def _s1_grd_mosaic_product(
                     src_crs=gcp_crs,
                     src_nodata=src.nodata if src.nodata is not None else 0,
                     dst_transform=dst_tf,
-                    dst_crs="EPSG:4326",
+                    dst_crs=dst_crs,
                     dst_nodata=np.nan,
                     resampling=Resampling.bilinear,
                     num_threads=2,
@@ -1334,26 +1665,29 @@ def _s1_crop_impl(product_ids: list[str], province, scale_m: float):
     from rasterio.features import rasterize  # noqa: PLC0415
     from rasterio.transform import from_bounds  # noqa: PLC0415
 
-    _ensure_cdse_creds()
-
     try:
         creds = get_s3_credentials()
-    except Exception as exc:
-        raise HTTPException(502, f"Chuẩn bị S3 thất bại: {exc}") from exc
-    time.sleep(5)  # chờ key install trên object storage
+    except RuntimeError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
-    # Lưới đích WGS84 phủ bbox tỉnh
-    pb = province.bbox
-    res_deg = scale_m / 111_320.0
-    width = int(-(-(pb.east - pb.west) // res_deg))  # ceil
-    height = int(-(-(pb.north - pb.south) // res_deg))
+    rectangle = province if isinstance(province, RectangleROI) else None
+    dst_crs = 'EPSG:4326'
+    if rectangle is not None:
+        from affine import Affine
+        grid = rectangle.output_grid(scale_m)
+        width, height = grid['width'], grid['height']
+        dst_tf, dst_crs = Affine(*grid['transform']), grid['crs']
+    else:
+        pb = province.bbox
+        res_deg = scale_m / 111_320.0
+        width = int(-(-(pb.east - pb.west) // res_deg))  # ceil
+        height = int(-(-(pb.north - pb.south) // res_deg))
+        dst_tf = from_bounds(pb.west, pb.south, pb.east, pb.north, width, height)
     if width * height > 120_000_000:
         raise HTTPException(
             400,
             f"Vùng quá lớn ở {scale_m}m ({width}x{height} px) — tăng scale_m.",
         )
-    dst_tf = from_bounds(pb.west, pb.south, pb.east, pb.north, width, height)
-
     import re as _re  # noqa: PLC0415
 
     # Gom measurement + pols của TẤT CẢ product trước (fail sớm nếu có
@@ -1397,21 +1731,23 @@ def _s1_crop_impl(product_ids: list[str], province, scale_m: float):
     m = _re.search(r"_(\d{8})T(\d{6})", safe_root)
     date_tag = (m.group(1) + "T" + m.group(2)) if m else first_pid[:8]
     pol_tag = "".join(p.upper() for p in pols)
+    region_tag = _rectangle_tag(rectangle) if rectangle is not None else province.id
     if len(product_ids) == 1:
-        fname = f"s1grd_{date_tag}_{province.id}_{pol_tag}_{first_pid[:8]}.tif"
+        fname = f"s1grd_{date_tag}_{region_tag}_{pol_tag}_{first_pid[:8]}.tif"
     else:
         fname = (
             f"s1grd_mosaic{len(product_ids)}_{date_tag}_"
-            f"{province.id}_{pol_tag}.tif"
+            f"{region_tag}_{pol_tag}.tif"
         )
-    out_path = _DOWNLOADS_DIR / fname
-    tmp_dir = _DOWNLOADS_DIR / f"_crop_{first_pid[:8]}"
+    request_id = uuid.uuid4().hex
+    out_path = _DOWNLOADS_DIR / (f'{request_id}_{fname}' if rectangle else fname)
+    tmp_dir = _DOWNLOADS_DIR / (f'_crop_{request_id}' if rectangle else f"_crop_{first_pid[:8]}")
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
     try:
         with rasterio.open(
             out_path, "w", driver="GTiff", width=width, height=height,
-            count=len(pols), dtype="float32", crs="EPSG:4326",
+            count=len(pols), dtype="float32", crs=dst_crs,
             transform=dst_tf, nodata=float("nan"), compress="deflate",
             tiled=True, bigtiff="IF_SAFER",
         ) as dst:
@@ -1420,11 +1756,17 @@ def _s1_crop_impl(product_ids: list[str], province, scale_m: float):
                 _s1_grd_mosaic_product(
                     pid, province, pols, all_meas[pid], creds,
                     dst_tf, width, height, out, tmp_dir,
+                    **({'dst_crs': dst_crs} if rectangle else {}),
                 )
             # Mask theo polygon tỉnh (MultiPolygon GeoJSON) — 1 lần sau
             # khi mosaic xong mọi product
+            if rectangle is not None:
+                from rasterio.warp import transform_geom
+                mask_geometry = transform_geom('EPSG:4326', dst_crs, rectangle.geometry)
+            else:
+                mask_geometry = province.geometry
             pmask = rasterize(
-                [(province.geometry, 1)],
+                [(mask_geometry, 1)],
                 out_shape=(height, width), transform=dst_tf,
                 fill=0, dtype="uint8",
             )
@@ -1432,15 +1774,19 @@ def _s1_crop_impl(product_ids: list[str], province, scale_m: float):
             if np.isnan(out).all():
                 raise HTTPException(
                     400,
-                    f"Không product nào phủ tỉnh {province.name} "
-                    f"(cảnh GRD nằm hoàn toàn ngoài biên giới).",
+                    ('Không product nào phủ vùng chữ nhật đã chọn.' if rectangle else
+                     f'Không product nào phủ tỉnh {province.name} (cảnh GRD nằm hoàn toàn ngoài biên giới).'),
                 )
             for bi, pol in enumerate(pols, start=1):
                 dst.write(out[bi - 1], bi)
                 dst.set_band_description(bi, pol.upper())
     except HTTPException:
+        if rectangle is not None:
+            out_path.unlink(missing_ok=True)
         raise
     except Exception as exc:
+        if rectangle is not None:
+            out_path.unlink(missing_ok=True)
         raise HTTPException(502, f"Warp/cắt GRD thất bại: {exc}") from exc
     finally:
         import shutil  # noqa: PLC0415
@@ -1450,8 +1796,29 @@ def _s1_crop_impl(product_ids: list[str], province, scale_m: float):
     return out_path, fname
 
 
+def _s1_crop_region(selection_mode, province_id, center_lon, center_lat,
+                    width_m, height_m, rotation_deg):
+    rectangle = _s2_rectangle_selection(selection_mode, center_lon, center_lat, width_m, height_m,
+                                         rotation_deg, None, None, 0, province_id, None)
+    if rectangle is not None:
+        return rectangle
+    if rotation_deg or not province_id:
+        raise HTTPException(400, 'province_id is required; rotation needs rectangle mode')
+    try:
+        province = get_province(province_id)
+    except RuntimeError as exc:
+        raise HTTPException(503, f'Administrative boundaries unavailable: {exc}') from exc
+    if province is None:
+        raise HTTPException(404, f'Province not found: {province_id}')
+    return province
+
+
 @app.get("/api/s1/crop")
-def s1_crop(product_id: str, province_id: str, scale_m: float = 20.0):
+def s1_crop(product_id: str, province_id: str | None = None, scale_m: float = 20.0,
+            selection_mode: Literal['province', 'rectangle'] | None = None,
+            center_lon: float | None = None, center_lat: float | None = None,
+            width_m: float | None = None, height_m: float | None = None,
+            rotation_deg: float = 0.0):
     """Cắt product Sentinel-1 GRD theo biên tỉnh → GeoTIFF VV/VH (WGS84).
 
     Pipeline: tải các file measurement .tiff trong .SAFE qua S3 eodata
@@ -1464,16 +1831,11 @@ def s1_crop(product_id: str, province_id: str, scale_m: float = 20.0):
     """
     if not _PRODUCT_ID_RE.match(product_id):
         raise HTTPException(400, "product_id không hợp lệ")
-    if scale_m < 10.0 or scale_m > 500.0:
+    if not math.isfinite(scale_m) or scale_m < 10.0 or scale_m > 500.0:
         raise HTTPException(400, "scale_m phải trong 10..500 mét")
 
-    try:
-        province = get_province(province_id)
-    except RuntimeError as exc:
-        raise HTTPException(503, f"Administrative boundaries unavailable: {exc}") from exc
-    if province is None:
-        raise HTTPException(404, f"Province not found: {province_id}")
-
+    province = _s1_crop_region(selection_mode, province_id, center_lon, center_lat,
+                               width_m, height_m, rotation_deg)
     out_path, fname = _s1_crop_impl([product_id], province, scale_m)
 
     return FileResponse(
@@ -1487,8 +1849,12 @@ def s1_crop(product_id: str, province_id: str, scale_m: float = 20.0):
 @app.get("/api/s1/crop-mosaic")
 def s1_crop_mosaic(
     product_ids: str,
-    province_id: str,
+    province_id: str | None = None,
     scale_m: float = 20.0,
+    selection_mode: Literal['province', 'rectangle'] | None = None,
+    center_lon: float | None = None, center_lat: float | None = None,
+    width_m: float | None = None, height_m: float | None = None,
+    rotation_deg: float = 0.0,
 ):
     """Ghép N product GRD thành 1 GeoTIFF duy nhất theo biên tỉnh.
 
@@ -1507,16 +1873,11 @@ def s1_crop_mosaic(
     for pid in ids:
         if not _PRODUCT_ID_RE.match(pid):
             raise HTTPException(400, f"product_id không hợp lệ: {pid[:16]}…")
-    if scale_m < 10.0 or scale_m > 500.0:
+    if not math.isfinite(scale_m) or scale_m < 10.0 or scale_m > 500.0:
         raise HTTPException(400, "scale_m phải trong 10..500 mét")
 
-    try:
-        province = get_province(province_id)
-    except RuntimeError as exc:
-        raise HTTPException(503, f"Administrative boundaries unavailable: {exc}") from exc
-    if province is None:
-        raise HTTPException(404, f"Province not found: {province_id}")
-
+    province = _s1_crop_region(selection_mode, province_id, center_lon, center_lat,
+                               width_m, height_m, rotation_deg)
     out_path, fname = _s1_crop_impl(ids, province, scale_m)
 
     return FileResponse(
@@ -1857,6 +2218,31 @@ def _s2_output_grid(lon, lat, radius_m, rotation_deg, province_id):
     return None
 
 
+def _s2_rectangle_selection(selection_mode, center_lon, center_lat, width_m, height_m,
+                            rotation_deg, lon, lat, radius_m, province_id, commune_id):
+    if selection_mode == 'rectangle':
+        if lon is not None or lat is not None or radius_m or province_id or commune_id:
+            raise HTTPException(400, 'rectangle selection cannot include point or administrative fields')
+        try:
+            return _rectangle_model(center_lon, center_lat, width_m, height_m, rotation_deg)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+    if any(value is not None for value in (center_lon, center_lat, width_m, height_m)):
+        raise HTTPException(400, 'rectangle fields require selection_mode=rectangle')
+    if selection_mode == 'point' and (lon is None or lat is None or radius_m <= 0 or province_id or commune_id):
+        raise HTTPException(400, 'point selection requires lon, lat and a positive radius_m only')
+    if selection_mode == 'province' and (not province_id or commune_id):
+        raise HTTPException(400, 'province selection requires province_id only')
+    if selection_mode == 'commune' and (not commune_id or province_id):
+        raise HTTPException(400, 'commune selection requires commune_id only')
+    return None
+
+
+def _rectangle_tag(rectangle):
+    return (f'rect{rectangle.center_lon:.5f}_{rectangle.center_lat:.5f}'
+            f'_w{rectangle.width_m:g}_h{rectangle.height_m:g}_a{rectangle.rotation_deg:g}')
+
+
 @app.get("/api/s2/bands")
 def s2_bands(
     product_id: str,
@@ -1868,6 +2254,11 @@ def s2_bands(
     radius_m: float = 0.0,
     rotation_deg: float = 0.0,
     commune_id: str | None = None,
+    selection_mode: Literal['point', 'rectangle', 'province', 'commune'] | None = None,
+    center_lon: float | None = None,
+    center_lat: float | None = None,
+    width_m: float | None = None,
+    height_m: float | None = None,
 ):
     """Liệt kê hoặc tải band từ product S2 L2A ZIP trên CDSE qua Nodes API.
 
@@ -1879,7 +2270,10 @@ def s2_bands(
     GeoTIFF đa lớp, harmonize reflectance như pipeline GEE. Có thể crop
     theo province_id hoặc lon/lat + radius_m.
     """
-    output_grid = _s2_output_grid(lon, lat, radius_m, rotation_deg, province_id or commune_id)
+    rectangle = _s2_rectangle_selection(selection_mode, center_lon, center_lat, width_m, height_m,
+                                         rotation_deg, lon, lat, radius_m, province_id, commune_id)
+    output_grid = (rectangle.output_grid(S2_SCALE) if rectangle else
+                   _s2_output_grid(lon, lat, radius_m, rotation_deg, province_id or commune_id))
     if not _PRODUCT_ID_RE.match(product_id):
         raise HTTPException(400, "product_id không hợp lệ")
     _ensure_cdse_creds()
@@ -1923,7 +2317,11 @@ def s2_bands(
     # Vùng crop (nếu có)
     crop_bbox = None
     tag = "full"
-    if province_id or commune_id:
+    if rectangle is not None:
+        pb = rectangle.bbox
+        crop_bbox = (pb.west, pb.south, pb.east, pb.north)
+        tag = _rectangle_tag(rectangle)
+    elif province_id or commune_id:
         try:
             province = get_commune(commune_id) if commune_id else get_province(province_id)
         except RuntimeError as exc:
@@ -2085,6 +2483,11 @@ def s2_aws_download(
     province_id: str | None = None,
     rotation_deg: float = 0.0,
     commune_id: str | None = None,
+    selection_mode: Literal['point', 'rectangle', 'province', 'commune'] | None = None,
+    center_lon: float | None = None,
+    center_lat: float | None = None,
+    width_m: float | None = None,
+    height_m: float | None = None,
 ):
     """Tải GeoTIFF đa lớp (tất cả band COG) của một item S2 L2A từ AWS.
 
@@ -2099,7 +2502,10 @@ def s2_aws_download(
     # Lấy item trực tiếp theo ID qua STAC — không phụ thuộc tọa độ điểm
     # (điểm chọn có thể nằm ngoài footprint tile của item, search theo điểm
     # sẽ bỏ sót -> 404 nhầm).
-    output_grid = _s2_output_grid(lon, lat, radius_m, rotation_deg, province_id or commune_id)
+    rectangle = _s2_rectangle_selection(selection_mode, center_lon, center_lat, width_m, height_m,
+                                         rotation_deg, lon, lat, radius_m, province_id, commune_id)
+    output_grid = (rectangle.output_grid(S2_SCALE) if rectangle else
+                   _s2_output_grid(lon, lat, radius_m, rotation_deg, province_id or commune_id))
     try:
         product = aws_get_item(product_id)
     except Exception as exc:
@@ -2114,7 +2520,10 @@ def s2_aws_download(
     out = _DOWNLOADS_DIR / fname
 
     try:
-        if province_id or commune_id:
+        if rectangle is not None:
+            pb = rectangle.bbox
+            bbox = (pb.west, pb.south, pb.east, pb.north)
+        elif province_id or commune_id:
             # Chế độ tỉnh: window = giao (tile ∩ bbox tỉnh)
             try:
                 province = get_commune(commune_id) if commune_id else get_province(province_id)
@@ -2135,7 +2544,9 @@ def s2_aws_download(
         else:
             bbox = None
         if output_grid:
-            fname = f"{Path(fname).stem}_pt{lon:.5f}_{lat:.5f}_r{radius_m:g}_a{rotation_deg % 360:g}.tif"
+            tag = (_rectangle_tag(rectangle) if rectangle else
+                   f'pt{lon:.5f}_{lat:.5f}_r{radius_m:g}_a{rotation_deg % 360:g}')
+            fname = f"{Path(fname).stem}_{tag}.tif"
             out = _DOWNLOADS_DIR / f"{uuid.uuid4().hex}_{fname}"
         aws_merge_all_bands(product["assets"], out, bbox,
                             **({"output_grid": output_grid} if output_grid else {}))

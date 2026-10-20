@@ -11,6 +11,7 @@ import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 
 import ee
 import requests
@@ -74,6 +75,10 @@ class InsufficientCoverageError(ValueError):
     pass
 
 
+# Share the small aggregation budget between simultaneous optical ROI requests.
+_OPTICAL_AGGREGATION_LOCK = Lock()
+
+
 def _coverage_fraction(image: ee.Image, dataset: str, roi: ee.Geometry) -> ee.Number:
     bands = (["B2", "B3", "B4", "B8", "B11", "B12"] if dataset == "sentinel2"
              else ["SR_B2", "SR_B3", "SR_B4", "SR_B5", "SR_B6", "SR_B7"])
@@ -89,56 +94,71 @@ def _coverage_fraction(image: ee.Image, dataset: str, roi: ee.Geometry) -> ee.Nu
 def _point_optical_scene(dataset, roi, start, end, max_cloud_pct, merge_scenes, clip_output=True):
     coll, cloud_prop, _ = _optical_collection(dataset, start, end)
     coll = coll.filterBounds(roi).filter(ee.Filter.lt(cloud_prop, max_cloud_pct))
-    if coll.size().getInfo() == 0:
+    count = coll.size().getInfo()
+    if count == 0:
         return None
     clear_fraction = _s2_clear_fraction if dataset == "sentinel2" else _landsat_clear_fraction
     scale = S2_SCALE if dataset == "sentinel2" else LANDSAT_SCALE
 
-    def score(img):
-        return img.set({
-            "roi_coverage": _coverage_fraction(img, dataset, roi),
-            "roi_clear_fraction": clear_fraction(img, roi, scale),
-        })
+    # Evaluate one scene at a time: reductions inside collection.map fan out on EE.
+    # Keep scores as Python values so later sorting/export cannot evaluate them again.
+    candidates = coll.toList(count)
+    scored = []
+    for index in range(count):
+        image = ee.Image(candidates.get(index))
+        coverage = None
+        if not merge_scenes:
+            with _OPTICAL_AGGREGATION_LOCK:
+                coverage = _coverage_fraction(image, dataset, roi).getInfo()
+            if coverage is None or coverage < 0.99:
+                continue
+        with _OPTICAL_AGGREGATION_LOCK:
+            info = ee.Dictionary({
+                "scene_id": image.get("system:index"),
+                "timestamp": image.get("system:time_start"),
+                "cloud_pct": image.get(cloud_prop),
+                "clear_fraction": clear_fraction(image, roi, scale),
+            }).getInfo()
+        # A missing QA/SCL reduction has no usable cloud score, not perfect clarity.
+        clear = info.get("clear_fraction")
+        scored.append((float(clear) if clear is not None else -1.0, image, coverage, info))
 
-    scored = coll.map(score)
     if not merge_scenes:
-        eligible = scored.filter(ee.Filter.gte("roi_coverage", 0.99))
-        if eligible.size().getInfo() == 0:
+        if not scored:
             raise InsufficientCoverageError(
                 "Không có cảnh phủ ≥99% vùng đã chọn. Hãy bật ghép nhiều cảnh hoặc mở rộng khoảng ngày."
             )
-        best = ee.Image(eligible.sort("roi_clear_fraction", False).first())
+        _, best, coverage, info = max(scored, key=lambda row: row[0])
         return SceneInfo(
             dataset=dataset, collection=_collection_id(dataset),
-            scene_id=best.get("system:index").getInfo(),
-            date=_ymd(best).getInfo(), cloud_pct=float(best.get(cloud_prop).getInfo()),
-            ee_object=best, coverage_pct=100 * best.get("roi_coverage").getInfo(),
+            scene_id=info["scene_id"], date=_fmt_time_start(info["timestamp"]),
+            cloud_pct=float(info["cloud_pct"]) if info["cloud_pct"] is not None else -1.0,
+            ee_object=best, coverage_pct=100 * coverage,
         )
 
     # mosaic gives priority to the LAST scene; clear pixels always beat cloudy fallbacks.
-    ranked = scored.sort("roi_clear_fraction")
+    scored.sort(key=lambda row: row[0])
+    ranked = ee.ImageCollection.fromImages([row[1] for row in scored])
     mask_clouds = _mask_s2_clouds if dataset == "sentinel2" else _mask_landsat_clouds
     image = ranked.mosaic().blend(ranked.map(mask_clouds).mosaic())
     if clip_output:
         image = image.clip(roi)
-    coverage = 100 * _coverage_fraction(image, dataset, roi).getInfo()
+    with _OPTICAL_AGGREGATION_LOCK:
+        coverage = 100 * _coverage_fraction(image, dataset, roi).getInfo()
     if coverage < 99:
         raise InsufficientCoverageError(
             f"Các cảnh ghép chỉ phủ {coverage:.2f}% vùng (<99%). Hãy mở rộng khoảng ngày hoặc giảm vùng chọn."
         )
-    ids = ranked.aggregate_array("system:index").getInfo()
-    dates = ranked.aggregate_array("system:time_start").getInfo()
-    scenes = tuple({"scene_id": sid, "date": _fmt_time_start(ts)} for sid, ts in zip(ids, dates))
+    scenes = tuple(
+        {"scene_id": row[3]["scene_id"], "date": _fmt_time_start(row[3]["timestamp"])}
+        for row in scored
+    )
     return SceneInfo(
         dataset=dataset, collection=_collection_id(dataset),
         scene_id=f"{dataset}_point_mosaic_{start}_{end}",
         date=f"{start} to {end} (end exclusive)", cloud_pct=-1,
-        ee_object=image, scene_count=len(ids), scenes=scenes, coverage_pct=coverage,
+        ee_object=image, scene_count=len(scenes), scenes=scenes, coverage_pct=coverage,
     )
-
-
-def _ymd(image: ee.Image) -> ee.String:
-    return ee.Date(image.get("system:time_start")).format("YYYY-MM-dd")
 
 
 def _scale_s2(img: ee.Image) -> ee.Image:
@@ -360,7 +380,8 @@ def _process_timeseries_image(image: ee.Image, dataset: str, polarization: str) 
         processed = image.select(bands).clamp(-30.0, 10.0).float()
     else:
         processed = image.select(DYNAMIC_WORLD_LABEL_BAND).toUint8()
-    return processed.select(bands).copyProperties(image, image.propertyNames())
+    # copyProperties can return an ee.Element; restore the image type for band operations.
+    return ee.Image(ee.Image(processed).select(bands).copyProperties(image, image.propertyNames()))
 
 
 def timeseries_collection(
@@ -1186,9 +1207,10 @@ def best_scene(
     max_cloud_pct: float = 60.0,
     merge_scenes: bool = False,
     roi: ee.Geometry | None = None,
+    bbox: Bbox | None = None,
 ) -> SceneInfo | None:
-    """Select ≥99% coverage for optical point ROIs, optionally merging scenes."""
-    bbox = point_bbox(lon, lat, radius_m)
+    """Select a scene using the supplied true ROI and its search envelope."""
+    bbox = bbox or point_bbox(lon, lat, radius_m)
     selection = roi if roi is not None else bbox_to_ee_geom(bbox)
     if dataset in ("sentinel2", "landsat"):
         return _point_optical_scene(
@@ -1326,6 +1348,8 @@ def download_geotiff(
         bands = ["B2", "B3", "B4", "B8", "B11", "B12"]
     elif dataset == "nicfi":
         bands = ["B", "G", "R", "N"]
+    elif dataset == "dem":
+        bands = ["elevation"]
     elif dataset == "s1gee":
         # chỉ tải các pol có thật trong ảnh (VV/VH hoặc HH/HV)
         available = set(image.bandNames().getInfo())
@@ -1351,6 +1375,8 @@ def download_geotiff(
             nodata = DYNAMIC_WORLD_NODATA
         else:
             one_band = selected.multiply(1.0).toFloat()
+            if dataset == "dem":
+                one_band = one_band.unmask(-9999, sameFootprint=False)
             dtype = "float"
             nodata = -9999
         download_params = {

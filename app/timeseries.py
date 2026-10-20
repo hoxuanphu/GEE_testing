@@ -374,7 +374,10 @@ class TimeSeriesService:
                                                           parameters.get("polarization", "vvvh"))
                             envelope = Bbox(**parameters["bbox"])
                             if parameters.get("output_grid"):
-                                envelope = source_bbox(envelope, parameters["scale_m"], parameters["lat"])
+                                center_lat = (parameters['rectangle']['center_lat']
+                                              if parameters.get('selection_mode') == 'rectangle'
+                                              else parameters['lat'])
+                                envelope = source_bbox(envelope, parameters["scale_m"], center_lat)
                             urls = download_geotiff(image, parameters["dataset"],
                                                     envelope, parameters["scale_m"])
                             merge_band_tiffs(urls, raw, categorical=parameters["dataset"] == "dynamic_world",

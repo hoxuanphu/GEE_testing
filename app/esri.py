@@ -1,7 +1,11 @@
 """Bounded, resumable Esri World Imagery downloads (no Earth Engine initialization).
 
 Limits: 20,000 requested tiles, 500 million bounding-raster pixels, 8 workers.
-Disk reservations allow 5 bytes/source pixel, 17 bytes/rotated output pixel
+Rectangle requests require selection_mode='rectangle' and center_lon/center_lat/
+width_m/height_m. They always use a local-metre rectangular grid, even at 0 degrees,
+with the same zoom-derived ground sampling as rotated points and a source halo.
+Legacy point/bbox/commune requests do not require selection_mode.
+Disk reservations allow 5 bytes/source pixel, 17 bytes/local-grid output pixel
 (float RGB plus mask/overhead), and 2 MB/requested tile,
 with 256 MiB free-space reserve, 6 GiB/download and 12 GiB/service storage caps.
 These additional budgets may reject requests below the tile/pixel ceilings.
@@ -26,7 +30,7 @@ from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import rasterio
@@ -82,6 +86,11 @@ class CancelledError(RuntimeError):
 
 class EsriRequest(BaseModel):
     model_config = ConfigDict(extra='forbid')
+    selection_mode: Literal['point', 'bbox', 'commune', 'rectangle'] | None = None
+    center_lon: float | None = Field(default=None, allow_inf_nan=False)
+    center_lat: float | None = Field(default=None, allow_inf_nan=False)
+    width_m: float | None = Field(default=None, allow_inf_nan=False)
+    height_m: float | None = Field(default=None, allow_inf_nan=False)
     bbox: list[float] | None = None
     commune_id: str | None = None
     lon: float | None = None
@@ -95,16 +104,30 @@ class EsriRequest(BaseModel):
     @model_validator(mode='after')
     def validate_area(self):
         point = any(v is not None for v in (self.lon, self.lat, self.radius_m))
-        if sum((point, self.bbox is not None, self.commune_id is not None)) != 1:
-            raise ValueError('Specify exactly one of point (lon/lat/radius_m), bbox or commune_id')
+        rectangle = self.selection_mode == 'rectangle'
+        rectangle_values = (self.center_lon, self.center_lat, self.width_m, self.height_m)
+        if not rectangle and any(v is not None for v in rectangle_values):
+            raise ValueError('Rectangle fields require selection_mode=rectangle')
+        if sum((point, rectangle, self.bbox is not None, self.commune_id is not None)) != 1:
+            raise ValueError('Specify exactly one of point (lon/lat/radius_m), rectangle, bbox or commune_id')
+        mode = 'rectangle' if rectangle else 'point' if point else 'bbox' if self.bbox is not None else 'commune'
+        if self.selection_mode is not None and self.selection_mode != mode:
+            raise ValueError('selection_mode does not match the supplied area')
         self.rotation_deg %= 360
-        if point:
+        if rectangle:
+            if any(v is None for v in rectangle_values):
+                raise ValueError('Rectangle requires center_lon, center_lat, width_m and height_m')
+            from .geo import RectangleROI
+            RectangleROI(center_lon=self.center_lon, center_lat=self.center_lat,
+                         width_m=self.width_m, height_m=self.height_m,
+                         rotation_deg=self.rotation_deg)
+        elif point:
             if any(v is None for v in (self.lon, self.lat, self.radius_m)):
                 raise ValueError('Point requires lon, lat and radius_m')
             from .geo import point_roi
             point_roi(self.lon, self.lat, self.radius_m, self.rotation_deg)
         elif self.rotation_deg:
-            raise ValueError('rotation_deg is only supported for point selections')
+            raise ValueError('rotation_deg is only supported for point or rectangle selections')
         if self.bbox is not None:
             validate_bbox(self.bbox)
         if self.commune_id is not None and not self.commune_id.strip():
@@ -224,17 +247,43 @@ def make_plan(bbox, zoom=18, max_tiles=4000, geometry=None, pad=0, workers=4,
     return plan
 
 
+def _local_pixel_scale(plan, lon, lat):
+    # Match the existing rotated-point sampling in local metres, not Mercator metres.
+    cx, cy = transform_coords('EPSG:4326', 'EPSG:3857', [lon], [lat])
+    half = plan.transform.a / 2
+    lons, _ = transform_coords('EPSG:3857', 'EPSG:4326',
+                               [cx[0]-half, cx[0]+half], [cy[0], cy[0]])
+    delta_lon = (lons[1]-lons[0]+180) % 360 - 180
+    return abs(delta_lon) * 111320 * math.cos(math.radians(lat))
+
+
 def request_plan(body, snapshot=None):
+    rectangle = body.selection_mode == 'rectangle'
+    local_grid = rectangle or bool(body.rotation_deg)
     if snapshot is not None:
         plan = make_plan(snapshot['bbox'], body.zoom, body.max_tiles,
-                         snapshot['roi_geometry'], pad=1 if body.rotation_deg else 0,
-                         workers=body.workers, source_halo=bool(body.rotation_deg))
+                         snapshot['roi_geometry'], pad=1 if local_grid else 0,
+                         workers=body.workers, source_halo=local_grid)
         plan.rotation_deg = body.rotation_deg
         plan.output_grid = snapshot.get('output_grid')
         if plan.output_grid is not None:
             grid = plan.output_grid
             if grid['width'] * grid['height'] > MAX_PIXELS:
                 raise ValueError(f'Output exceeds {MAX_PIXELS} raster pixels; reduce zoom/area')
+        return plan
+    if rectangle:
+        from .geo import RectangleROI
+        roi = RectangleROI(center_lon=body.center_lon, center_lat=body.center_lat,
+                           width_m=body.width_m, height_m=body.height_m,
+                           rotation_deg=body.rotation_deg)
+        geometry, b = roi.model_geometry()
+        plan = make_plan([b.west, b.south, b.east, b.north], body.zoom, body.max_tiles,
+                         geometry, pad=1, workers=body.workers, source_halo=True)
+        grid = roi.output_grid(_local_pixel_scale(plan, roi.center_lon, roi.center_lat))
+        if grid['width'] * grid['height'] > MAX_PIXELS:
+            raise ValueError(f'Output exceeds {MAX_PIXELS} raster pixels; reduce zoom/area')
+        plan.output_grid = grid
+        plan.rotation_deg = roi.rotation_deg
         return plan
     if body.lon is not None:
         from .geo import point_roi
@@ -246,13 +295,7 @@ def request_plan(body, snapshot=None):
                          source_halo=bool(body.rotation_deg))
         plan.rotation_deg = body.rotation_deg
         if body.rotation_deg:
-            # Convert a centre-spanning Web Mercator pixel to local metric length.
-            cx, cy = transform_coords('EPSG:4326', 'EPSG:3857', [body.lon], [body.lat])
-            half = plan.transform.a / 2
-            lons, _ = transform_coords('EPSG:3857', 'EPSG:4326',
-                                       [cx[0]-half, cx[0]+half], [cy[0], cy[0]])
-            delta_lon = (lons[1]-lons[0]+180) % 360 - 180
-            scale = abs(delta_lon) * 111320 * math.cos(math.radians(body.lat))
+            scale = _local_pixel_scale(plan, body.lon, body.lat)
             grid = build_rotated_grid(body.lon, body.lat, body.radius_m,
                                       body.rotation_deg, scale)
             if grid['width'] * grid['height'] > MAX_PIXELS:
@@ -524,7 +567,7 @@ class EsriService:
                        progress=dict(processed=0, total=len(plan.tiles), succeeded=0, failed=0, cached=0),
                        error=None, attribution=ATTRIBUTION, source=TILE_URL,
                        acquisition_date=None, native_resolution=None)
-            if body.lon is not None:
+            if body.lon is not None or body.selection_mode == 'rectangle':
                 job.update(bbox=plan.bbox, roi_geometry=plan.roi_geometry,
                            rotation_deg=plan.rotation_deg, output_grid=plan.output_grid)
             self._jobs[job_id] = job
