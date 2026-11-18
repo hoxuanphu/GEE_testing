@@ -14,7 +14,7 @@ import time
 import uuid
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -26,6 +26,7 @@ from rasterio.warp import calculate_default_transform, reproject, Resampling
 from .geo import Bbox, source_bbox
 from .raster_grid import warp_to_grid
 from .imagery import download_geotiff, load_timeseries_scene, merge_band_tiffs
+from .vector_mask import mask_raster_to_polygon
 
 TTL_SECONDS = 24 * 60 * 60
 ACTIVE_STATUSES = ("queued", "running")
@@ -163,6 +164,9 @@ class TimeSeriesStore:
                 return self._job(existing)
             if db.execute("SELECT 1 FROM jobs WHERE status IN ('queued','running')").fetchone():
                 raise BusyError("Another time-series job is active. Try again after it finishes.")
+            if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ts_batches'").fetchone() and \
+                    db.execute("SELECT 1 FROM ts_batches WHERE status IN ('queued','running','pausing')").fetchone():
+                raise BusyError("A yearly time-series batch is active. Pause it or wait for completion.")
             job_id, now = str(uuid.uuid4()), time.time()
             db.execute("INSERT INTO jobs (id,search_id,status,total,created,activity) VALUES (?,?,?,?,?,?)",
                        (job_id, search_id, "queued", total, now, now))
@@ -266,7 +270,10 @@ def align_timeseries_raster(source: Path, destination: Path, grid: dict | None =
                           src_transform=src.transform, src_crs=src.crs,
                           src_nodata=src.nodata, dst_transform=transform, dst_crs=grid["crs"],
                           dst_nodata=fill, init_dest_nodata=True,
-                          resampling=Resampling.nearest if categorical else Resampling.bilinear)
+                          resampling=Resampling.nearest if categorical or
+                          (bands[index - 1] if bands else src.descriptions[index - 1]) in
+                          ("SCL", "QA10", "QA20", "QA60", "MSK_CLASSI_OPAQUE",
+                           "MSK_CLASSI_CIRRUS", "MSK_CLASSI_SNOW_ICE") else Resampling.bilinear)
                 description = bands[index - 1] if bands and index <= len(bands) else src.descriptions[index - 1]
                 if description:
                     dst.set_band_description(index, description)
@@ -294,6 +301,19 @@ class TimeSeriesService:
         self._executor = None
         self._futures = {}
         self._closed = False
+
+    def submit_task(self, key, operation, *args):
+        """Use the same executor for legacy exports and annual orchestration."""
+        with self._lock:
+            if self._closed:
+                raise RuntimeError('Time-series service is shut down.')
+            self._futures = {k:v for k,v in self._futures.items() if not v.done()}
+            # SQLite admission has already reserved this run. A prior same-key
+            # worker can still be returning after publishing paused/completed.
+            # Queue the admitted continuation behind it in the single executor.
+            if self._executor is None:
+                self._executor = ThreadPoolExecutor(max_workers=1,thread_name_prefix='timeseries')
+            self._futures[key] = self._executor.submit(operation,*args)
 
     def start_job(self, search_id: str) -> dict:
         with self._lock:
@@ -357,6 +377,12 @@ class TimeSeriesService:
         try:
             parameters, scenes = self.store._snapshot(job["search_id"])
             grid = parameters.get("output_grid")
+            vector_geometry = (parameters['roi_geometry']
+                               if parameters.get('selection_mode') == 'vector' else None)
+            clip_kwargs = {}
+            if vector_geometry is not None:
+                import ee
+                clip_kwargs['clip_region'] = ee.Geometry(vector_geometry, geodesic=False)
             directory.mkdir(parents=True, exist_ok=True)
             for position, scene in enumerate(scenes):
                 record = {**scene, "file": None, "status": "failed", "error": None,
@@ -365,7 +391,10 @@ class TimeSeriesService:
                           "value_offset": parameters.get("value_offset")}
                 raw = directory / "scene.raw.tif"
                 aligned = directory / "scene.aligned.tif"
+                raster_context = ExitStack()
                 try:
+                    from .export_resources import RESOURCES
+                    raster_context.enter_context(RESOURCES.raster_admission())
                     self._check_disk(parameters, directory)
                     filename = _scene_filename(parameters["dataset"], scene)
                     for attempt in range(3):
@@ -378,10 +407,12 @@ class TimeSeriesService:
                                               if parameters.get('selection_mode') == 'rectangle'
                                               else parameters['lat'])
                                 envelope = source_bbox(envelope, parameters["scale_m"], center_lat)
-                            urls = download_geotiff(image, parameters["dataset"],
-                                                    envelope, parameters["scale_m"])
+                            band_options = {key: parameters[key] for key in ('s2_auxiliary_bands', 's2_band_preset')
+                                            if parameters.get(key) is not None}
+                            urls = download_geotiff(image, parameters["dataset"], envelope,
+                                                    parameters["scale_m"], **clip_kwargs, **band_options)
                             merge_band_tiffs(urls, raw, categorical=parameters["dataset"] == "dynamic_world",
-                                             **({"preserve_masks": True} if parameters.get("output_grid") else {}))
+                                             **({"preserve_masks": True} if parameters.get("output_grid") or vector_geometry is not None else {}))
                             break
                         except Exception as exc:
                             # The merge helper already retries HTTP fetches/URL refreshes.
@@ -397,6 +428,8 @@ class TimeSeriesService:
                     new_grid = align_timeseries_raster(raw, aligned, grid,
                                 categorical=parameters["dataset"] == "dynamic_world",
                                 bands=parameters["bands"], nodata=parameters.get("nodata"))
+                    if vector_geometry is not None:
+                        mask_raster_to_polygon(aligned, vector_geometry)
                     with rasterio.open(aligned) as raster:
                         record["nodata"] = raster.nodata
                         record["dtype"] = raster.dtypes[0]
@@ -410,6 +443,7 @@ class TimeSeriesService:
                     if isinstance(exc, DiskSpaceError) or getattr(exc, "errno", None) == 28:
                         fatal = "Insufficient disk space; export stopped safely."
                 finally:
+                    raster_context.close()
                     raw.unlink(missing_ok=True)
                     aligned.unlink(missing_ok=True)
                 records.append(record)

@@ -1,0 +1,110 @@
+(() => {
+  const get = id => document.getElementById(id);
+  const sidebar = get('sidebar');
+  const fields = document.createElement('div');
+  fields.className = 'workspace-fields';
+  const title = document.createElement('h2');
+  title.textContent = 'Khám phá dữ liệu';
+  const intro = document.createElement('p');
+  intro.className = 'hint';
+  intro.textContent = 'Chọn vùng và nguồn dữ liệu để bắt đầu.';
+  fields.append(title, intro);
+  sidebar.querySelector('h1').remove();
+  const group = heading => {
+    const section = document.createElement('section');
+    section.className = 'workspace-group';
+    const h = document.createElement('h2');
+    h.textContent = heading;
+    section.append(h);
+    fields.append(section);
+    return section;
+  };
+  const region = group('01 · Vùng quan tâm');
+  const source = group('02 · Nguồn dữ liệu');
+  const filters = group('03 · Bộ lọc');
+  const move = (target, ids) => ids.forEach(id => { const node = get(id); if (node) target.append(node); });
+  // Move existing nodes, rather than recreating inputs, to retain listeners and ROI state.
+  region.append(get('selection_mode').parentElement);
+  move(region, ['vectorLayersPanel']);
+  move(region, ['mfRoiSource', 'referenceSelection', 'rectangleSelection', 'provinceSelection', 'communeSelection']);
+  region.append(pointSelection, radiusSelection);
+  move(region, ['rotationSelection']);
+  source.append(get('dataset').parentElement);
+  move(source, ['mfPlatformSelection']);
+  move(source, ['s5pSelection', 'sarSelection', 'slcSelection', 's2SourceSelection', 's3TypeSelection', 'demHint']);
+  move(filters, ['dateSelection', 'cloudSelection']);
+  move(filters, ['s2AuxiliarySelection']);
+  const advanced = document.createElement('details');
+  const summary = document.createElement('summary');
+  summary.textContent = 'Tùy chọn nâng cao';
+  const advancedBody = document.createElement('div');
+  advancedBody.className = 'workspace-details-body';
+  advanced.append(summary, advancedBody);
+  filters.append(advanced);
+  move(advancedBody, ['pointMergeSelection', 'compositeSelection', 'sceneGroupingSelection', 'mosaicMaskSelection', 'colorBalanceSelection', 'sarMergeSelection', 'timeSeriesSelection']);
+  const info = document.createElement('details');
+  info.className = 'workspace-source-info';
+  const infoTitle = document.createElement('summary');
+  infoTitle.textContent = 'Thông tin và giới hạn dữ liệu';
+  info.append(infoTitle);
+  const sourceInfo = sidebar.lastElementChild;
+  if (sourceInfo) info.append(sourceInfo);
+  filters.append(info);
+  const action = document.createElement('div');
+  action.className = 'workspace-action';
+  move(action, ['imageInventoryControls', 'btnSearch', 'status', 'searchTiming']);
+  move(get('workspaceResults'), ['plan', 'sceneCatalogResults', 'result', 's1result', 's5pResults', 'timeSeriesResults', 'matchedFrameResults']);
+  move(get('workspaceJobs'), ['esriPanel', 'timeSeriesBatchPanel', 'downloadJobPanel']);
+  // Keep any future source-specific controls reachable even if not explicitly grouped above.
+  while (sidebar.firstChild) filters.append(sidebar.firstChild);
+  sidebar.append(fields, action);
+  const selection = get('selection_mode');
+  const labels = {point:'Theo vị trí', rectangle:'Vẽ hình chữ nhật (ROI)', province:'Theo tỉnh / thành phố', commune:'Theo xã / phường', reference:'Đồng khung GeoTIFF mẫu', vector:'Từ polygon lớp vector'};
+  [...selection.options].forEach(option => { option.textContent = labels[option.value] || option.textContent; });
+  selection.previousElementSibling.textContent = 'Cách chọn vùng';
+  const addLabel = (id, text) => {
+    const input = get(id);
+    const label = document.createElement('label');
+    label.htmlFor = id;
+    label.textContent = text;
+    input.before(label);
+  };
+  addLabel('lon', 'Kinh độ');
+  addLabel('lat', 'Vĩ độ');
+  document.querySelectorAll('label:not([for])').forEach(label => {
+    const control = label.querySelector('input,select') || label.nextElementSibling;
+    if (control && control.matches('input[id],select[id]')) label.htmlFor = control.id;
+  });
+  get('preview').alt = 'Ảnh xem trước dữ liệu vệ tinh của vùng đã chọn';
+  const resultPanel = get('workspaceResults');
+  const jobPanel = get('workspaceJobs');
+  let currentView = 'explore';
+  const hasResults = () => ['plan','sceneCatalogResults','result','s1result','s5pResults','timeSeriesResults','matchedFrameResults'].some(id => {
+    const node = get(id);
+    return !node.hidden && getComputedStyle(node).display !== 'none';
+  });
+  function showView(view) {
+    currentView = view;
+    const jobs = view === 'jobs';
+    sidebar.hidden = jobs;
+    get('map').hidden = jobs;
+    jobPanel.hidden = !jobs;
+    resultPanel.hidden = view !== 'results';
+    document.body.classList.toggle('has-results', view === 'results');
+    document.querySelectorAll('[data-workspace-view]').forEach(button => button.setAttribute('aria-pressed', String(button.dataset.workspaceView === view)));
+    get('workspaceEmpty').hidden = hasResults();
+    requestAnimationFrame(() => { if (!jobs) map.invalidateSize(); });
+  }
+  document.querySelectorAll('[data-workspace-view]').forEach(button => button.addEventListener('click', () => showView(button.dataset.workspaceView)));
+  get('workspaceClose').addEventListener('click', () => showView('explore'));
+  let previousResults = hasResults();
+  const observer = new MutationObserver(() => {
+    const visible = hasResults();
+    get('workspaceEmpty').hidden = visible;
+    if (visible && !previousResults && currentView !== 'jobs') showView('results');
+    previousResults = visible;
+  });
+  ['plan','sceneCatalogResults','result','s1result','s5pResults','timeSeriesResults','matchedFrameResults'].forEach(id => observer.observe(get(id), {attributes:true, attributeFilter:['style','hidden']}));
+  window.SatelliteWorkspace = Object.freeze({showView, hasResults});
+  showView('explore');
+})();

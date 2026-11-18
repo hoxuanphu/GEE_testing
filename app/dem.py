@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import math
 import re
 import uuid
 
@@ -30,6 +31,47 @@ def elevation_image(dataset: str, roi: ee.Geometry) -> ee.Image:
     else:
         image = ee.Image(source["asset"]).select(source["band"])
     return image.rename("elevation").toFloat()
+
+
+def elevation_grid(bbox, scale_m: float = 30) -> dict:
+    """North-up metric grid in the centre UTM zone (UPS at polar latitudes)."""
+    from rasterio.warp import transform_bounds
+
+    lon = (bbox.west + bbox.east) / 2
+    lat = (bbox.south + bbox.north) / 2
+    zone = min(60, max(1, math.floor((lon + 180) / 6) + 1))
+    epsg = (32600 if lat >= 0 else 32700) + zone
+    if lat > 84 or lat < -80:
+        epsg = 32661 if lat >= 0 else 32761
+    crs = f"EPSG:{epsg}"
+    west, south, east, north = transform_bounds(
+        "EPSG:4326", crs, bbox.west, bbox.south, bbox.east, bbox.north,
+        densify_pts=41,
+    )
+    west = math.floor(west / scale_m) * scale_m
+    north = math.ceil(north / scale_m) * scale_m
+    return {
+        "crs": crs,
+        "transform": [scale_m, 0, west, 0, -scale_m, north],
+        "width": max(1, math.ceil((east - west) / scale_m)),
+        "height": max(1, math.ceil((north - south) / scale_m)),
+    }
+
+
+def mask_elevation(path, geometry: dict) -> None:
+    """Apply the true ROI after resampling so rotated ROI corners stay NoData."""
+    import rasterio
+    from rasterio.features import geometry_mask
+    from rasterio.warp import transform_geom
+
+    with rasterio.open(path, "r+") as dst:
+        polygon = transform_geom("EPSG:4326", dst.crs, geometry)
+        for _, window in dst.block_windows(1):
+            values = dst.read(1, window=window)
+            inside = geometry_mask([polygon], out_shape=values.shape,
+                                   transform=dst.window_transform(window), invert=True)
+            values[~inside] = -9999
+            dst.write(values, 1, window=window)
 
 
 def finalize_elevation(path) -> None:

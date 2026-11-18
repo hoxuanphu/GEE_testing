@@ -11,6 +11,52 @@ const base = {center_lon:105, center_lat:12, width_m:8000, height_m:2000, rotati
 const plain = value => JSON.parse(JSON.stringify(value));
 function close(a,b,tolerance=1e-8) { assert.ok(Math.abs(a-b) < tolerance, `${a} != ${b}`); }
 
+test('copy footprint preserves a rotated rectangle and detaches its coordinates', () => {
+  const footprint = ROI.geometry(base), before = plain(footprint);
+  const copied = ROI.fromFootprint(footprint);
+  for (const key of ROI.fields) close(copied[key],base[key]);
+  assert.deepEqual(footprint,before);
+  footprint.coordinates[0][0][0] = 0;
+  close(copied.center_lon,base.center_lon);
+});
+
+test('copy contains every densified or sheared footprint vertex without discarding rotation', () => {
+  const corners = ROI.geometry(base).coordinates[0];
+  const ring = corners.slice(0,4).flatMap((p,i) => Array.from({length:32}, (_,j) => {
+    const q = corners[i+1], t = j/32;
+    return [p[0]*(1-t)+q[0]*t + 0.002*Math.sin(Math.PI*t),p[1]*(1-t)+q[1]*t];
+  }));
+  ring.push([...ring[0]]);
+  const copied = ROI.fromFootprint({type:'Polygon',coordinates:[ring]});
+  assert.ok(copied.rotation_deg > 1 && copied.rotation_deg < 89);
+  for (const [lon,lat] of ring) {
+    const [x,y] = ROI.local(copied,lon,lat);
+    assert.ok(Math.abs(x) <= copied.width_m/2 + 1e-6);
+    assert.ok(Math.abs(y) <= copied.height_m/2 + 1e-6);
+  }
+});
+
+test('copy rejects missing, invalid, degenerate and oversized footprints', () => {
+  for (const footprint of [null, {type:'Point',coordinates:[105,12]},
+    {type:'Polygon',coordinates:[[[105,12],[NaN,12],[105,13],[105,12]]]},
+    {type:'Polygon',coordinates:[[[105,12],[105,12],[105,12],[105,12]]]},
+    {type:'Polygon',coordinates:[[[105,12],[107,12],[107,14],[105,14],[105,12]]]}]) {
+    assert.throws(() => ROI.fromFootprint(footprint));
+  }
+});
+
+test('copy accepts the 90 km boundary without accepting genuinely larger frames', () => {
+  for (const rotation_deg of [0,10,30,90,180,270,359]) {
+    for (const sizes of [{width_m:90000,height_m:2000},{width_m:2000,height_m:90000}]) {
+      const rect = {...base,...sizes,rotation_deg};
+      const copied = ROI.fromFootprint(ROI.geometry(rect));
+      close(copied.width_m,sizes.width_m,1e-6);
+      close(copied.height_m,sizes.height_m,1e-6);
+    }
+  }
+  assert.throws(() => ROI.fromFootprint(ROI.geometry({...base,width_m:90000.01})));
+});
+
 class Element {
   constructor(id = '') {
     this.id = id; this.value = ''; this.checked = false; this.hidden = false; this.disabled = false;
@@ -175,6 +221,16 @@ test('scene and S1 GEE requests contain rectangle only; response cannot replace 
   assert.equal(f.requests[1].url,'/api/s1gee/scene'); assert.equal(f.requests[1].body.height_m,2000);
   assert.ok(!('radius_m' in f.requests[1].body));
 });
+
+test('optical point and rectangle merge requests explicitly select RAW', async () => {
+  const f = fixture();
+  f.el('merge_scenes').checked = true;
+  let body = f.run("opticalSceneBody('point', '', '', 105, 12)");
+  assert.equal(body.composite_method, 'raw');
+  await f.rectangle();
+  body = f.run("opticalSceneBody('rectangle', '', '', null, null)");
+  assert.equal(body.composite_method, 'raw');
+});
 test('old in-flight scene response cannot restore results after a rectangle edit', async () => {
   let resolve; const f = fixture(() => new Promise(done => resolve=done)); await f.rectangle();
   const pending = f.el('btnSearch').fire('click');
@@ -323,4 +379,91 @@ test('whole ZIP links explicitly disclose no ROI crop and no new CDN/package dep
   assert.match(html,/ZIP nguyên sản phẩm \(không cắt ROI\)/);
   assert.match(html,/src="\/rectangle.js/);
   assert.ok(!fs.readFileSync(path.join(__dirname,'..','static','rectangle.js'),'utf8').includes('https://'));
+});
+
+test('RAW color balance defaults on in HTML and follows point/rectangle/admin/vector requests', async () => {
+  assert.match(html, /id="color_balance"[^>]*checked/);
+  const f = fixture();
+  f.el('color_balance').checked = true; f.el('merge_scenes').checked = true;
+  f.el('composite_method').value = 'raw';
+  assert.equal(f.run("opticalSceneBody('point', null, null, 105, 12)").color_balance, true);
+  await f.rectangle();
+  assert.equal(f.run("opticalSceneBody('rectangle', null, null, null, null)").color_balance, true);
+  for (const mode of ['province', 'commune']) {
+    f.el('selection_mode').value = mode;
+    assert.equal(f.run(`opticalSceneBody('${mode}', 'VN01', '001', null, null)`).color_balance, true);
+  }
+  f.run("window.VectorLayers = {request:() => ({selection_mode:'vector',vector_roi_id:'roi'})}");
+  f.el('selection_mode').value = 'vector';
+  assert.equal(f.run("opticalSceneBody('vector')").color_balance, true);
+});
+
+test('color balance is excluded from unmerged, non-RAW, SAR and time-series requests', () => {
+  const f = fixture(); f.el('color_balance').checked = true;
+  const body = () => f.run("opticalSceneBody($('selection_mode').value, 'VN01', '001', 105, 12)");
+  assert.equal(body().color_balance, undefined);
+  f.el('selection_mode').value = 'province'; f.el('composite_method').value = 'median';
+  assert.equal(body().color_balance, undefined);
+  f.el('composite_method').value = 'raw'; f.el('dataset').value = 's1gee';
+  assert.equal(body().color_balance, undefined);
+  f.el('dataset').value = 'sentinel2'; f.el('time_series_enabled').checked = true;
+  assert.equal(body().color_balance, undefined);
+});
+
+test('changing color balance invalidates the displayed result and updates visibility', async () => {
+  const f = fixture(); f.el('merge_scenes').checked = true;
+  f.el('result').style.display = ''; f.el('color_balance').checked = false;
+  await f.el('color_balance').fire('change');
+  assert.equal(f.el('result').style.display, 'none');
+  assert.equal(f.el('colorBalanceSelection').hidden, false);
+  f.el('merge_scenes').checked = false; await f.el('merge_scenes').fire('change');
+  assert.equal(f.el('colorBalanceSelection').hidden, true);
+});
+
+test('color balance status reports partial/skipped calibration and its reason', () => {
+  const f = fixture();
+  const text = f.run(`colorBalanceSummary({scenes:[{status:'reference'}, {status:'applied'},
+    {status:'skipped',reason:'insufficient_overlap'}, {status:'partial',bands:{B2:{status:'skipped',reason:'flat_overlap'}}}]})`);
+  assert.match(text, /RAW \+ cân bằng màu/);
+  assert.match(text, /chồng lấp/);
+  assert.match(text, /từng băng/);
+});
+
+test('coherent RAW and stable mosaics carry independent grouping and cloud-mask choices', async () => {
+  const f=fixture(); f.el('merge_scenes').checked=true;
+  f.el('scene_grouping').value='near_date'; f.el('max_scene_span_days').value='3';
+  f.el('composite_method').value='mosaic'; f.el('mosaic_mask_clouds').value='false';
+  let body=f.run("opticalSceneBody('point',null,null,105,12)");
+  assert.equal(body.composite_method,'mosaic'); assert.equal(body.scene_grouping,'near_date');
+  assert.equal(body.max_scene_span_days,3); assert.equal(body.mosaic_mask_clouds,false);
+  assert.equal(body.color_balance,undefined);
+  await f.rectangle();
+  body=f.run("opticalSceneBody('rectangle',null,null,null,null)");
+  assert.equal(body.mosaic_mask_clouds,false);
+  f.el('composite_method').value='raw'; f.el('color_balance').checked=true;
+  body=f.run("opticalSceneBody('rectangle',null,null,null,null)");
+  assert.equal(body.color_balance,true); assert.equal(body.scene_grouping,'near_date');
+  assert.equal(body.mosaic_mask_clouds,undefined);
+});
+
+test('mosaic options disappear for time series, single scenes and unrelated composites', () => {
+  const f=fixture(); f.el('scene_grouping').value='near_date'; f.el('max_scene_span_days').value='3';
+  assert.deepEqual(plain(f.run("mosaicOptionsRequest('point')")),{});
+  f.el('merge_scenes').checked=true; f.el('composite_method').value='mosaic';
+  f.el('time_series_enabled').checked=true;
+  assert.deepEqual(plain(f.run("mosaicOptionsRequest('point')")),{});
+  f.el('time_series_enabled').checked=false; f.el('composite_method').value='median';
+  assert.deepEqual(plain(f.run("mosaicOptionsRequest('province')")),{});
+});
+
+test('group/day/mask changes invalidate old results and update visible controls', async () => {
+  const f=fixture(); f.el('merge_scenes').checked=true; f.el('composite_method').value='mosaic';
+  f.el('scene_grouping').value='near_date';
+  for (const id of ['scene_grouping','max_scene_span_days','mosaic_mask_clouds']) {
+    f.el('result').style.display='block'; await f.el(id).fire('change');
+    assert.equal(f.el('result').style.display,'none');
+  }
+  assert.equal(f.el('mosaicMaskSelection').hidden,false);
+  assert.equal(f.el('sceneGroupingSelection').hidden,false);
+  assert.equal(f.el('colorBalanceSelection').hidden,true);
 });

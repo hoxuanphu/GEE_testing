@@ -51,6 +51,48 @@
     return result;
   }
   function query(rect) { return new URLSearchParams(body({}, rect)).toString(); }
+  function fromFootprint(footprint) {
+    const ring = footprint?.type === 'Polygon' && footprint.coordinates?.[0];
+    if (!Array.isArray(ring) || ring.length < 4 || ring.some(p => !Array.isArray(p) ||
+      p.length < 2 || !Number.isFinite(p[0]) || !Number.isFinite(p[1]) ||
+      Math.abs(p[0]) > 180 || Math.abs(p[1]) > MAX_LAT)) {
+      throw new Error('Footprint GeoTIFF không hợp lệ để copy sang ROI chữ nhật.');
+    }
+    const points = ring.slice(0,-1);
+    if (ring[0][0] !== ring.at(-1)[0] || ring[0][1] !== ring.at(-1)[1] ||
+      Math.max(...points.map(p => p[0])) - Math.min(...points.map(p => p[0])) > 180) {
+      throw new Error('Footprint phải là vòng kín và không vượt đường đổi ngày.');
+    }
+    const origin = {
+      center_lon:points.reduce((sum,p) => sum+p[0],0)/points.length,
+      center_lat:points.reduce((sum,p) => sum+p[1],0)/points.length,
+      rotation_deg:0
+    };
+    const xy = points.map(([lon,lat]) => local(origin,lon,lat));
+    let best = null;
+    // Evaluate edge-aligned enclosing rectangles, retaining all densified vertices.
+    // The manual editor uses local metres, so curved/sheared frames are enclosed.
+    for (let i=0; i<xy.length; i++) {
+      const [x,y] = xy[i], [nx,ny] = xy[(i+1)%xy.length];
+      if (Math.hypot(nx-x,ny-y) < 1e-8) continue;
+      const angle = Math.atan2(-(ny-y),nx-x), c = Math.cos(angle), s = Math.sin(angle);
+      const xs = xy.map(([east,north]) => east*c-north*s);
+      const ys = xy.map(([east,north]) => east*s+north*c);
+      const w = Math.min(...xs), e = Math.max(...xs), south = Math.min(...ys), n = Math.max(...ys);
+      const area = (e-w)*(n-south);
+      if (best && area >= best.area*(1-1e-10)) continue;
+      const [center_lon,center_lat] = point({...origin,rotation_deg:normalize(angle*180/Math.PI)},(w+e)/2,(south+n)/2);
+      best = {area, center_lon, center_lat, rotation_deg:normalize(angle*180/Math.PI)%180};
+    }
+    if (!best || best.area < 1e-8) throw new Error('Footprint GeoTIFF không có diện tích để copy.');
+    // Re-evaluate at the new latitude to keep every source vertex inside the ROI.
+    const offsets = points.map(([lon,lat]) => local(best,lon,lat));
+    // Coordinate round trips can put an exactly 90 km side a few nanometres over.
+    const size = value => value > MAX_SIZE && value <= MAX_SIZE+1e-6 ? MAX_SIZE : value;
+    return snapshot({...best,
+      width_m:size(2*Math.max(...offsets.map(([x]) => Math.abs(x)))),
+      height_m:size(2*Math.max(...offsets.map(([,y]) => Math.abs(y))))});
+  }
   function draw(start, end) {
     const center_lat = (start.lat + end.lat)/2;
     return {center_lon: (start.lng + end.lng)/2, center_lat,
@@ -225,5 +267,5 @@
     }
     destroy() { this.cancel(); this.map.off('zoomend', this.onZoom); this.map.removeLayer(this.group); this.listeners.forEach(remove => remove()); }
   }
-  return {METRES, MAX_LAT, MAX_SIZE, fields, normalize, point, local, geometry, validate, snapshot, bbox, body, query, draw, edit, Controller};
+  return {METRES, MAX_LAT, MAX_SIZE, fields, normalize, point, local, geometry, validate, snapshot, bbox, body, query, fromFootprint, draw, edit, Controller};
 });

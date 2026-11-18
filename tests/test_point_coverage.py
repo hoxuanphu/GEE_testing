@@ -81,9 +81,10 @@ class PointCoverageTests(unittest.TestCase):
 
     def test_best_scene_routes_optical_only(self):
         with mock.patch.object(imagery, 'bbox_to_ee_geom', return_value='roi'), \
-             mock.patch.object(imagery, '_point_optical_scene', return_value='scene') as select:
+             mock.patch.object(imagery, '_raw_optical_scene', return_value='scene') as select:
             self.assertEqual(imagery.best_scene('landsat', 104, 21, 3000, '2026-01-01', '2026-02-01', merge_scenes=True), 'scene')
-            self.assertTrue(select.call_args.args[-1])
+            self.assertEqual(select.call_args.args[0], 'landsat')
+            self.assertTrue(select.call_args.kwargs['clip_output'])
 
 
 if __name__ == '__main__':

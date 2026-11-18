@@ -26,7 +26,7 @@ class TestRectangleSearchToDownload(unittest.TestCase):
                                            width_m=200, height_m=100, rotation_deg=angle)
                         grid = roi.output_grid(main.S1_SCALE if dataset == 's1gee' else main._scale_for(dataset))
                         scene = SceneInfo(dataset, 'fixture', 'exact-scene', '2026-01-01', 0,
-                                          object(), coverage_pct=100)
+                                          object(), coverage_pct=100, platform='C')
                         def merge(urls, destination, **kwargs):
                             self.assertTrue(kwargs['preserve_masks'])
                             with rasterio.open(destination, 'w', driver='GTiff', width=80,
@@ -41,11 +41,14 @@ class TestRectangleSearchToDownload(unittest.TestCase):
                         optical = dataset != 's1gee'
                         if optical:
                             body['dataset'] = dataset
+                        if dataset in ('sentinel2', 's1gee'):
+                            body['platform'] = 'C'
                         endpoint = '/api/scene' if optical else '/api/s1gee/scene'
                         selector = 'best_scene' if optical else 'best_s1_scene'
                         with mock.patch.object(main, '_ensure_ee'), \
                                 mock.patch('ee.Geometry.Polygon', return_value='true-polygon'), \
                                 mock.patch.object(main, selector, return_value=scene) as search, \
+                                mock.patch('app.s1_mosaic.prepare_s1', return_value=scene), \
                                 mock.patch.object(main, 'preview_rgb', return_value=None), \
                                 mock.patch.object(main, '_DOWNLOADS_DIR', root), \
                                 mock.patch.object(main, 'download_geotiff', return_value=[]) as export, \
@@ -55,9 +58,14 @@ class TestRectangleSearchToDownload(unittest.TestCase):
                             data = found.json()
                             self.assertEqual(data['roi_geometry'], roi.geometry)
                             self.assertEqual(search.call_args.kwargs['roi'], 'true-polygon')
+                            self.assertEqual(search.call_args.kwargs['platform'], body.get('platform'))
+                            if body.get('platform'):
+                                self.assertEqual(data['platform'], 'C')
+                                self.assertIn('platform=C', data['download_url'])
                             downloaded = client.get(data['download_url'])
                             self.assertEqual(downloaded.status_code, 200, downloaded.text)
                             self.assertEqual(search.call_args.kwargs['roi'], 'true-polygon')
+                            self.assertEqual(search.call_args.kwargs['platform'], body.get('platform'))
                             self.assertIsNone(export.call_args.args[4])
                             self.assertLess(export.call_args.args[2].west, roi.bbox.west)
                             with rasterio.MemoryFile(downloaded.content) as mem, mem.open() as dst:

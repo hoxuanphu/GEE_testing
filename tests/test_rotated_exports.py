@@ -108,7 +108,7 @@ class TestRotatedTimeSeriesWorker(RasterCase):
 class TestGEERotatedMerge(RasterCase):
     def test_optical_selection_uses_polygon_without_admin_composite(self):
         roi = object()
-        with mock.patch.object(imagery, "_point_optical_scene", return_value="scene") as pick:
+        with mock.patch.object(imagery, "_raw_optical_scene", return_value="scene") as pick:
             result = imagery.best_scene("sentinel2", 107, 10, 100, "2026-01-01", "2026-01-02",
                                         merge_scenes=True, roi=roi)
         self.assertEqual(result, "scene")

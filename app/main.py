@@ -6,6 +6,8 @@ import asyncio
 from contextlib import asynccontextmanager, suppress
 import os
 import math
+import logging
+import json
 import uuid
 import re
 import time
@@ -18,11 +20,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from rasterio.errors import RasterioError
 
 from .request_timing import SearchTimingMiddleware, measure_call
+from .scene_snapshots import SceneSnapshots
+from .download_metrics import DownloadTimingMiddleware, measure as measure_download
+from .export_resources import bulk_export, QueueTimeout
 from .esri import EsriRequest, EsriService, BusyError as EsriBusyError
 from .timeseries import BusyError, TimeSeriesService, TimeSeriesStore
+from .timeseries_batches import BatchStore, BatchService
+from .timeseries_batch_api import register_batch_routes
 from .imagery import list_timeseries_scenes, timeseries_source_metadata
+from .timeseries_metadata import search_failure
 
 from .cdse import (
     build_pairs,
@@ -57,6 +66,9 @@ from .admin_boundaries import (
 )
 from .commune_boundaries import Commune, commune_feature, get_commune, list_communes
 from .ee_session import init_ee
+from .platforms import validate_platform
+from .vector_store import VectorStore
+from .vector_api import VectorArea, vector_area, register_vector_routes
 from .geo import (
     MAX_RECTANGLE_DIMENSION_M,
     Bbox,
@@ -72,6 +84,7 @@ from .imagery import (
     DYNAMIC_WORLD_SCALE,
     S1_SCALE,
     S2_SCALE,
+    s2_export_bands,
     best_scene,
     InsufficientCoverageError,
     best_scene_for_roi,
@@ -84,15 +97,35 @@ from .imagery import (
     MEDOID_MAX_TILE_PIXELS,
 )
 
-_timeseries_store = TimeSeriesStore(Path(__file__).resolve().parent.parent / "downloads" / "timeseries")
+_DOWNLOADS_DIR = Path(os.environ.get('GEE_DOWNLOADS_DIR') or
+                      Path(__file__).resolve().parent.parent / 'downloads').resolve()
+_DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
+_vector_store = VectorStore(_DOWNLOADS_DIR / 'vectors')
+_timeseries_store = TimeSeriesStore(_DOWNLOADS_DIR / "timeseries")
 _timeseries_service = TimeSeriesService(_timeseries_store)
-_esri_root = Path(__file__).resolve().parent.parent / "downloads" / "esri"
+_batch_store = BatchStore(_DOWNLOADS_DIR / 'timeseries')
+_batch_service = BatchService(_batch_store, _timeseries_service)
+_esri_root = _DOWNLOADS_DIR / "esri"
 _esri_service = EsriService(_esri_root)
+
+from .frame_store import FrameStore
+from .frame_jobs import FrameService
+
+_frame_store = FrameStore(_DOWNLOADS_DIR / 'matched_frame')
+_frame_service = FrameService(_frame_store)
 
 
 @asynccontextmanager
 async def _lifespan(application):
-    global _timeseries_service, _esri_service
+    global _timeseries_service, _esri_service, _frame_service, _batch_service, _download_service
+    if _download_service is not None and _download_service._stop.is_set():
+        _download_service = None
+    if os.getenv('GEE_DOWNLOAD_JOBS') == '1':
+        _get_download_service()
+    if _frame_service._closed:
+        _frame_service = FrameService(_frame_store)
+    _frame_service.recover()
+    _frame_service.cleanup()
     if _esri_service._closed:
         _esri_service = EsriService(_esri_root)
     _esri_service.recover()
@@ -100,11 +133,18 @@ async def _lifespan(application):
         _timeseries_service = TimeSeriesService(_timeseries_store)
     _timeseries_service.recover_interrupted_jobs()
     _timeseries_service.cleanup_expired_jobs()
+    _batch_service = BatchService(_batch_store, _timeseries_service)
+    _batch_store.recover()
+    _batch_store.cleanup()
 
     async def cleanup_loop():
         while True:
             await asyncio.sleep(3600)
             await asyncio.to_thread(_timeseries_service.cleanup_expired_jobs)
+            await asyncio.to_thread(_batch_store.cleanup)
+            await asyncio.to_thread(_frame_service.cleanup)
+            if _download_service is not None:
+                await asyncio.to_thread(_download_service.cleanup)
 
     cleanup_task = asyncio.create_task(cleanup_loop())
     try:
@@ -113,12 +153,24 @@ async def _lifespan(application):
         cleanup_task.cancel()
         with suppress(asyncio.CancelledError):
             await cleanup_task
+        await asyncio.to_thread(_batch_service.pause_active)
         await asyncio.to_thread(_esri_service.shutdown)
         await asyncio.to_thread(_timeseries_service.shutdown)
+        await asyncio.to_thread(_frame_service.shutdown)
+        if _download_service is not None:
+            await asyncio.to_thread(_download_service.shutdown)
 
 
 app = FastAPI(title="GEE Surface Reflectance Downloader", version="0.1.0", lifespan=_lifespan)
 app.add_middleware(SearchTimingMiddleware)
+app.add_middleware(DownloadTimingMiddleware, directory=_DOWNLOADS_DIR / 'download-performance' / 'requests')
+
+
+@app.exception_handler(QueueTimeout)
+async def export_queue_timeout(request,exc):
+    from fastapi.responses import JSONResponse
+    return JSONResponse({'code':'queue_timeout','detail':'Hàng đợi tải ảnh đã hết thời gian chờ; hãy thử lại sau.'},
+                        status_code=503,headers={'Retry-After':'30'})
 
 app.add_middleware(
     CORSMiddleware,
@@ -128,8 +180,6 @@ app.add_middleware(
 )
 
 _STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
-_DOWNLOADS_DIR = Path(__file__).resolve().parent.parent / "downloads"
-_DOWNLOADS_DIR.mkdir(exist_ok=True)
 
 _MAX_RADIUS_M = 45_000.0
 _DEFAULT_DAYS = 30
@@ -187,6 +237,90 @@ except ImportError:
     rasterio = None
 
 _ee_ready = False
+_color_snapshots = SceneSnapshots()
+_mosaic_snapshots = SceneSnapshots()
+_download_service = None
+
+
+def _get_download_store():
+    from .download_store import SelectionStore
+    return SelectionStore(_DOWNLOADS_DIR / 'gee-downloads')
+
+
+def _get_download_service():
+    global _download_service
+    from .download_jobs import DownloadService
+    from .download_models import DownloadSettings
+    root = (_DOWNLOADS_DIR / 'gee-downloads').resolve()
+    if _download_service is not None and _download_service.store.root != root:
+        _download_service.shutdown()
+        _download_service = None
+    if _download_service is None:
+        _download_service = DownloadService(_get_download_store(),
+            settings=DownloadSettings(vrt=os.getenv('GEE_DOWNLOAD_VRT') == '1'),
+            # The flag gates new jobs/UI. Existing paused jobs remain resumable
+            # after rollback, using their persisted writer profile and graph.
+            autostart=True)
+    return _download_service
+
+
+from .download_api import register_download_routes
+register_download_routes(app, _get_download_service, lambda: os.getenv('GEE_DOWNLOAD_JOBS') == '1')
+
+
+def _frozen_download_supported(dataset, mode):
+    return (os.getenv('GEE_DOWNLOAD_SNAPSHOTS') == '1' and dataset == 'sentinel2'
+            and mode in ('point', 'rectangle'))
+
+
+def _validate_color_balance(enabled, dataset, selection_mode, merge_scenes, composite_method):
+    if enabled and (dataset not in ('sentinel2', 'landsat') or composite_method != 'raw' or
+                    (composite_method != 'raw' if selection_mode in ('province', 'commune', 'vector')
+                     else not merge_scenes)):
+        raise ValueError('Cân bằng màu chỉ hỗ trợ ghép RAW Sentinel-2/Landsat.')
+
+
+def _mosaic_options(grouping='any', days=3, mask=True, method='raw', dataset='sentinel2'):
+    return (dict(scene_grouping=grouping, max_scene_span_days=days, mosaic_mask_clouds=mask)
+            if dataset in ('sentinel2', 'landsat') and (grouping != 'any' or method == 'mosaic') else {})
+
+
+def _validate_mosaic_options(dataset, mode, merge, method, grouping, days, mask):
+    if grouping not in ('any', 'near_date', 'same_pass') or days not in (1, 3, 5, 7):
+        raise ValueError('Giới hạn thời gian phải là 1/3/5/7 ngày.')
+    active = mode in ('province', 'commune', 'vector') or merge
+    if dataset in ('sentinel2', 'landsat') and method == 'mosaic' and not active:
+        raise ValueError('Bật ghép nhiều cảnh trước khi chọn Mosaic ổn định.')
+    if (grouping != 'any' or not mask) and (
+            dataset not in ('sentinel2', 'landsat') or not active or method not in ('raw', 'mosaic')):
+        raise ValueError('Chọn ghép RAW hoặc Mosaic ổn định Sentinel-2/Landsat trước.')
+    if not mask and method != 'mosaic':
+        raise ValueError('Tùy chọn mask mây chỉ áp dụng cho Mosaic ổn định.')
+
+
+def _mosaic_snapshot_key(base, method, grouping, days, mask, balance, merge):
+    return base + json.dumps([method, grouping, days, mask, balance, merge])
+
+
+def _color_snapshot_key(dataset, start, end, mode, bbox, area, rotation, *, s2_band_preset=None, **coordinates):
+    active_fields = ('lon', 'lat', 'radius_m') if mode == 'point' else (
+        ('center_lon', 'center_lat', 'width_m', 'height_m') if mode == 'rectangle' else ())
+    coordinates = {field: coordinates[field] for field in ('platform', *active_fields)}
+    return json.dumps(dict(dataset=dataset, start=start, end=end, mode=mode,
+                           bbox=_bbox_dict(bbox), area_id=area.id if area else None,
+                           geometry=area.geometry if area else None,
+                           rotation=rotation % 360, s2_band_preset=s2_band_preset,
+                           **coordinates), sort_keys=True)
+
+
+S2BandPreset = Literal['rgbnir']
+
+
+def _validate_s2_band_preset(dataset, preset, auxiliary_bands):
+    if preset is not None:
+        if dataset != 'sentinel2':
+            raise ValueError('s2_band_preset requires dataset=sentinel2')
+        s2_export_bands(auxiliary_bands, s2_band_preset=preset)
 
 
 def _ensure_ee() -> None:
@@ -205,10 +339,22 @@ def _ensure_ee() -> None:
 class PointSelectionRequest(BaseModel):
     model_config = ConfigDict(allow_inf_nan=False)
     rotation_deg: float = Field(0.0, ge=0, le=360)
+    vector_roi_id: str | None = Field(None, max_length=64)
 
     @model_validator(mode="after")
     def valid_rotation(self):
         self.rotation_deg %= 360
+        if self.selection_mode == 'vector':
+            try:
+                if str(uuid.UUID(self.vector_roi_id or '')) != self.vector_roi_id:
+                    raise ValueError()
+            except (ValueError, TypeError, AttributeError):
+                raise ValueError('Chọn và áp dụng polygon vector hợp lệ trước.') from None
+            if any(getattr(self, field, None) is not None for field in ('lon', 'lat', 'province_id', 'commune_id',
+                    'center_lon', 'center_lat', 'width_m', 'height_m')) or 'radius_m' in self.model_fields_set:
+                raise ValueError('Vector ROI cannot include point, rectangle or administrative fields')
+        elif self.vector_roi_id is not None:
+            raise ValueError('vector_roi_id requires vector selection')
         if self.selection_mode not in ("point", "rectangle") and self.rotation_deg:
             raise ValueError("rotation_deg is only supported for point or rectangle selection")
         try:
@@ -229,7 +375,7 @@ class PointSelectionRequest(BaseModel):
 
 
 class SceneRequest(PointSelectionRequest):
-    selection_mode: Literal["point", "rectangle", "province", "commune"] = "point"
+    selection_mode: Literal["point", "rectangle", "province", "commune", "vector"] = "point"
     lon: float | None = Field(None, ge=-180, le=180, description="Longitude (degrees)")
     lat: float | None = Field(None, ge=-90, le=90, description="Latitude (degrees)")
     center_lon: float | None = Field(None, ge=-180, le=180)
@@ -245,9 +391,43 @@ class SceneRequest(PointSelectionRequest):
     end_date: str = Field(..., description="YYYY-MM-DD (inclusive)")
     radius_m: float = Field(2000.0, gt=0, le=_MAX_RADIUS_M)
     merge_scenes: bool = False
+    color_balance: bool = False
+    scene_grouping: Literal['any', 'near_date', 'same_pass'] = 'any'
+    max_scene_span_days: Literal[1, 3, 5, 7] = 3
+    mosaic_mask_clouds: bool = True
+    platform: str | None = None
+    s2_auxiliary_bands: list[str] | None = None
+    s2_band_preset: S2BandPreset | None = None
+
+    @field_validator('s2_auxiliary_bands')
+    @classmethod
+    def valid_auxiliary_bands(cls, value, info):
+        if value is not None:
+            if info.data.get('dataset') != 'sentinel2':
+                raise ValueError('s2_auxiliary_bands requires dataset=sentinel2')
+            s2_export_bands(value)
+        return value
+
     composite_method: Literal["mosaic", "median", "medoid", "base-score", "raw"] = Field(
-        "medoid", description="Province mode: how to composite multiple scenes"
+        "raw", description="Province mode: how to composite multiple scenes"
     )
+
+    @model_validator(mode="after")
+    def valid_platform(self):
+        self.platform = validate_platform(self.dataset, self.platform)
+        _validate_s2_band_preset(self.dataset, self.s2_band_preset, self.s2_auxiliary_bands)
+        _validate_color_balance(self.color_balance, self.dataset, self.selection_mode,
+                                self.merge_scenes, self.composite_method)
+        _validate_mosaic_options(self.dataset, self.selection_mode, self.merge_scenes, self.composite_method,
+                                self.scene_grouping, self.max_scene_span_days, self.mosaic_mask_clouds)
+        return self
+
+    def download_parameters(self):
+        parameters = self.model_dump()
+        if self.s2_band_preset is None:
+            # Keep the request identity of existing download tokens and artifacts.
+            parameters.pop('s2_band_preset')
+        return parameters
 
     @field_validator("start_date", "end_date")
     @classmethod
@@ -261,6 +441,7 @@ class SceneRequest(PointSelectionRequest):
 
 class SceneResponse(BaseModel):
     dataset: str
+    platform: str | None = None
     scene_id: str
     date: str
     cloud_pct: float
@@ -271,7 +452,8 @@ class SceneResponse(BaseModel):
     bands: list[str]
     preview_url: str | None = None
     download_url: str | None = None
-    selection_mode: Literal["point", "rectangle", "province", "commune"]
+    selection_mode: Literal["point", "rectangle", "province", "commune", "vector"]
+    vector_roi_id: str | None = None
     province_id: str | None = None
     province_name: str | None = None
     commune_id: str | None = None
@@ -284,6 +466,11 @@ class SceneResponse(BaseModel):
     scenes: list[dict] = Field(default_factory=list)
     estimated_seconds: int | None = None
     coverage_pct: float | None = None
+    color_balance: dict | None = None
+    scene_grouping: dict | None = None
+    mosaic_mask_clouds: bool | None = None
+    selection_token: str | None = None
+    download_job_available: bool = False
 
 
 @app.exception_handler(InsufficientCoverageError)
@@ -314,11 +501,20 @@ def _resolve_selection(
     center_lat: float | None = None,
     width_m: float | None = None,
     height_m: float | None = None,
+    vector_roi_id: str | None = None,
 ) -> tuple[object, Bbox, Province | Commune | None]:
     """Resolve a trusted point or local administrative polygon into an ROI."""
     if not math.isfinite(rotation_deg) or not 0 <= rotation_deg <= 360:
         raise HTTPException(400, "rotation_deg must be finite and between 0 and 360")
     rotation_deg %= 360
+    if selection_mode == 'vector':
+        if rotation_deg or any(value is not None for value in (lon, lat, province_id, commune_id,
+                center_lon, center_lat, width_m, height_m)):
+            raise HTTPException(400, 'Vector ROI cannot include other selection fields or rotation')
+        area = vector_area(_vector_store, vector_roi_id)
+        return area.ee_geometry(), area.bbox, area
+    if vector_roi_id is not None:
+        raise HTTPException(400, 'vector_roi_id requires vector selection')
     if selection_mode not in ("point", "rectangle") and rotation_deg:
         raise HTTPException(400, "rotation_deg is only supported for point or rectangle selection")
     if selection_mode == "rectangle":
@@ -381,7 +577,7 @@ def _bbox_dict(bbox: Bbox) -> dict[str, float]:
 
 class TimeSeriesRequest(PointSelectionRequest):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
-    selection_mode: Literal["point", "rectangle"] = "point"
+    selection_mode: Literal["point", "rectangle", "vector"] = "point"
     dataset: Literal["sentinel2", "landsat", "nicfi", "dynamic_world", "s1gee"]
     lon: float | None = Field(None, ge=-180, le=180)
     lat: float | None = Field(None, ge=-90, le=90)
@@ -393,6 +589,18 @@ class TimeSeriesRequest(PointSelectionRequest):
     start_date: str
     end_date: str
     polarization: Literal["vv", "vh", "vvvh", "hh", "hv", "hhhv"] = "vvvh"
+    platform: str | None = None
+    s2_auxiliary_bands: list[str] | None = None
+    s2_band_preset: S2BandPreset | None = None
+
+    @field_validator('s2_auxiliary_bands')
+    @classmethod
+    def valid_auxiliary_bands(cls, value, info):
+        if value is not None:
+            if info.data.get('dataset') != 'sentinel2':
+                raise ValueError('s2_auxiliary_bands requires dataset=sentinel2')
+            s2_export_bands(value)
+        return value
 
     @field_validator("start_date", "end_date")
     @classmethod
@@ -404,6 +612,8 @@ class TimeSeriesRequest(PointSelectionRequest):
 
     @model_validator(mode="after")
     def valid_interval(self):
+        self.platform = validate_platform(self.dataset, self.platform)
+        _validate_s2_band_preset(self.dataset, self.s2_band_preset, self.s2_auxiliary_bands)
         if self.selection_mode == 'point' and (self.lon is None or self.lat is None):
             raise ValueError('lon and lat are required for point selection')
         if self.selection_mode == 'rectangle' and 'radius_m' in self.model_fields_set:
@@ -432,29 +642,41 @@ class TimeSeriesJobRequest(BaseModel):
 
 @app.post("/api/timeseries/search")
 def search_timeseries(body: TimeSeriesRequest) -> dict:
-    _ensure_ee()
+    started, request_id = time.monotonic(), uuid.uuid4().hex[:12]
+    try:
+        _ensure_ee()
+    except Exception as exc:
+        error = search_failure(exc, stage='initialization', request_id=request_id, started=started)
+        raise HTTPException(error.status, error.message,
+                            headers={'X-Search-Request-ID': request_id}) from exc
     rectangle = (_rectangle_model(body.center_lon, body.center_lat, body.width_m,
                                   body.height_m, body.rotation_deg)
                  if body.selection_mode == 'rectangle' else None)
     rectangle_args = ({field: getattr(body, field) for field in
                        ('center_lon', 'center_lat', 'width_m', 'height_m')} if rectangle else {})
-    roi, bbox, _ = _resolve_selection(body.selection_mode, body.lon, body.lat, body.radius_m,
-                                     None, rotation_deg=body.rotation_deg, **rectangle_args)
+    roi, bbox, area = _resolve_selection(body.selection_mode, body.lon, body.lat, body.radius_m,
+                                     None, rotation_deg=body.rotation_deg, **rectangle_args,
+                                     **({'vector_roi_id': body.vector_roi_id} if body.vector_roi_id else {}))
     end_exclusive = (dt.date.fromisoformat(body.end_date) + dt.timedelta(days=1)).isoformat()
+    stage = 'metadata'
     try:
         scenes = list_timeseries_scenes(body.dataset,
-                                       rectangle.center_lon if rectangle else body.lon,
-                                       rectangle.center_lat if rectangle else body.lat,
+                                       rectangle.center_lon if rectangle else body.lon or 0,
+                                       rectangle.center_lat if rectangle else body.lat or 0,
                                        body.start_date, end_exclusive, body.polarization,
-                                       **({"roi": roi} if rectangle or body.rotation_deg else {}))
+                                       **({"roi": roi} if rectangle or body.rotation_deg or body.selection_mode == 'vector' else {}),
+                                       **({'platform': body.platform} if body.platform is not None else {}))
+        stage = 'parameters'
         parameters = body.model_dump()
         if rectangle is None:
             for field in ('center_lon', 'center_lat', 'width_m', 'height_m'):
                 parameters.pop(field, None)
-        parameters.update(timeseries_source_metadata(body.dataset, body.polarization))
+        parameters.update(timeseries_source_metadata(body.dataset, body.polarization,
+                                                     body.s2_auxiliary_bands,
+                                                     s2_band_preset=body.s2_band_preset))
         parameters["bbox"] = vars(bbox)
         parameters["crs"] = "EPSG:4326"
-        parameters["roi_geometry"] = (rectangle.geometry if rectangle else
+        parameters["roi_geometry"] = (area.geometry if body.selection_mode == 'vector' else rectangle.geometry if rectangle else
                                       point_roi(body.lon, body.lat, body.radius_m, body.rotation_deg)[0])
         if rectangle is not None:
             parameters['rectangle'] = rectangle.model_dump()
@@ -462,10 +684,14 @@ def search_timeseries(body: TimeSeriesRequest) -> dict:
         elif body.rotation_deg:
             parameters["output_grid"] = build_rotated_grid(body.lon, body.lat, body.radius_m,
                                                           body.rotation_deg, parameters["scale_m"])
+        stage = 'validation'
         scenes = [TimeSeriesSceneResponse.model_validate(scene).model_dump() for scene in scenes]
+        stage = 'snapshot'
         return _timeseries_store.create_search(parameters, scenes)
     except Exception as exc:
-        raise HTTPException(502, "Unable to list GEE scenes; check collection access and retry") from exc
+        error = search_failure(exc, stage=stage, request_id=request_id, started=started)
+        raise HTTPException(error.status, error.message,
+                            headers={'X-Search-Request-ID': request_id}) from exc
 
 
 @app.get("/api/timeseries/search/{search_id}")
@@ -626,6 +852,7 @@ def find_scene(req: SceneRequest) -> SceneResponse:
         req.center_lat,
         req.width_m,
         req.height_m,
+        **({'vector_roi_id': req.vector_roi_id} if req.vector_roi_id else {}),
     )
 
     # Inclusive end date for GEE filterDate (shift by +1 day)
@@ -634,6 +861,8 @@ def find_scene(req: SceneRequest) -> SceneResponse:
     ).isoformat()
 
     try:
+        mosaic_options = _mosaic_options(req.scene_grouping, req.max_scene_span_days,
+                                        req.mosaic_mask_clouds, req.composite_method, req.dataset)
         if province is not None:
             scene = measure_call("scene_search", best_scene_for_roi,
                 req.dataset,
@@ -642,6 +871,9 @@ def find_scene(req: SceneRequest) -> SceneResponse:
                 end_exclusive,
                 composite=True,
                 composite_method=req.composite_method,
+                platform=req.platform,
+                **mosaic_options,
+                **({'color_balance': True} if req.color_balance else {}),
             )
         else:
             scene = measure_call("scene_search", best_scene,
@@ -655,6 +887,10 @@ def find_scene(req: SceneRequest) -> SceneResponse:
                 merge_scenes=req.merge_scenes,
                 roi=roi if req.selection_mode in ("rectangle",) or req.rotation_deg else None,
                 bbox=bbox if req.selection_mode == "rectangle" else None,
+                platform=req.platform,
+                **({'color_balance': True} if req.color_balance else {}),
+                **({'freeze_assets': True} if _frozen_download_supported(req.dataset, req.selection_mode) else {}),
+                **({'composite_method': req.composite_method, **mosaic_options} if mosaic_options else {}),
             )
     except InsufficientCoverageError:
         raise
@@ -676,6 +912,8 @@ def find_scene(req: SceneRequest) -> SceneResponse:
     if scene is None:
         raise HTTPException(
             404,
+            f"Không có ảnh Sentinel-2{req.platform} trong khoảng thời gian/vùng đã chọn."
+            if req.platform is not None else
             "No image found for this selection/date range. "
             "Try widening the date range or increasing cloud tolerance.",
         )
@@ -683,7 +921,7 @@ def find_scene(req: SceneRequest) -> SceneResponse:
     bbox_dict = _bbox_dict(bbox)
 
     if req.dataset == "sentinel2":
-        bands = ["B2", "B3", "B4", "B8", "B11", "B12"]
+        bands = s2_export_bands(req.s2_auxiliary_bands, s2_band_preset=req.s2_band_preset)
     elif req.dataset == "nicfi":
         bands = ["B", "G", "R", "N"]
     elif req.dataset == "dynamic_world":
@@ -691,6 +929,14 @@ def find_scene(req: SceneRequest) -> SceneResponse:
     else:
         bands = ["SR_B2", "SR_B3", "SR_B4", "SR_B5", "SR_B6", "SR_B7"]
 
+    selection_token = None
+    if _frozen_download_supported(req.dataset, req.selection_mode):
+        from .download_snapshots import freeze_selection, provider_scope, restore_selection
+        from dataclasses import replace
+        snapshot = freeze_selection(scene, req.download_parameters(), provider_scope=provider_scope())
+        _get_download_store().create(snapshot)
+        selection_token = snapshot.token
+        scene = replace(scene, ee_object=restore_selection(snapshot))
     try:
         preview_url = measure_call(
             "preview_url",
@@ -704,7 +950,10 @@ def find_scene(req: SceneRequest) -> SceneResponse:
         preview_url = None
 
     download_path = f"/api/download/{req.dataset}"
-    if province is not None:
+    if req.selection_mode == 'vector':
+        download_params = (f'?selection_mode=vector&vector_roi_id={req.vector_roi_id}'
+                           f'&start_date={req.start_date}&end_date={req.end_date}')
+    elif province is not None:
         selection_query = (
             f"selection_mode=commune&commune_id={province.id}"
             if isinstance(province, Commune)
@@ -730,10 +979,42 @@ def find_scene(req: SceneRequest) -> SceneResponse:
     if province is not None:
         download_params += f"&composite_method={req.composite_method}"
     elif point_merge:
-        download_params += "&merge_scenes=true"
+        download_params += f"&merge_scenes=true&composite_method={req.composite_method}"
+    if req.platform is not None:
+        download_params += f"&platform={req.platform}"
+    if req.dataset == 'sentinel2' and req.s2_auxiliary_bands is not None:
+        download_params += '&s2_auxiliary_bands=' + ','.join(req.s2_auxiliary_bands)
+    if req.s2_band_preset is not None:
+        download_params += f'&s2_band_preset={req.s2_band_preset}'
+
+    if req.color_balance and not mosaic_options:
+        key = _color_snapshot_key(req.dataset, req.start_date, req.end_date, req.selection_mode,
+            bbox, province, req.rotation_deg, platform=req.platform, lon=req.lon, lat=req.lat,
+            radius_m=req.radius_m, center_lon=req.center_lon, center_lat=req.center_lat,
+            width_m=req.width_m, height_m=req.height_m, s2_band_preset=req.s2_band_preset)
+        token = _color_snapshots.put(key, scene)
+        download_params += f'&color_balance=true&color_snapshot={token}'
+    elif req.color_balance:
+        download_params += '&color_balance=true'
+
+    if mosaic_options:
+        download_params += (f'&scene_grouping={req.scene_grouping}&max_scene_span_days={req.max_scene_span_days}'
+                            f'&mosaic_mask_clouds={str(req.mosaic_mask_clouds).lower()}')
+        base = _color_snapshot_key(req.dataset, req.start_date, req.end_date, req.selection_mode,
+            bbox, province, req.rotation_deg, platform=req.platform, lon=req.lon, lat=req.lat,
+            radius_m=req.radius_m, center_lon=req.center_lon, center_lat=req.center_lat,
+            width_m=req.width_m, height_m=req.height_m, s2_band_preset=req.s2_band_preset)
+        key = _mosaic_snapshot_key(base, req.composite_method, req.scene_grouping,
+                                  req.max_scene_span_days, req.mosaic_mask_clouds, req.color_balance,
+                                  req.merge_scenes and req.selection_mode in ('point', 'rectangle'))
+        download_params += '&mosaic_snapshot=' + _mosaic_snapshots.put(key, scene)
+
+    if selection_token:
+        download_params += f'&selection_token={selection_token}'
 
     return SceneResponse(
         dataset=req.dataset,
+        platform=req.platform,
         scene_id=scene.scene_id,
         date=scene.date,
         cloud_pct=scene.cloud_pct,
@@ -753,8 +1034,9 @@ def find_scene(req: SceneRequest) -> SceneResponse:
         preview_url=preview_url,
         download_url=download_path + download_params,
         selection_mode=req.selection_mode,
-        province_id=province.id if province else None,
-        province_name=(province.province_name if isinstance(province, Commune) else province.name) if province else None,
+        vector_roi_id=req.vector_roi_id,
+        province_id=province.id if isinstance(province, (Province, Commune)) else None,
+        province_name=(province.province_name if isinstance(province, Commune) else province.name) if isinstance(province, (Province, Commune)) else None,
         commune_id=province.id if isinstance(province, Commune) else None,
         commune_name=province.name if isinstance(province, Commune) else None,
         composite=province is not None or point_merge,
@@ -762,11 +1044,16 @@ def find_scene(req: SceneRequest) -> SceneResponse:
         composite_method=(
             "dynamic-world-mode"
             if province is not None and req.dataset == "dynamic_world"
-            else req.composite_method if province is not None else "mosaic" if point_merge else None
+            else req.composite_method if province is not None or point_merge else None
         ),
         scene_count=scene.scene_count,
         scenes=list(scene.scenes),
         estimated_seconds=scene.estimated_seconds,
+        color_balance=scene.color_balance if req.color_balance else None,
+        scene_grouping=getattr(scene, 'scene_grouping', None),
+        mosaic_mask_clouds=getattr(scene, 'mosaic_mask_clouds', None),
+        selection_token=selection_token,
+        download_job_available=bool(selection_token and os.getenv('GEE_DOWNLOAD_JOBS') == '1'),
     )
 
 
@@ -776,32 +1063,38 @@ def plan_composite(req: SceneRequest) -> dict:
     measure_call("ee_init", _ensure_ee)
     if req.start_date > req.end_date:
         raise HTTPException(400, "start_date must be <= end_date")
-    if req.selection_mode not in ("province", "commune"):
+    if req.selection_mode not in ("province", "commune", "vector"):
         raise HTTPException(400, "Composite planning is only available for administrative selection")
     if req.dataset not in ("sentinel2", "landsat"):
         raise HTTPException(400, "Composite planning is only available for Sentinel-2 or Landsat")
 
     roi, _bbox, _province = measure_call("selection", _resolve_selection,
-        req.selection_mode, req.lon, req.lat, req.radius_m, req.province_id, req.commune_id, req.rotation_deg
+        req.selection_mode, req.lon, req.lat, req.radius_m, req.province_id, req.commune_id, req.rotation_deg,
+        **({'vector_roi_id': req.vector_roi_id} if req.vector_roi_id else {}),
     )
     end_exclusive = (dt.date.fromisoformat(req.end_date) + dt.timedelta(days=1)).isoformat()
     try:
         plan = measure_call("composite_plan", composite_plan,
-            req.dataset, roi, req.start_date, end_exclusive, req.composite_method
+            req.dataset, roi, req.start_date, end_exclusive, req.composite_method,
+            platform=req.platform,
+            **_mosaic_options(req.scene_grouping, req.max_scene_span_days, req.mosaic_mask_clouds, req.composite_method, req.dataset),
         )
     except Exception as exc:
         raise HTTPException(502, f"Earth Engine planning failed: {exc}") from exc
     if plan is None:
-        raise HTTPException(404, "No image found for this selection/date range")
+        raise HTTPException(404, f"Không có ảnh Sentinel-2{req.platform} trong khoảng thời gian/vùng đã chọn."
+                            if req.platform is not None else "No image found for this selection/date range")
     return plan
 
 
 @app.get("/api/download/{dataset}")
+@bulk_export
 def download(
     dataset: str,
     start_date: str,
     end_date: str,
-    selection_mode: Literal["point", "rectangle", "province", "commune"] = "point",
+    selection_mode: Literal["point", "rectangle", "province", "commune", "vector"] = "point",
+    vector_roi_id: str | None = None,
     lon: float | None = None,
     lat: float | None = None,
     center_lon: float | None = None,
@@ -814,10 +1107,38 @@ def download(
     merge_scenes: bool = False,
     composite_method: Literal[
         "mosaic", "median", "medoid", "base-score", "raw"
-    ] = "medoid",
+    ] = "raw",
     rotation_deg: float = 0.0,
+    platform: str | None = None,
+    s2_auxiliary_bands: str | None = None,
+    s2_band_preset: S2BandPreset | None = None,
+    color_balance: bool = False,
+    color_snapshot: str | None = None,
+    selection_token: str | None = None,
+    scene_grouping: Literal['any', 'near_date', 'same_pass'] = 'any',
+    max_scene_span_days: int = 3,
+    mosaic_mask_clouds: bool = True,
+    mosaic_snapshot: str | None = None,
 ):
-    _ensure_ee()
+    auxiliary_bands = None if s2_auxiliary_bands is None else s2_auxiliary_bands.split(',') if s2_auxiliary_bands else []
+    try:
+        platform = validate_platform(dataset, platform)
+        _validate_color_balance(color_balance, dataset, selection_mode, merge_scenes, composite_method)
+        _validate_mosaic_options(dataset, selection_mode, merge_scenes, composite_method,
+                                scene_grouping, max_scene_span_days, mosaic_mask_clouds)
+        mosaic_options = _mosaic_options(scene_grouping, max_scene_span_days, mosaic_mask_clouds, composite_method, dataset)
+        if mosaic_snapshot and (not mosaic_options or len(mosaic_snapshot) > 128):
+            raise ValueError('Invalid mosaic snapshot')
+        if color_snapshot and (not color_balance or len(color_snapshot) > 128):
+            raise ValueError('color_snapshot requires color_balance=true and a valid snapshot token')
+        if auxiliary_bands is not None:
+            if dataset != 'sentinel2':
+                raise ValueError('s2_auxiliary_bands requires dataset=sentinel2')
+            s2_export_bands(auxiliary_bands)
+        _validate_s2_band_preset(dataset, s2_band_preset, auxiliary_bands)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    measure_download('provider_readiness', _ensure_ee)
     if dataset not in ("sentinel2", "landsat", "nicfi", "dynamic_world"):
         raise HTTPException(
             400, "dataset must be sentinel2, landsat, nicfi or dynamic_world"
@@ -834,25 +1155,74 @@ def download(
         center_lat,
         width_m,
         height_m,
+        **({'vector_roi_id': vector_roi_id} if vector_roi_id else {}),
     )
 
     end_exclusive = (
         dt.date.fromisoformat(end_date) + dt.timedelta(days=1)
     ).isoformat()
 
-    if province is not None:
+    if selection_token:
+        from .download_snapshots import provider_scope, restore_selection
+        from .download_store import SelectionExpired, SelectionMismatch
+        from .imagery import SceneInfo
+        request = SceneRequest(dataset=dataset, start_date=start_date, end_date=end_date,
+            selection_mode=selection_mode, vector_roi_id=vector_roi_id, lon=lon, lat=lat,
+            center_lon=center_lon, center_lat=center_lat, width_m=width_m, height_m=height_m,
+            radius_m=radius_m, province_id=province_id, commune_id=commune_id,
+            merge_scenes=merge_scenes, composite_method=composite_method,
+            rotation_deg=rotation_deg, platform=platform, s2_auxiliary_bands=auxiliary_bands,
+            s2_band_preset=s2_band_preset,
+            color_balance=color_balance, scene_grouping=scene_grouping,
+            max_scene_span_days=max_scene_span_days, mosaic_mask_clouds=mosaic_mask_clouds)
+        try:
+            snapshot = _get_download_store().get(selection_token, request=request.download_parameters(),
+                                                 provider_scope=provider_scope())
+        except SelectionExpired as exc:
+            raise HTTPException(410, str(exc)) from None
+        except SelectionMismatch as exc:
+            raise HTTPException(409, str(exc)) from None
+        scene = SceneInfo(**snapshot.scene, ee_object=restore_selection(snapshot), selection_recipe=snapshot.recipe)
+    elif mosaic_snapshot:
+        base = _color_snapshot_key(dataset, start_date, end_date, selection_mode, bbox, province,
+            rotation_deg, platform=platform, lon=lon, lat=lat, radius_m=radius_m,
+            center_lon=center_lon, center_lat=center_lat, width_m=width_m, height_m=height_m,
+            s2_band_preset=s2_band_preset)
+        key = _mosaic_snapshot_key(base, composite_method, scene_grouping, max_scene_span_days,
+                                  mosaic_mask_clouds, color_balance, merge_scenes and selection_mode in ('point', 'rectangle'))
+        try:
+            scene = _mosaic_snapshots.get(mosaic_snapshot, key)
+        except LookupError as exc:
+            raise HTTPException(410, str(exc)) from None
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from None
+    elif color_snapshot:
+        key = _color_snapshot_key(dataset, start_date, end_date, selection_mode, bbox, province,
+            rotation_deg, platform=platform, lon=lon, lat=lat, radius_m=radius_m,
+            center_lon=center_lon, center_lat=center_lat, width_m=width_m, height_m=height_m,
+            s2_band_preset=s2_band_preset)
+        try:
+            scene = _color_snapshots.get(color_snapshot, key)
+        except LookupError as exc:
+            raise HTTPException(410, str(exc)) from None
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from None
+    elif province is not None:
         if dataset not in ("sentinel2", "landsat"):
             composite_method = "mosaic"
-        scene = best_scene_for_roi(
+        scene = measure_download('selection', best_scene_for_roi,
             dataset,
             roi,
             start_date,
             end_exclusive,
             composite=True,
             composite_method=composite_method,
+            platform=platform,
+            **mosaic_options,
+            **({'color_balance': True} if color_balance else {}),
         )
     else:
-        scene = best_scene(
+        scene = measure_download('selection', best_scene,
             dataset=dataset,
             lon=center_lon if selection_mode == "rectangle" else lon,
             lat=center_lat if selection_mode == "rectangle" else lat,
@@ -863,9 +1233,13 @@ def download(
             merge_scenes=merge_scenes,
             roi=roi if selection_mode == "rectangle" or rotation_deg % 360 else None,
             bbox=bbox if selection_mode == "rectangle" else None,
+            platform=platform,
+            **({'color_balance': True} if color_balance else {}),
+            **({'composite_method': composite_method, **mosaic_options} if mosaic_options else {}),
         )
     if scene is None:
-        raise HTTPException(404, "No scene found for this point/date range")
+        raise HTTPException(404, f"Không có ảnh Sentinel-2{platform} trong khoảng thời gian/vùng đã chọn."
+                            if platform is not None else "No scene found for this point/date range")
 
     scale = _scale_for(dataset)
     rectangle = (
@@ -886,7 +1260,8 @@ def download(
             scale,
             rectangle.center_lat if rectangle is not None else lat,
         )
-    band_urls = download_geotiff(
+    optimized = bool(selection_token and os.getenv('GEE_DOWNLOAD_TRANSPORT') == '1')
+    band_urls = [] if optimized else measure_download('planning_probe', download_geotiff,
         scene.ee_object,
         dataset,
         bbox,
@@ -899,6 +1274,8 @@ def download(
         if province is not None and composite_method in ("medoid", "base-score")
         and dataset in ("sentinel2", "landsat")
         else None,
+        **({'s2_auxiliary_bands': auxiliary_bands} if auxiliary_bands is not None else {}),
+        **({'s2_band_preset': s2_band_preset} if s2_band_preset is not None else {}),
     )
 
     if province is not None:
@@ -919,18 +1296,57 @@ def download(
         else:
             fname = f"{Path(fname).stem}_pt{lon:.5f}_{lat:.5f}_r{radius_m:g}_a{rotation_deg % 360:g}.tif"
     out = _DOWNLOADS_DIR / f"{uuid.uuid4().hex}.tif"
+    if color_balance:
+        fname = f'{Path(fname).stem}_balanced.tif'
+    if mosaic_options:
+        suffix = ('masked' if mosaic_mask_clouds else 'unmasked') if composite_method == 'mosaic' else 'raw'
+        fname = f'{Path(fname).stem}_{suffix}_{scene_grouping}.tif'
+    if s2_band_preset == 'rgbnir':
+        fname = f'{Path(fname).stem}_rgbnir.tif'
+    if optimized:
+        from .download_pipeline import execute_selection
+        from .download_models import DownloadSettings
+        from .download_store import AttemptBusy
+        from .download_api import ArtifactResponse
+        try:
+            receipt = execute_selection(snapshot, _get_download_store(),
+                settings=DownloadSettings(vrt=os.getenv('GEE_DOWNLOAD_VRT') == '1'))
+        except AttemptBusy as exc:
+            raise HTTPException(409, str(exc)) from None
+        except (RuntimeError, ValueError, TimeoutError, OSError, requests.RequestException) as exc:
+            logging.getLogger(__name__).error('Frozen GeoTIFF export failed: error_type=%s',type(exc).__name__)
+            raise HTTPException(502, 'Không thể hoàn tất tải ảnh; các ô đã kiểm tra được giữ để tiếp tục.') from exc
+        return ArtifactResponse(_get_download_store(), receipt.tile_key, fname)
     raw = out.with_suffix(".source.tif") if output_grid else out
     try:
-        merge_band_tiffs(
+        measure_download('transfer_assembly', merge_band_tiffs,
             band_urls, raw, categorical=dataset == "dynamic_world",
-            **({"preserve_masks": True} if output_grid else {})
+            **({"preserve_masks": True} if output_grid or selection_mode == 'vector' or color_balance or mosaic_options else {})
         )
         if output_grid:
-            warp_to_grid(raw, out, output_grid, categorical=dataset == "dynamic_world")
+            measure_download('warp_compress', warp_to_grid, raw, out, output_grid, categorical=dataset == "dynamic_world")
+        if selection_mode == 'vector':
+            from .vector_mask import mask_raster_to_polygon
+            mask_raster_to_polygon(out, province.geometry)
+        if color_balance:
+            with rasterio.open(out, 'r+') as calibrated:
+                calibrated.update_tags(COLOR_BALANCE=json.dumps(scene.color_balance, ensure_ascii=True,
+                                                               allow_nan=False),
+                                       COMPOSITE_METHOD='raw_color_balanced')
+        if mosaic_options:
+            from .scene_grouping import export_tags
+            with rasterio.open(out, 'r+') as target:
+                target.update_tags(**export_tags(scene.__dict__))
     except requests.RequestException as exc:
+        out.unlink(missing_ok=True)
         raise HTTPException(502, f"Failed to download GeoTIFF from GEE: {exc}") from exc
     except RuntimeError as exc:
+        out.unlink(missing_ok=True)
         raise HTTPException(502, f"Failed to merge band GeoTIFFs: {exc}") from exc
+    except (RasterioError, OSError) as exc:
+        out.unlink(missing_ok=True)
+        logging.getLogger(__name__).exception("Local GeoTIFF write failed: %s", out.name)
+        raise HTTPException(500, "Failed to write GeoTIFF locally. Check available disk space and server logs.") from exc
     finally:
         if output_grid:
             raw.unlink(missing_ok=True)
@@ -951,7 +1367,8 @@ def download(
 @app.get("/api/dem/download")
 def dem_download(
     dataset: Literal["alos", "srtm", "copernicus"] = "alos",
-    selection_mode: Literal["point", "rectangle", "province", "commune"] = "point",
+    selection_mode: Literal["point", "rectangle", "province", "commune", "vector"] = "point",
+    vector_roi_id: str | None = None,
     lon: float | None = None,
     lat: float | None = None,
     radius_m: float = 2000.0,
@@ -964,7 +1381,8 @@ def dem_download(
     commune_id: str | None = None,
 ):
     import ee
-    from .dem import elevation_filename, elevation_image, finalize_elevation
+    from .dem import (elevation_filename, elevation_grid, elevation_image,
+                      finalize_elevation, mask_elevation)
 
     try:
         _validate_selection_fields(selection_mode, lon, lat, radius_m,
@@ -972,22 +1390,30 @@ def dem_download(
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     _ensure_ee()
-    roi, bbox, _ = _resolve_selection(
+    roi, bbox, area = _resolve_selection(
         selection_mode, lon, lat, radius_m, province_id, commune_id,
         rotation_deg, center_lon, center_lat, width_m, height_m,
+        **({'vector_roi_id': vector_roi_id} if vector_roi_id else {}),
     )
     rectangle = (_rectangle_model(center_lon, center_lat, width_m, height_m, rotation_deg)
                  if selection_mode == "rectangle" else None)
-    grid = (rectangle.output_grid(30) if rectangle else
-            build_rotated_grid(lon, lat, radius_m, rotation_deg, 30)
-            if rotation_deg % 360 else None)
-    if grid:
-        bbox = source_bbox(bbox, 30, rectangle.center_lat if rectangle else lat)
+    grid = elevation_grid(bbox)
+    if selection_mode == 'vector':
+        roi_geometry = area.geometry
+    elif rectangle:
+        roi_geometry = rectangle.geometry
+    elif selection_mode == "point":
+        roi_geometry = point_roi(lon, lat, radius_m, rotation_deg)[0]
+    else:
+        roi_geometry = roi.getInfo()
+    bbox = source_bbox(bbox, 30, (bbox.south + bbox.north) / 2)
     if rectangle:
         region_tag = (f"rect_lon{rectangle.center_lon:.5f}_lat{rectangle.center_lat:.5f}"
                       f"_w{rectangle.width_m:g}_h{rectangle.height_m:g}_a{rectangle.rotation_deg:g}")
     elif selection_mode == "point":
         region_tag = f"pt_lon{lon:.5f}_lat{lat:.5f}_r{radius_m:g}_a{rotation_deg % 360:g}"
+    elif selection_mode == 'vector':
+        region_tag = f'vector_{vector_roi_id}'
     else:
         region_tag = f"{selection_mode}_{province_id if selection_mode == 'province' else commune_id}"
     filename = elevation_filename(dataset, region_tag)
@@ -1010,6 +1436,10 @@ def dem_download(
         if grid:
             warp_to_grid(raw, out, grid)
             finalize_elevation(out)
+            mask_elevation(out, roi_geometry)
+        if selection_mode == 'vector':
+            from .vector_mask import mask_raster_to_polygon
+            mask_raster_to_polygon(out, roi_geometry)
     except HTTPException:
         out.unlink(missing_ok=True)
         raise
@@ -1031,7 +1461,7 @@ def dem_download(
 
 
 class S1SceneRequest(PointSelectionRequest):
-    selection_mode: Literal["point", "rectangle", "province", "commune"] = "point"
+    selection_mode: Literal["point", "rectangle", "province", "commune", "vector"] = "point"
     lon: float | None = Field(None, ge=-180, le=180)
     lat: float | None = Field(None, ge=-90, le=90)
     center_lon: float | None = Field(None, ge=-180, le=180)
@@ -1044,6 +1474,13 @@ class S1SceneRequest(PointSelectionRequest):
     end_date: str = Field(..., description="YYYY-MM-DD (inclusive)")
     radius_m: float = Field(2000.0, gt=0, le=_MAX_RADIUS_M)
     polarization: str = Field("vvvh", pattern="^(vvvh|vv|hhhv|hh)$")
+    merge_scenes: bool = False
+    platform: str | None = None
+
+    @field_validator("platform")
+    @classmethod
+    def valid_platform(cls, value):
+        return validate_platform('s1gee', value)
 
     @field_validator("start_date", "end_date")
     @classmethod
@@ -1074,6 +1511,7 @@ def find_s1_scene(req: S1SceneRequest):
         req.center_lat,
         req.width_m,
         req.height_m,
+        **({'vector_roi_id': req.vector_roi_id} if req.vector_roi_id else {}),
     )
 
     end_exclusive = (
@@ -1082,7 +1520,7 @@ def find_s1_scene(req: S1SceneRequest):
     try:
         if province is not None:
             scene = best_s1_scene_for_roi(
-                roi, req.start_date, end_exclusive, req.polarization
+                roi, req.start_date, end_exclusive, req.polarization, platform=req.platform
             )
         else:
             scene = best_s1_scene(
@@ -1094,6 +1532,7 @@ def find_s1_scene(req: S1SceneRequest):
                 end_date=end_exclusive,
                 polarization=req.polarization,
                 roi=roi if req.selection_mode == "rectangle" or req.rotation_deg else None,
+                platform=req.platform,
             )
     except Exception as exc:
         raise HTTPException(502, f"Earth Engine query failed: {exc}") from exc
@@ -1101,8 +1540,16 @@ def find_s1_scene(req: S1SceneRequest):
     if scene is None:
         raise HTTPException(
             404,
-            "No Sentinel-1 scene found for this selection/date range.",
+            f"Không có ảnh Sentinel-1{req.platform} trong khoảng thời gian/vùng đã chọn."
+            if req.platform is not None else "No Sentinel-1 scene found for this selection/date range.",
         )
+
+    from .s1_mosaic import prepare_s1
+    try:
+        scene = prepare_s1(scene, roi, req.start_date, end_exclusive,
+                           req.polarization, req.merge_scenes, platform=req.platform)
+    except Exception as exc:
+        raise HTTPException(502, f"Không thể đánh giá/ghép độ phủ SAR: {exc}") from exc
 
     try:
         available = set(scene.ee_object.bandNames().getInfo())
@@ -1120,7 +1567,10 @@ def find_s1_scene(req: S1SceneRequest):
     except Exception:
         preview_url = None
 
-    if province is not None:
+    if req.selection_mode == 'vector':
+        download_params = (f'?selection_mode=vector&vector_roi_id={req.vector_roi_id}'
+                           f'&start_date={req.start_date}&end_date={req.end_date}&polarization={req.polarization}')
+    elif province is not None:
         selection_query = (
             f"selection_mode=commune&commune_id={province.id}"
             if isinstance(province, Commune)
@@ -1144,8 +1594,11 @@ def find_s1_scene(req: S1SceneRequest):
             f"&start_date={req.start_date}&end_date={req.end_date}"
             f"&polarization={req.polarization}"
         )
+    if req.platform is not None:
+        download_params += f"&platform={req.platform}"
     return {
         "dataset": "s1gee",
+        "platform": req.platform,
         "scene_id": scene.scene_id,
         "date": scene.date,
         "cloud_pct": scene.cloud_pct,
@@ -1163,10 +1616,18 @@ def find_s1_scene(req: S1SceneRequest):
         "scale_m": S1_SCALE,
         "bands": bands,
         "preview_url": preview_url,
-        "download_url": f"/api/s1gee/download{download_params}",
+        "download_url": f"/api/s1gee/download{download_params}&merge_scenes={str(req.merge_scenes).lower()}",
+        "coverage_pct": scene.coverage_pct,
+        "coverage_scale_m": 100,
+        "scene_count": scene.scene_count,
+        "scenes": list(scene.scenes),
+        "composite": (scene.scene_count or 1) > 1,
+        "warning": ("Độ phủ SAR dưới 99%; vẫn cho tải phần có dữ liệu. Hãy mở rộng khoảng ngày hoặc thu nhỏ ROI."
+                    if scene.coverage_pct is not None and scene.coverage_pct < 99 else None),
         "selection_mode": req.selection_mode,
-        "province_id": province.id if province else None,
-        "province_name": (province.province_name if isinstance(province, Commune) else province.name) if province else None,
+        "vector_roi_id": req.vector_roi_id,
+        "province_id": province.id if isinstance(province, (Province, Commune)) else None,
+        "province_name": (province.province_name if isinstance(province, Commune) else province.name) if isinstance(province, (Province, Commune)) else None,
         "commune_id": province.id if isinstance(province, Commune) else None,
         "commune_name": province.name if isinstance(province, Commune) else None,
     }
@@ -1176,7 +1637,8 @@ def find_s1_scene(req: S1SceneRequest):
 def s1gee_download(
     start_date: str,
     end_date: str,
-    selection_mode: Literal["point", "rectangle", "province", "commune"] = "point",
+    selection_mode: Literal["point", "rectangle", "province", "commune", "vector"] = "point",
+    vector_roi_id: str | None = None,
     lon: float | None = None,
     lat: float | None = None,
     center_lon: float | None = None,
@@ -1188,8 +1650,14 @@ def s1gee_download(
     province_id: str | None = None,
     commune_id: str | None = None,
     rotation_deg: float = 0.0,
+    merge_scenes: bool = False,
+    platform: str | None = None,
 ):
     """Tải GeoTIFF S1 GRD (dB) theo vùng đã chọn — không cần tài khoản CDSE."""
+    try:
+        platform = validate_platform('s1gee', platform)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
     _ensure_ee()
     if polarization not in ("vvvh", "vv", "hhhv", "hh"):
         raise HTTPException(400, "polarization must be vvvh|vv|hhhv|hh")
@@ -1205,13 +1673,14 @@ def s1gee_download(
         center_lat,
         width_m,
         height_m,
+        **({'vector_roi_id': vector_roi_id} if vector_roi_id else {}),
     )
 
     end_exclusive = (
         dt.date.fromisoformat(end_date) + dt.timedelta(days=1)
     ).isoformat()
     if province is not None:
-        scene = best_s1_scene_for_roi(roi, start_date, end_exclusive, polarization)
+        scene = best_s1_scene_for_roi(roi, start_date, end_exclusive, polarization, platform=platform)
     else:
         scene = best_s1_scene(
             center_lon if selection_mode == 'rectangle' else lon,
@@ -1219,9 +1688,17 @@ def s1gee_download(
             max(width_m, height_m) / 2 if selection_mode == 'rectangle' else radius_m,
             start_date, end_exclusive, polarization,
             roi=roi if selection_mode == 'rectangle' or rotation_deg % 360 else None,
+            platform=platform,
         )
     if scene is None:
-        raise HTTPException(404, "No Sentinel-1 scene found for this point/date range")
+        raise HTTPException(404, f"Không có ảnh Sentinel-1{platform} trong khoảng thời gian/vùng đã chọn."
+                            if platform is not None else "No Sentinel-1 scene found for this point/date range")
+    if merge_scenes:
+        from .s1_mosaic import prepare_s1
+        try:
+            scene = prepare_s1(scene, roi, start_date, end_exclusive, polarization, True, platform=platform)
+        except Exception as exc:
+            raise HTTPException(502, f"Không thể ghép độ phủ SAR: {exc}") from exc
 
     rectangle = (
         _rectangle_model(center_lon, center_lat, width_m, height_m, rotation_deg)
@@ -1247,7 +1724,10 @@ def s1gee_download(
         roi if province is not None else None,
     )
 
-    fname = f"{scene.scene_id}_{polarization}.tif"
+    if (getattr(scene, "scene_count", None) or 1) > 1:
+        fname = f"s1gee_mosaic_{start_date}_{end_date}_n{scene.scene_count}_{polarization}.tif"
+    else:
+        fname = f"{scene.scene_id}_{polarization}.tif"
     if province is not None:
         fname = f"{Path(fname).stem}_{selection_mode}_{province.id}.tif"
     elif not output_grid:
@@ -1263,9 +1743,12 @@ def s1gee_download(
     out = _DOWNLOADS_DIR / f"{uuid.uuid4().hex}.tif"
     raw = out.with_suffix(".source.tif") if output_grid else out
     try:
-        merge_band_tiffs(band_urls, raw, **({"preserve_masks": True} if output_grid else {}))
+        merge_band_tiffs(band_urls, raw, **({"preserve_masks": True} if output_grid or merge_scenes or selection_mode == 'vector' else {}))
         if output_grid:
             warp_to_grid(raw, out, output_grid)
+        if selection_mode == 'vector':
+            from .vector_mask import mask_raster_to_polygon
+            mask_raster_to_polygon(out, province.geometry)
     except requests.RequestException as exc:
         raise HTTPException(502, f"Failed to download GeoTIFF from GEE: {exc}") from exc
     except RuntimeError as exc:
@@ -2658,5 +3141,20 @@ def s2_aws_province_mosaic(
 from .scene_catalog import register_scene_catalog
 
 _scene_catalog_store = register_scene_catalog(app)
+
+from .frame_api import register_frame_routes
+
+register_frame_routes(app, lambda: _frame_service)
+
+from .s5p import register_s5p
+
+_s5p_store = register_s5p(app)
+
+from .scene_inventory import register_scene_inventory
+
+_scene_inventory_store = register_scene_inventory(app)
+
+register_vector_routes(app, _vector_store)
+register_batch_routes(app, _batch_store, lambda: _batch_service)
 
 app.mount("/", StaticFiles(directory=str(_STATIC_DIR), html=True), name="static")

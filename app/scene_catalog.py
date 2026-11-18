@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import datetime as dt
+from copy import deepcopy
 import math
+import time
 import uuid
 from pathlib import Path
 from urllib.parse import urlencode
@@ -13,6 +15,8 @@ from pydantic import Field, model_validator
 
 from . import imagery, eodag_adapter
 from .catalog_models import CatalogFailure, CatalogUnavailable
+from .timeseries_metadata import search_failure
+from .vector_mask import mask_raster_to_polygon
 
 
 def register_scene_catalog(api):
@@ -66,11 +70,14 @@ def register_scene_catalog(api):
         return result
 
     def search(body):
+        started, request_id = time.monotonic(), uuid.uuid4().hex[:12]
         params = body.model_dump()
         if body.source != 'eodag':
             params.pop('provider', None)
             params.pop('eodag_collection', None)
         gee = body.dataset in ('sentinel2', 'landsat')
+        if body.selection_mode == 'vector' and not gee:
+            raise HTTPException(409, 'Vector ROI search/download is unsupported for external providers; use scene counts instead')
         rectangle = None
         if body.selection_mode == 'rectangle':
             rectangle = main._rectangle_model(body.center_lon, body.center_lat,
@@ -84,12 +91,21 @@ def register_scene_catalog(api):
             for field in ('center_lon', 'center_lat', 'width_m', 'height_m'):
                 params.pop(field, None)
         if gee:
-            main._ensure_ee()
+            try:
+                main._ensure_ee()
+            except Exception as exc:
+                error = search_failure(exc, stage='initialization', request_id=request_id, started=started)
+                raise HTTPException(error.status, error.message,
+                                    headers={'X-Search-Request-ID': request_id}) from exc
             rectangle_args = ({field: getattr(body, field) for field in
                 ('center_lon', 'center_lat', 'width_m', 'height_m')} if rectangle else {})
-            roi, bbox, _ = main._resolve_selection(body.selection_mode, body.lon, body.lat,
+            vector_args = ({'vector_roi_id': body.vector_roi_id}
+                           if body.selection_mode == 'vector' else {})
+            roi, bbox, area = main._resolve_selection(body.selection_mode, body.lon, body.lat,
                 body.radius_m, body.province_id, body.commune_id, rotation_deg=body.rotation_deg,
-                **rectangle_args)
+                **rectangle_args, **vector_args)
+            if body.selection_mode == 'vector':
+                params['roi_geometry'] = deepcopy(area.geometry)
         elif rectangle is not None:
             pass  # External providers search the envelope; the true polygon stays in the snapshot.
         elif body.selection_mode == 'point':
@@ -106,11 +122,13 @@ def register_scene_catalog(api):
                 raise HTTPException(404, 'Administrative selection not found')
             bbox = area.bbox
         params['bbox'] = vars(bbox)
+        stage = 'metadata'
         try:
             if gee:
                 end = (dt.date.fromisoformat(body.end_date) + dt.timedelta(days=1)).isoformat()
                 scenes = main.list_timeseries_scenes(body.dataset, body.lon or 0, body.lat or 0,
-                    body.start_date, end, roi=roi, cloud_min=body.cloud_min, cloud_max=body.cloud_max)
+                    body.start_date, end, roi=roi, cloud_min=body.cloud_min, cloud_max=body.cloud_max,
+                    platform=body.platform)
                 params['source'] = 'gee'
                 truncated = False
             elif body.source == 'eodag':
@@ -130,6 +148,7 @@ def register_scene_catalog(api):
                     cloud_min=body.cloud_min, cloud_max=body.cloud_max)
                 params['source'] = source
                 truncated = len(scenes) >= cap
+            stage = 'validation'
             filtered = []
             for scene in scenes:
                 cloud = scene.get('cloud_pct')
@@ -152,6 +171,7 @@ def register_scene_catalog(api):
                 filtered.append(row)
             filtered.sort(key=lambda row: (row.get('timestamp') or row.get('date') or '', row.get('asset_id') or row.get('id') or ''), reverse=True)
             params['truncated'] = truncated
+            stage = 'snapshot'
             created = store.create_search(params, filtered)
             return page(created['search_id'])
         except HTTPException:
@@ -161,6 +181,10 @@ def register_scene_catalog(api):
         except CatalogFailure as exc:
             raise HTTPException(502, str(exc)) from exc
         except Exception as exc:
+            if gee:
+                error = search_failure(exc, stage=stage, request_id=request_id, started=started)
+                raise HTTPException(error.status, error.message,
+                                    headers={'X-Search-Request-ID': request_id}) from exc
             if body.source == 'eodag':
                 raise HTTPException(502, 'EODAG provider search failed') from exc
             raise HTTPException(502, f'Unable to list scenes: {exc}') from exc
@@ -173,6 +197,12 @@ def register_scene_catalog(api):
         if index < 0 or index >= len(scenes):
             raise HTTPException(404, 'Scene not found')
         scene = scenes[index]
+        if params.get('platform') is not None:
+            expected_platform = 'Sentinel-2' + params['platform']
+            if params['dataset'] != 'sentinel2' or scene.get('platform') != expected_platform:
+                raise HTTPException(409, 'Scene does not match the selected platform; search again')
+        if params['selection_mode'] == 'vector' and params['source'] != 'gee':
+            raise HTTPException(409, 'Vector ROI downloads are unsupported for external providers')
         if params['source'] == 'eodag':
             raise HTTPException(409, 'EODAG MVP is catalogue-only; downloads are unsupported')
         if params['source'] != 'gee':
@@ -192,7 +222,13 @@ def register_scene_catalog(api):
                 query.update(action='download', bands='B02,B03,B04,B08,B11,B12')
             return RedirectResponse(target + '?' + urlencode(query), status_code=303)
         main._ensure_ee()
-        if params['selection_mode'] == 'rectangle':
+        if params['selection_mode'] == 'vector':
+            import ee
+            roi = ee.Geometry(params['roi_geometry'], geodesic=False)
+            bbox = main.Bbox(**params['bbox'])
+            grid = None
+            center_lat = (bbox.south + bbox.north) / 2
+        elif params['selection_mode'] == 'rectangle':
             import ee
             roi = ee.Geometry.Polygon(params['roi_geometry']['coordinates'], geodesic=False)
             bbox = main.Bbox(**params['bbox'])
@@ -207,17 +243,23 @@ def register_scene_catalog(api):
         image = imagery.load_timeseries_scene(scene['asset_id'], params['dataset'])
         scale = main._scale_for(params['dataset'])
         envelope = main.source_bbox(bbox, scale, center_lat) if grid else bbox
-        urls = main.download_geotiff(image, params['dataset'], envelope, scale, clip_region=None if grid else roi)
+        band_options = {key: params[key] for key in ('s2_auxiliary_bands', 's2_band_preset')
+                        if params.get(key) is not None}
+        urls = main.download_geotiff(image, params['dataset'], envelope, scale,
+                                    clip_region=None if grid else roi, **band_options)
         out = main._DOWNLOADS_DIR / f'{uuid.uuid4().hex}.tif'
         raw = out.with_suffix('.source.tif') if grid else out
         try:
             main.merge_band_tiffs(urls, raw, preserve_masks=True)
             if grid:
                 main.warp_to_grid(raw, out, grid)
+            if params['selection_mode'] == 'vector':
+                mask_raster_to_polygon(out, params['roi_geometry'])
         finally:
             if grid:
                 raw.unlink(missing_ok=True)
-        filename = f'{params["dataset"]}_{Path(scene["asset_id"]).name}.tif'
+        suffix = '_rgbnir' if params.get('s2_band_preset') == 'rgbnir' else ''
+        filename = f'{params["dataset"]}_{Path(scene["asset_id"]).name}{suffix}.tif'
         return FileResponse(out, media_type='image/tiff', filename=filename)
 
     # Local Pydantic model is supplied explicitly so FastAPI resolves it without a forward reference.

@@ -6,6 +6,7 @@ from unittest.mock import Mock, patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from google.auth.exceptions import RefreshError
 
 from app import main
 from app.scene_catalog import register_scene_catalog
@@ -71,6 +72,64 @@ class TestSceneCatalog(unittest.TestCase):
             self.assertEqual(response.status_code, 200)
             load.assert_called_once_with(asset, 'sentinel2')
             self.assertEqual(urls.call_args.args[0], 'exact-image')
+
+    def test_gee_timeout_has_safe_message_and_creates_no_snapshot(self):
+        with patch.object(main, '_ensure_ee'), patch.object(main, '_resolve_selection',
+                return_value=('roi', main.Bbox(105, 9, 107, 11), None)), \
+                patch.object(main, 'list_timeseries_scenes', side_effect=TimeoutError('private URL')), \
+                self.assertLogs('uvicorn.error', level='ERROR') as logs:
+            response = self.client.post('/api/scene-catalog', json={**self.body, 'dataset': 'sentinel2'})
+        self.assertEqual(response.status_code, 504, response.text)
+        self.assertNotIn('private', response.text + '\n'.join(logs.output))
+        self.assertIn(response.headers['X-Search-Request-ID'], '\n'.join(logs.output))
+        with self.store._connect() as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM searches').fetchone()[0], 0)
+
+    def test_gee_initial_auth_failure_is_sanitized_and_correlated(self):
+        with patch.object(main, '_ee_ready', False), \
+                patch.object(main, 'init_ee', side_effect=RefreshError('private credentials')), \
+                self.assertLogs('uvicorn.error', level='ERROR') as logs:
+            response = self.client.post('/api/scene-catalog', json={**self.body, 'dataset': 'sentinel2'})
+        self.assertEqual(response.status_code, 502, response.text)
+        text = response.text + '\n'.join(logs.output)
+        self.assertNotIn('private', text)
+        self.assertIn('stage=initialization', text)
+        self.assertIn(response.headers['X-Search-Request-ID'], text)
+
+    def test_gee_selected_platform_reaches_listing_and_exact_download_snapshot(self):
+        asset = 'COPERNICUS/S2_SR_HARMONIZED/EXACT_C'
+        with patch.object(main, '_ensure_ee'), patch.object(main, '_resolve_selection',
+                return_value=('roi', main.Bbox(105, 9, 107, 11), None)), \
+                patch.object(main, 'list_timeseries_scenes', return_value=[dict(asset_id=asset,
+                    date='2026-01-31', cloud_pct=35, source_metadata={'SPACECRAFT_NAME': 'Sentinel-2C'})]) as listing:
+            response = self.client.post('/api/scene-catalog', json={**self.body,
+                'dataset': 'sentinel2', 'platform': 'C'})
+            self.assertEqual(response.status_code, 200, response.text)
+            data = response.json()
+            self.assertEqual(listing.call_args.kwargs.get('platform'), 'C')
+            self.assertEqual(data['parameters']['platform'], 'C')
+            self.assertEqual(data['scenes'][0]['platform'], 'Sentinel-2C')
+            with patch('app.imagery.load_timeseries_scene', return_value='exact-image') as load, \
+                    patch.object(main, 'download_geotiff', return_value=[]), \
+                    patch.object(main, '_DOWNLOADS_DIR', Path(self.temp.name)), \
+                    patch.object(main, 'merge_band_tiffs', side_effect=lambda urls, path, **kwargs: path.write_bytes(b'fixture')):
+                result = self.client.get(data['scenes'][0]['download_url'])
+            self.assertEqual(result.status_code, 200, result.text)
+            load.assert_called_once_with(asset, 'sentinel2')
+
+    def test_selected_platform_snapshot_mismatch_cannot_download(self):
+        asset = 'COPERNICUS/S2_SR_HARMONIZED/WRONG_A'
+        with patch.object(main, '_ensure_ee'), patch.object(main, '_resolve_selection',
+                return_value=('roi', main.Bbox(105, 9, 107, 11), None)), \
+                patch.object(main, 'list_timeseries_scenes', return_value=[dict(asset_id=asset,
+                    date='2026-01-31', cloud_pct=35, source_metadata={'SPACECRAFT_NAME': 'Sentinel-2A'})]):
+            data = self.client.post('/api/scene-catalog', json={**self.body,
+                'dataset': 'sentinel2', 'platform': 'C'}).json()
+        with patch.object(main, '_ensure_ee') as ensure, patch('app.imagery.load_timeseries_scene') as load:
+            result = self.client.get(data['scenes'][0]['download_url'])
+        self.assertEqual(result.status_code, 409)
+        ensure.assert_not_called()
+        load.assert_not_called()
 
     def test_rotated_gee_exact_asset_warps_snapshot_grid(self):
         asset = 'COPERNICUS/S2_SR_HARMONIZED/ROTATED'

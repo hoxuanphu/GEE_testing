@@ -17,8 +17,46 @@ import ee
 import requests
 
 from .geo import Bbox, bbox_to_ee_geom, point_bbox
+from . import color_balance as color_calibration
+from . import scene_grouping as grouping
+from .download_metrics import measure as measure_download
+from .export_resources import bulk_export
+from .platforms import apply_platform_filter, validate_platform
+from .timeseries_metadata import (MAX_SCENES as TIMESERIES_MAX_SCENES,
+                                  MetadataSearchError,
+                                  compute_metadata as _compute_timeseries_metadata)
 
 S2_COLLECTION = "COPERNICUS/S2_SR_HARMONIZED"
+S2_RGB_NIR_BANDS = ["B2", "B3", "B4", "B8"]
+# Preserve the original first six channels for existing RGB/index consumers.
+S2_SPECTRAL_BANDS = S2_RGB_NIR_BANDS + ["B11", "B12", "B1", "B5", "B6", "B7", "B8A", "B9"]
+S2_AUXILIARY_BANDS = [
+    "AOT", "WVP", "SCL", "TCI_R", "TCI_G", "TCI_B", "MSK_CLDPRB", "MSK_SNWPRB",
+    "QA10", "QA20", "QA60", "MSK_CLASSI_OPAQUE", "MSK_CLASSI_CIRRUS", "MSK_CLASSI_SNOW_ICE",
+]
+S2_EXPORT_BANDS = S2_SPECTRAL_BANDS + S2_AUXILIARY_BANDS
+
+
+def s2_export_bands(auxiliary_bands: list[str] | None = None, *,
+                    s2_band_preset: str | None = None) -> list[str]:
+    """Resolve the ordered export bands. By default, include all auxiliary bands."""
+    if s2_band_preset is not None:
+        if s2_band_preset != 'rgbnir':
+            raise ValueError('Unsupported Sentinel-2 band preset')
+        if auxiliary_bands:
+            raise ValueError('s2_band_preset=rgbnir requires no auxiliary bands')
+        return list(S2_RGB_NIR_BANDS)
+    if auxiliary_bands is None:
+        return list(S2_EXPORT_BANDS)
+    if len(auxiliary_bands) != len(set(auxiliary_bands)) or any(
+        band not in S2_AUXILIARY_BANDS for band in auxiliary_bands
+    ):
+        raise ValueError('s2_auxiliary_bands must contain unique Sentinel-2 auxiliary band names')
+    return S2_SPECTRAL_BANDS + [band for band in S2_AUXILIARY_BANDS if band in auxiliary_bands]
+
+
+S2_CATEGORICAL_BANDS = ["SCL", "QA10", "QA20", "QA60", "MSK_CLASSI_OPAQUE",
+                        "MSK_CLASSI_CIRRUS", "MSK_CLASSI_SNOW_ICE"]
 L8_COLLECTION = "LANDSAT/LC08/C02/T1_L2"
 L9_COLLECTION = "LANDSAT/LC09/C02/T1_L2"
 S1_COLLECTION = "COPERNICUS/S1_GRD"
@@ -69,6 +107,11 @@ class SceneInfo:
     scenes: tuple[dict, ...] = ()
     estimated_seconds: int | None = None
     coverage_pct: float | None = None
+    platform: str | None = None
+    color_balance: dict | None = None
+    selection_recipe: dict | None = None
+    scene_grouping: dict | None = None
+    mosaic_mask_clouds: bool | None = None
 
 
 class InsufficientCoverageError(ValueError):
@@ -91,8 +134,9 @@ def _coverage_fraction(image: ee.Image, dataset: str, roi: ee.Geometry) -> ee.Nu
     ).get("valid"))
 
 
-def _point_optical_scene(dataset, roi, start, end, max_cloud_pct, merge_scenes, clip_output=True):
-    coll, cloud_prop, _ = _optical_collection(dataset, start, end)
+def _point_optical_scene(dataset, roi, start, end, max_cloud_pct, merge_scenes, clip_output=True, platform=None,
+                         freeze_assets=False):
+    coll, cloud_prop, _ = _optical_collection(dataset, start, end, platform=platform)
     coll = coll.filterBounds(roi).filter(ee.Filter.lt(cloud_prop, max_cloud_pct))
     count = coll.size().getInfo()
     if count == 0:
@@ -129,6 +173,8 @@ def _point_optical_scene(dataset, roi, start, end, max_cloud_pct, merge_scenes, 
                 "Không có cảnh phủ ≥99% vùng đã chọn. Hãy bật ghép nhiều cảnh hoặc mở rộng khoảng ngày."
             )
         _, best, coverage, info = max(scored, key=lambda row: row[0])
+        if freeze_assets:
+            best = load_timeseries_scene(_collection_id(dataset) + '/' + info['scene_id'], dataset)
         return SceneInfo(
             dataset=dataset, collection=_collection_id(dataset),
             scene_id=info["scene_id"], date=_fmt_time_start(info["timestamp"]),
@@ -161,6 +207,42 @@ def _point_optical_scene(dataset, roi, start, end, max_cloud_pct, merge_scenes, 
     )
 
 
+def _raw_optical_scene(dataset, roi, start, end, max_cloud_pct, clip_output=True, platform=None,
+                       color_balance=False, freeze_assets=False):
+    """Build an unmasked RAW mosaic, filling original data gaps across dates.
+
+    Rank with the coarse blue-band haze score on GEE, not a Python loop of
+    full-resolution SCL/QA aggregations. Preserve the rectangle warp halo.
+    """
+    coll, cloud_prop, _ = _optical_collection(dataset, start, end, platform=platform)
+    coll = coll.filterBounds(roi).filter(ee.Filter.lt(cloud_prop, max_cloud_pct))
+    if coll.size().getInfo() == 0:
+        return None
+    from .download_models import SelectionTrace
+    trace = SelectionTrace() if freeze_assets else None
+    image, picked = _least_cloudy_per_tile(coll, dataset, cloud_prop, roi, keep_clouds=True,
+        **({'color_balance': True} if color_balance else {}),
+        **({'selection_trace': trace} if trace is not None else {}))
+    if clip_output:
+        image = image.clip(roi)
+    with _OPTICAL_AGGREGATION_LOCK:
+        coverage = 100 * _coverage_fraction(image, dataset, roi).getInfo()
+    if coverage < 99:
+        raise InsufficientCoverageError(
+            f"RAW chỉ phủ {coverage:.2f}% vùng (<99%). Hãy mở rộng khoảng ngày hoặc giảm vùng chọn."
+        )
+    return SceneInfo(
+        dataset=dataset, collection=_collection_id(dataset),
+        scene_id=f"{dataset}_raw_{start}_{end}",
+        date=", ".join(sorted({row["date"] for row in picked})),
+        cloud_pct=max((row["cloud"] for row in picked), default=-1),
+        ee_object=image, scene_count=len(picked), scenes=tuple(picked), coverage_pct=coverage,
+        color_balance=_color_balance_report(picked) if color_balance else None,
+        selection_recipe=({**trace.__dict__, 'mode': 'raw', 'clipped': clip_output}
+                          if trace is not None else None),
+    )
+
+
 def _scale_s2(img: ee.Image) -> ee.Image:
     """Scale S2 DN to reflectance. KHÔNG mask mây — giữ nguyên mọi pixel.
 
@@ -176,9 +258,13 @@ def _scale_s2(img: ee.Image) -> ee.Image:
         .divide(_S2_SCALE)
         .float()
     )
-    return img.addBands(optical, None, True).copyProperties(
-        img, ["system:time_start", "system:index"]
-    )
+    # Optional quality bands can be absent in older products. Keep a stable
+    # export schema using masked (NoData), never zero-filled, placeholders.
+    placeholders = ee.Image.constant([0] * len(S2_EXPORT_BANDS)).rename(S2_EXPORT_BANDS).toFloat()
+    placeholders = placeholders.updateMask(ee.Image.constant(0))
+    return img.addBands(placeholders.select(ee.List(S2_EXPORT_BANDS).removeAll(img.bandNames()))).addBands(optical, None, True).select(
+        S2_EXPORT_BANDS
+    ).copyProperties(img, ["system:time_start", "system:index"])
 
 
 def _s2_clear_fraction(img: ee.Image, roi: ee.Geometry, scale: float) -> ee.Number:
@@ -258,14 +344,14 @@ def _landsat_scale(img: ee.Image) -> ee.Image:
     return img.addBands(optical, None, True)
 
 
-def _s2_collection(start: str, end: str, platform: str = "ALL") -> ee.ImageCollection:
+def _s2_collection(start: str, end: str, platform: str | None = None) -> ee.ImageCollection:
+    platform = validate_platform('sentinel2', platform)
     collection = (
         ee.ImageCollection(S2_COLLECTION)
         .filterDate(start, end)
         .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 90))
     )
-    if platform != "ALL":
-        collection = collection.filter(ee.Filter.eq("SPACECRAFT_NAME", platform))
+    collection = apply_platform_filter(collection, 'sentinel2', platform)
     return collection.map(_scale_s2)
 
 
@@ -289,7 +375,7 @@ def _nicfi_collection(start: str, end: str, *, preserve_asset_id: bool = False) 
         )
         if preserve_asset_id:
             scaled = scaled.copyProperties(img, img.propertyNames()).set({
-                "timeseries:asset_id": img.id(),
+                "timeseries:asset_id": ee.String(NICFI_COLLECTION + '/').cat(ee.String(img.get('system:index'))),
                 "timeseries:collection": NICFI_COLLECTION,
             })
         return scaled
@@ -317,7 +403,7 @@ S1_POLARIZATIONS = {
 }
 
 
-def _s1_collection(start: str, end: str, polarization: str) -> ee.ImageCollection:
+def _s1_collection(start: str, end: str, polarization: str, platform: str | None = None) -> ee.ImageCollection:
     """Sentinel-1 GRD: chọn polarization, clamp dải động dB.
 
     GEE S1_GRD đã ở đơn vị dB (sigma0 dB, đã hiệu chuẩn; giá trị thực đo
@@ -325,6 +411,7 @@ def _s1_collection(start: str, end: str, polarization: str) -> ee.ImageCollectio
     đã từng làm toàn bộ pixel ra -inf). Chỉ clamp về dải -30..+10 dB hợp lý
     cho hiển thị/phân tích.
     """
+    platform = validate_platform('s1gee', platform)
     bands = S1_POLARIZATIONS[polarization]
 
     def to_db(img: ee.Image) -> ee.Image:
@@ -333,21 +420,25 @@ def _s1_collection(start: str, end: str, polarization: str) -> ee.ImageCollectio
             sel.clamp(-30.0, 10.0)  # giới hạn dải động hợp lý
             .float()
         )
-        return db.copyProperties(img, ["system:time_start", "system:index"])
+        return db.copyProperties(img, ["system:time_start", "system:index", "platform_number",
+                                       "orbitProperties_pass", "relativeOrbitNumber_start"])
 
-    return (
+    collection = (
         ee.ImageCollection(S1_COLLECTION)
         .filter(ee.Filter.listContains("transmitterReceiverPolarisation", bands[0]))
         .filterDate(start, end)
         .filter(ee.Filter.eq("instrumentMode", "IW"))
-        .map(to_db)
     )
+    return apply_platform_filter(collection, 's1gee', platform).map(to_db)
 
 
-def timeseries_source_metadata(dataset: str, polarization: str = "vvvh") -> dict:
+def timeseries_source_metadata(dataset: str, polarization: str = "vvvh",
+                               s2_auxiliary_bands: list[str] | None = None, *,
+                               s2_band_preset: str | None = None) -> dict:
     """Describe exported bands, nominal resolution and source value conversion."""
     sources = {
-        "sentinel2": (["B2", "B3", "B4", "B8", "B11", "B12"], S2_SCALE, "reflectance", 0.0001, 0.0),
+        "sentinel2": (s2_export_bands(s2_auxiliary_bands, s2_band_preset=s2_band_preset), S2_SCALE,
+                      "reflectance" if s2_band_preset == 'rgbnir' else "mixed", 0.0001, 0.0),
         "landsat": (["SR_B2", "SR_B3", "SR_B4", "SR_B5", "SR_B6", "SR_B7"], LANDSAT_SCALE, "reflectance", 0.0000275, -0.2),
         "nicfi": (["B", "G", "R", "N"], NICFI_SCALE, "reflectance", 0.0001, 0.0),
         "dynamic_world": ([DYNAMIC_WORLD_LABEL_BAND], DYNAMIC_WORLD_SCALE, "class", 1.0, 0.0),
@@ -361,6 +452,16 @@ def timeseries_source_metadata(dataset: str, polarization: str = "vvvh") -> dict
     result = {"bands": list(bands), "scale_m": scale, "units": units,
               "value_scale": factor, "value_offset": offset,
               "nodata": DYNAMIC_WORLD_NODATA if dataset == "dynamic_world" else None}
+    if dataset == "sentinel2":
+        result["band_metadata"] = {
+            band: {"units": "reflectance" if band in S2_SPECTRAL_BANDS else
+                   "cm" if band == "WVP" else "class" if band in S2_CATEGORICAL_BANDS else "source",
+                   "value_scale": 0.0001 if band in S2_SPECTRAL_BANDS else
+                   0.001 if band in ("AOT", "WVP") else 1.0,
+                   "value_offset": 0.0,
+                   "export_scale": 0.0001 if band in S2_SPECTRAL_BANDS else 1.0}
+            for band in bands
+        }
     if dataset == "s1gee":
         result.update(polarization=polarization, clamp_db=[-30.0, 10.0])
     if dataset == "nicfi":
@@ -386,36 +487,37 @@ def _process_timeseries_image(image: ee.Image, dataset: str, polarization: str) 
 
 def timeseries_collection(
     dataset: str, start_date: str, end_exclusive: str, polarization: str = "vvvh",
+    platform: str | None = None,
+    *, roi: ee.Geometry | None = None,
 ) -> ee.ImageCollection:
-    """All source scenes; caller converts inclusive end dates to exclusive dates.
+    """Native metadata only; caller converts inclusive end dates to exclusive dates.
 
     No cloud ranking, cloud thresholds, orbit preference or temporal composites.
     Full asset IDs are stored independently of EE transformations/merged indexes.
     """
     timeseries_source_metadata(dataset, polarization)
+    platform = validate_platform(dataset, platform)
 
     def prepare(image: ee.Image, collection_id: str) -> ee.Image:
-        asset_id = image.id()
-        return _process_timeseries_image(image, dataset, polarization).set({
+        # Image.id() inside a collection map can be only the relative index.
+        # Tag the complete native ID before any merge rewrites system:index.
+        asset_id = ee.String(collection_id + '/').cat(ee.String(image.get('system:index')))
+        return image.set({
             "timeseries:asset_id": asset_id,
             "timeseries:collection": collection_id,
         })
 
-    if dataset == "nicfi":
-        return _nicfi_collection(start_date, end_exclusive, preserve_asset_id=True).select(
-            ["B", "G", "R", "N"]
-        )
-    if dataset == "dynamic_world":
-        return _dynamic_world_collection(start_date, end_exclusive).map(
-            lambda image: prepare(image, DYNAMIC_WORLD_COLLECTION)
-        )
     collection_ids = {
         "sentinel2": [S2_COLLECTION], "landsat": [L8_COLLECTION, L9_COLLECTION],
-        "s1gee": [S1_COLLECTION],
+        "s1gee": [S1_COLLECTION], "nicfi": [NICFI_COLLECTION],
+        "dynamic_world": [DYNAMIC_WORLD_COLLECTION],
     }[dataset]
     collections = []
     for collection_id in collection_ids:
         collection = ee.ImageCollection(collection_id).filterDate(start_date, end_exclusive)
+        if roi is not None:
+            collection = collection.filterBounds(roi)
+        collection = apply_platform_filter(collection, dataset, platform)
         if dataset == "s1gee":
             collection = collection.filter(ee.Filter.eq("instrumentMode", "IW"))
             for band in S1_POLARIZATIONS[polarization]:
@@ -433,11 +535,13 @@ def list_timeseries_scenes(
     roi: ee.Geometry | None = None,
     cloud_min: float | None = None,
     cloud_max: float | None = None,
+    platform: str | None = None,
 ) -> list[dict]:
     """Return scene metadata; optional scene-cloud filters apply before enumeration."""
+    platform = validate_platform(dataset, platform)
     point = ee.Geometry.Point([lon, lat])
-    collection = timeseries_collection(dataset, start_date, end_exclusive, polarization).filterBounds(
-        roi if roi is not None else point)
+    collection = timeseries_collection(dataset, start_date, end_exclusive, polarization,
+                                       platform=platform, roi=roi if roi is not None else point)
     if roi is None:
         collection = collection.map(
             lambda image: image.set("timeseries:contains_center", image.geometry().contains(point, ee.ErrorMargin(1)))
@@ -465,15 +569,26 @@ def list_timeseries_scenes(
             "source_metadata": image.toDictionary(source_properties),
         })
 
-    rows = collection.toList(collection.size()).map(metadata).getInfo()
+    # One extra row detects an incomplete result; never publish a truncated list.
+    rows = _compute_timeseries_metadata(collection.toList(TIMESERIES_MAX_SCENES + 1).map(metadata))
     scenes = {}
-    for row in rows:
-        timestamp = dt.datetime.fromtimestamp(row.pop("timestamp_ms") / 1000, tz=dt.timezone.utc)
-        row.update(dataset=dataset, timestamp=timestamp.isoformat().replace("+00:00", "Z"),
-                   date=timestamp.date().isoformat())
-        cloud = row.get("cloud_pct")
-        row["cloud_pct"] = float(cloud) if cloud is not None and 0 <= cloud <= 100 else None
-        scenes.setdefault(row["asset_id"], row)
+    try:
+        for raw in rows:
+            row = dict(raw)
+            stamp = row.pop('timestamp_ms')
+            asset, source = row['asset_id'], row['collection']
+            if (isinstance(stamp, bool) or not isinstance(stamp, (int, float)) or
+                    not isinstance(asset, str) or not isinstance(source, str) or
+                    not asset.startswith(source + '/') or not isinstance(row.get('source_metadata'), dict)):
+                raise ValueError('Invalid scene metadata')
+            timestamp = dt.datetime.fromtimestamp(stamp / 1000, tz=dt.timezone.utc)
+            row.update(dataset=dataset, timestamp=timestamp.isoformat().replace("+00:00", "Z"),
+                       date=timestamp.date().isoformat())
+            cloud = row.get("cloud_pct")
+            row["cloud_pct"] = float(cloud) if cloud is not None and 0 <= cloud <= 100 else None
+            scenes.setdefault(asset, row)
+    except (KeyError, TypeError, ValueError, OverflowError, OSError) as exc:
+        raise MetadataSearchError('invalid_metadata', 'GEE trả về metadata cảnh không hợp lệ; kết quả chưa được lưu.') from exc
     return sorted(scenes.values(), key=lambda row: (
         dt.datetime.fromisoformat(row["timestamp"].replace("Z", "+00:00")), row["asset_id"]
     ))
@@ -505,6 +620,7 @@ def best_s1_scene(
     end_date: str,
     polarization: str = "vvvh",
     roi: ee.Geometry | None = None,
+    platform: str | None = None,
 ) -> SceneInfo | None:
     """Return the newest S1 GRD scene covering the point within the date range.
 
@@ -512,7 +628,7 @@ def best_s1_scene(
     scene (no cloud scoring needed).
     """
     point = roi if roi is not None else ee.Geometry.Point([lon, lat])
-    coll = _s1_collection(start_date, end_date, polarization).filterBounds(point)
+    coll = _s1_collection(start_date, end_date, polarization, platform=platform).filterBounds(point)
     best = _pick_s1_covering(coll, point)
     if best is None:
         return None
@@ -523,6 +639,7 @@ def best_s1_scene(
         date=ee.Date(best.get("system:time_start")).format("YYYY-MM-dd").getInfo(),
         cloud_pct=-1.0,  # SAR không có khái niệm mây
         ee_object=best,
+        platform=best.get("platform_number").getInfo(),
     )
 
 
@@ -565,9 +682,10 @@ def best_s1_scene_for_roi(
     start_date: str,
     end_date: str,
     polarization: str = "vvvh",
+    platform: str | None = None,
 ) -> SceneInfo | None:
     """Return the S1 scene covering the largest fraction of the ROI (newest first)."""
-    coll = _s1_collection(start_date, end_date, polarization).filterBounds(roi)
+    coll = _s1_collection(start_date, end_date, polarization, platform=platform).filterBounds(roi)
     best = _pick_s1_covering(coll, roi)
     if best is None:
         return None
@@ -578,7 +696,238 @@ def best_s1_scene_for_roi(
         date=ee.Date(best.get("system:time_start")).format("YYYY-MM-dd").getInfo(),
         cloud_pct=-1.0,
         ee_object=best,
+        platform=best.get("platform_number").getInfo(),
     )
+
+
+def _raw_gap_fill(
+    coll: ee.ImageCollection,
+    ranked: ee.ImageCollection,
+    dataset: str,
+    cloud_prop: str,
+    roi: ee.Geometry | None,
+    color_balance: bool = False,
+    *, selection_trace=None,
+) -> tuple[ee.Image, list[dict]]:
+    """Prefer whole valid scene footprints; use other dates only in data gaps.
+
+    Freeze ranking in one metadata RPC so exports never rerun haze reductions.
+    A source-index mosaic also prevents masked auxiliary bands from silently
+    taking values from another date. Clouds and valid zero values stay intact.
+    """
+    sort_prop = "hazeScore" if roi is not None else cloud_prop
+    ordered = ranked.sort(sort_prop, False)  # best LAST: GEE mosaic priority
+    tile_properties = ["MGRS_TILE"] if dataset == "sentinel2" else ["WRS_PATH", "WRS_ROW"]
+    properties = ["system:index", "system:time_start", cloud_prop] + tile_properties
+    rows = ordered.toList(ordered.size()).map(
+        lambda value: ee.Image(value).toDictionary(properties)
+    ).getInfo()
+    bands = (["B2", "B3", "B4", "B8", "B11", "B12"] if dataset == "sentinel2"
+             else ["SR_B2", "SR_B3", "SR_B4", "SR_B5", "SR_B6", "SR_B7"])
+    source_band = "raw_source_index"
+    sources = []
+    for index, row in enumerate(rows):
+        original = (load_timeseries_scene(_collection_id(dataset) + '/' + row['system:index'], dataset)
+                    if selection_trace is not None else
+                    ee.Image(coll.filter(ee.Filter.eq("system:index", row["system:index"])).first()))
+        valid = original.select(bands).mask().reduce(ee.Reducer.min())
+        # Edge masks become fractional at thumbnail/pyramid scales. Mosaic
+        # alpha-blends those masks, which would invent intermediate source IDs.
+        # Expand before thresholding so the label's footprint cannot add alpha.
+        # Only the categorical label mask is binary; original band masks stay.
+        source_valid = valid.unmask(0, sameFootprint=False).gt(0)
+        source = ee.Image.constant(index).toInt32().rename(source_band).updateMask(source_valid)
+        # Absent S2 auxiliaries use Float placeholders; native QA bands are
+        # integer. Normalize before mosaic (exports already use Float32).
+        sources.append(original.toFloat().addBands(source).set("__raw_index", index))
+
+    # Start with one preferred scene per tile. Add ranked dates in doubling
+    # batches only while data coverage is below 99%. Lower-priority batches
+    # never replace a valid pixel already supplied by an earlier batch.
+    per_tile = {}
+    for index in reversed(range(len(rows))):
+        key = tuple(rows[index].get(prop) for prop in tile_properties)
+        per_tile.setdefault(key, []).append(index)
+    selected = []
+    batch_size = 1
+    while True:
+        wanted = {index for indices in per_tile.values() for index in indices[:batch_size]}
+        layer = sorted(wanted.difference(selected))
+        selected = layer + selected
+        if selection_trace is not None:
+            selection_trace.layers.append(layer)
+        stack = ee.ImageCollection.fromImages([sources[index] for index in selected])
+        owner = stack.select(source_band).mosaic()
+        with _OPTICAL_AGGREGATION_LOCK:
+            histogram = ee.Dictionary(owner.unmask(-1, sameFootprint=False).reduceRegion(
+                reducer=ee.Reducer.frequencyHistogram(),
+                geometry=roi if roi is not None else coll.geometry(),
+                scale=S2_SCALE if dataset == "sentinel2" else LANDSAT_SCALE,
+                maxPixels=100_000_000, tileScale=4,
+            ).get(source_band)).getInfo() or {}
+        total = sum(histogram.values())
+        missing = sum(count for key, count in histogram.items() if float(key) < 0)
+        if (total > 0 and missing / total <= .01) or len(selected) == len(rows):
+            break
+        batch_size *= 2
+
+    used = {int(float(key)) for key, count in histogram.items() if float(key) >= 0 and count > 0}
+    if selection_trace is not None:
+        selection_trace.assets = [_collection_id(dataset) + '/' + rows[index]['system:index']
+                                  for index in selected]
+        selection_trace.priority = list(selected)
+        selection_trace.contributors = sorted(used)
+    calibration = {}
+    if color_balance and used:
+        priority = [index for index in reversed(selected) if index in used]
+
+        def evaluate(sample):
+            with _OPTICAL_AGGREGATION_LOCK:
+                return sample.getInfo()
+
+        calibrated, report = color_calibration.balance_sources(
+            [sources[index] for index in priority], dataset,
+            roi if roi is not None else coll.geometry(), evaluate,
+            [rows[index]['system:index'] for index in priority])
+        for index, image, detail in zip(priority, calibrated, report['scenes']):
+            sources[index] = image
+            calibration[index] = detail
+        stack = ee.ImageCollection.fromImages([sources[index] for index in selected])
+
+    # Apply ownership to ALL bands, retaining each band's original NoData mask.
+    image = stack.map(lambda value: value.updateMask(
+        owner.eq(ee.Image.constant(value.get("__raw_index"))))).mosaic()
+    image = image.select(ee.Image(sources[selected[0]]).bandNames().remove(source_band))
+    infos = [
+        {"scene_id": row["system:index"], "date": _fmt_time_start(row["system:time_start"]),
+         "cloud": float(row.get(cloud_prop) if row.get(cloud_prop) is not None else -1),
+         **({'color_balance': calibration[index]} if index in calibration else {})}
+        for index, row in enumerate(rows) if index in used
+    ]
+    return image, infos
+
+
+def _color_balance_report(picked):
+    details = [row['color_balance'] for row in picked if 'color_balance' in row]
+    return dict(method=color_calibration.METHOD,
+                spectral_values_modified=any(row['status'] in ('applied', 'partial') for row in details),
+                sample_scale_m=color_calibration.SAMPLE_SCALE_M, max_samples=color_calibration.MAX_SAMPLES,
+                min_samples=color_calibration.MIN_SAMPLES, scenes=details)
+
+
+_GROUP_PROPERTIES = ['system:index', 'system:time_start', 'SPACECRAFT_NAME', 'SPACECRAFT_ID',
+    'DATATAKE_IDENTIFIER', 'SENSING_ORBIT_NUMBER', 'MGRS_TILE', 'WRS_PATH', 'WRS_ROW',
+    'MEAN_SOLAR_ZENITH_ANGLE', 'MEAN_SOLAR_AZIMUTH_ANGLE', 'MEAN_INCIDENCE_ZENITH_ANGLE_B4',
+    'SUN_ELEVATION', 'SUN_AZIMUTH', 'ROLL_ANGLE', 'PROCESSING_BASELINE', 'PROCESSING_LEVEL']
+
+
+def _native_asset(row, dataset):
+    index = row['system:index']
+    if dataset == 'sentinel2':
+        return S2_COLLECTION + '/' + index
+    # Merged Landsat collections prefix system:index with 1_/2_.
+    for marker, collection in (('LC08_', L8_COLLECTION), ('LC09_', L9_COLLECTION)):
+        if marker in index:
+            return collection + '/' + index[index.index(marker):]
+    raise ValueError('Không xác định được asset Landsat gốc.')
+
+
+def _load_mosaic_asset(asset, dataset):
+    image = load_timeseries_scene(asset, dataset)
+    # The time-series export loader intentionally selects six Landsat SR
+    # bands. Mosaic cloud masking/calibration still needs native QA_PIXEL.
+    if dataset == 'landsat':
+        image = image.addBands(ee.Image(asset).select('QA_PIXEL'))
+    return image
+
+
+def _group_metadata(coll, roi, cloud_prop):
+    def metadata(value):
+        image = ee.Image(value)
+        return image.toDictionary(_GROUP_PROPERTIES).set('cloud', image.get(cloud_prop)).set(
+            'footprint', image.geometry().intersection(roi, ee.ErrorMargin(60)))
+    # A FeatureCollection nested in Dictionary.getInfo yields only its schema.
+    # Explicit dictionary rows materialize both properties and geometry.
+    candidates = coll.limit(grouping.MAX_CANDIDATES + 1).toList(
+        grouping.MAX_CANDIDATES + 1).map(metadata)
+    with _OPTICAL_AGGREGATION_LOCK:
+        payload = ee.Dictionary({'roi': roi, 'rows': candidates}).getInfo()
+    rows = payload['rows']
+    if len(rows) > grouping.MAX_CANDIDATES:
+        raise ValueError('Có quá nhiều cảnh (>400); hãy thu hẹp khoảng ngày hoặc ROI.')
+    return rows, payload['roi']
+
+
+def _coherent_optical_scene(coll, dataset, cloud_prop, roi, start, end, method,
+                            scene_grouping, max_scene_span_days, *, mosaic_mask_clouds=True,
+                            color_balance=False, clip_output=True):
+    rows, roi_geometry = _group_metadata(coll, roi, cloud_prop)
+    if not rows:
+        return None
+    groups = (grouping.rank_groups(rows, dataset, scene_grouping, max_scene_span_days, roi_geometry)
+              if scene_grouping != 'any' else [{'indices': list(range(len(rows)))}])
+    best_coverage, checks = 0., 0
+    from .download_models import SelectionTrace
+    for group in groups[:grouping.MAX_PIXEL_CHECKS]:
+        chosen = [rows[index] for index in group['indices']]
+        # Bind native sources before ranking/mosaicking. Neither preview nor
+        # snapshots subsequently query a live collection to reselect a scene.
+        source_images = [_load_mosaic_asset(_native_asset(row, dataset), dataset).set(
+            {key: value for key, value in row.items() if key != 'footprint'}) for row in chosen]
+        subset = ee.ImageCollection.fromImages(source_images)
+        trace = SelectionTrace() if dataset == 'sentinel2' else None
+        image, picked = _least_cloudy_per_tile(subset, dataset, cloud_prop, roi,
+            keep_clouds=(method == 'raw'), mosaic_mask_clouds=False,
+            **({'selection_trace': trace} if trace is not None else {}))
+        with _OPTICAL_AGGREGATION_LOCK:
+            coverage = 100 * (_coverage_fraction(image, dataset, roi).getInfo() or 0.)
+        checks += 1
+        best_coverage = max(best_coverage, coverage)
+        if scene_grouping != 'any' and coverage < 99:
+            continue
+        if method == 'mosaic' and mosaic_mask_clouds:
+            metadata = {row['system:index']: row for row in chosen}
+            mask = _mask_s2_clouds if dataset == 'sentinel2' else _mask_landsat_clouds
+            image = ee.ImageCollection.fromImages([ee.Image(mask(_load_mosaic_asset(
+                _native_asset(metadata[item['scene_id']], dataset), dataset))).toFloat()
+                for item in sorted(picked, key=lambda item: item['date'])]).mosaic()
+        if method == 'raw' and color_balance:
+            trace = SelectionTrace() if trace is not None else None
+            image, picked = _least_cloudy_per_tile(subset, dataset, cloud_prop, roi,
+                keep_clouds=(method == 'raw'), mosaic_mask_clouds=mosaic_mask_clouds,
+                **({'color_balance': True} if color_balance else {}),
+                **({'selection_trace': trace} if trace is not None else {}))
+        metadata = {row['system:index']: row for row in chosen}
+        details = [{**item, **{key: value for key, value in metadata[item['scene_id']].items()
+                              if key not in ('footprint', 'cloud', 'system:index', 'system:time_start')},
+                    'timestamp': metadata[item['scene_id']]['system:time_start']} for item in picked]
+        times = [item['timestamp'] for item in details]
+        keys = [grouping.acquisition_key(metadata[item['scene_id']], dataset) for item in details]
+        with _OPTICAL_AGGREGATION_LOCK:
+            output_coverage = 100 * (_coverage_fraction(image, dataset, roi).getInfo() or 0.)
+        report = dict(mode=scene_grouping, max_scene_span_days=max_scene_span_days,
+            span_days=(max(times) - min(times)) / grouping.DAY_MS,
+            start_utc=dt.datetime.fromtimestamp(min(times) / 1000, dt.timezone.utc).isoformat(),
+            end_utc=dt.datetime.fromtimestamp(max(times) / 1000, dt.timezone.utc).isoformat(),
+            same_pass=keys[0] is not None and all(key == keys[0] for key in keys),
+            data_coverage_pct=coverage, output_coverage_pct=output_coverage,
+            groups_checked=checks, shortlisted_groups=len(groups), candidate_count=len(rows),
+            missing_metadata_scenes=[item['scene_id'] for item in details
+                if grouping.missing_fields(metadata[item['scene_id']], dataset)],
+            missing_metadata_fields={item['scene_id']: grouping.missing_fields(metadata[item['scene_id']], dataset)
+                for item in details if grouping.missing_fields(metadata[item['scene_id']], dataset)})
+        recipe = ({**trace.__dict__, 'mode': 'raw', 'clipped': clip_output} if trace is not None and method == 'raw' else
+                  dict(mode=method, assets=[_native_asset(metadata[item['scene_id']], dataset) for item in details]))
+        return SceneInfo(dataset, _collection_id(dataset), f'{dataset}_{method}_{start}_{end}',
+            ', '.join(sorted({item['date'] for item in details})),
+            max((item['cloud'] for item in details), default=-1), image.clip(roi) if clip_output else image,
+            scene_count=len(details), scenes=tuple(details), coverage_pct=output_coverage,
+            color_balance=_color_balance_report(picked) if color_balance else None,
+            selection_recipe=recipe, scene_grouping=report,
+            mosaic_mask_clouds=mosaic_mask_clouds if method == 'mosaic' else None)
+    raise InsufficientCoverageError(
+        f'Nhóm cảnh tương đồng chỉ phủ tối đa {best_coverage:.2f}% dữ liệu (<99%). '
+        f'Không tự mở rộng cửa sổ {max_scene_span_days} ngày; hãy tăng giới hạn ngày hoặc giảm ROI.')
 
 
 def _least_cloudy_per_tile(
@@ -587,17 +936,19 @@ def _least_cloudy_per_tile(
     cloud_prop: str,
     roi: ee.Geometry | None = None,
     keep_clouds: bool = False,
+    color_balance: bool = False,
+    *, selection_trace=None, mosaic_mask_clouds=True,
 ) -> tuple[ee.Image, list[dict]]:
-    """Với mỗi tile phủ ROI, lấy 1 scene trong rồi mosaic lại.
+    """Build a masked per-tile mosaic, or an original-data-gap-filling RAW mosaic.
 
-    Mỗi tile đóng góp đúng một scene nên kết quả không có hiện tượng
+    Với mosaic có mask mây, mỗi tile đóng góp đúng một scene nên không có hiện tượng
     ``qualityMosaic`` đổi ngày độc lập ở từng pixel như medoid. Khi có ROI,
     xếp hạng theo mean băng xanh (haze) trước; ``CLOUDY_PIXEL_PERCENTAGE``
     vẫn là bộ lọc đầu vào nhưng không đủ để nhận ra khói/sương. Cảnh đã chọn
     được SCL/QA-mask trước khi mosaic để mây residual không thành mảng màu.
 
-    ``keep_clouds=True`` (method "raw"): KHÔNG mask pixel mây — mosaic giữ
-    nguyên cảnh như cảm biến ghi, đẹp về thị giác, mây hiện nguyên vẹn.
+    ``keep_clouds=True`` (method "raw"): giữ mây và pixel gốc của cảnh ưu tiên;
+    dùng thêm ngày khác (kể cả cùng tile) chỉ để bù footprint/NoData bị thiếu.
     """
     ranked = (
         _haze_rank(
@@ -608,6 +959,10 @@ def _least_cloudy_per_tile(
         if roi is not None
         else coll
     )
+    if keep_clouds:
+        return _raw_gap_fill(coll, ranked, dataset, cloud_prop, roi,
+                             **({'color_balance': True} if color_balance else {}),
+                             **({'selection_trace': selection_trace} if selection_trace is not None else {}))
     mask_scene = _mask_s2_clouds if dataset == "sentinel2" else _mask_landsat_clouds
 
     if dataset == "sentinel2":
@@ -632,13 +987,15 @@ def _least_cloudy_per_tile(
         sort_prop = "hazeScore" if roi is not None else cloud_prop
         best = ee.Image(sub.sort(sort_prop).first())
         info = best.getInfo()["properties"]
+        if selection_trace is not None:
+            best = load_timeseries_scene(_native_asset(info, dataset), dataset)
         date = dt.datetime.fromtimestamp(
             info["system:time_start"] / 1000, dt.timezone.utc
         ).strftime("%Y-%m-%d")
         # Mask only after selecting the scene so the selection itself still
         # uses the complete ROI haze score; mosaic then prefers valid pixels.
         # raw: giữ nguyên pixel mây — không mask cảnh được chọn.
-        picked.append((date, best if keep_clouds else mask_scene(best)))
+        picked.append((date, ee.Image(mask_scene(best) if mosaic_mask_clouds else best).toFloat()))
         infos.append(
             {
                 "scene_id": info["system:index"],
@@ -738,7 +1095,7 @@ def _base_score_per_tile(
 
 
 # Số băng tải về cho mỗi dataset — dùng để ước lượng thời gian median.
-_MEDIAN_BAND_COUNTS = {"sentinel2": 6, "landsat": 6, "nicfi": 4}
+_MEDIAN_BAND_COUNTS = {"sentinel2": len(S2_EXPORT_BANDS), "landsat": 6, "nicfi": 4}
 
 
 def _dynamic_world_scene_info(
@@ -820,11 +1177,12 @@ def _estimate_median_seconds(
 
 
 def _optical_collection(
-    dataset: str, start: str, end: str, platform: str = "ALL"
+    dataset: str, start: str, end: str, platform: str | None = None
 ) -> tuple[ee.ImageCollection, str | None, float]:
     """Return (collection, cloud metadata property, scale) for a dataset."""
+    platform = validate_platform(dataset, platform)
     if dataset == "sentinel2":
-        return _s2_collection(start, end), "CLOUDY_PIXEL_PERCENTAGE", S2_SCALE
+        return _s2_collection(start, end, platform=platform), "CLOUDY_PIXEL_PERCENTAGE", S2_SCALE
     if dataset == "landsat":
         l8 = _landsat_collection(L8_COLLECTION, start, end)
         l9 = _landsat_collection(L9_COLLECTION, start, end)
@@ -841,13 +1199,26 @@ def composite_plan(
     roi: ee.Geometry,
     start_date: str,
     end_date: str,
-    method: str = "medoid",
+    method: str = "raw",
     max_cloud_pct: float = 60.0,
+    platform: str | None = None,
+    scene_grouping: str = 'any', max_scene_span_days: int = 3, mosaic_mask_clouds: bool = True,
 ) -> dict | None:
     """Lập kế hoạch composite mà KHÔNG chạy: trả về số cảnh, khoảng ngày và
     (mosaic) danh sách cảnh từng tile kèm % mây, hoặc (median/medoid) thời
     gian ước lượng. Trả về None nếu không có cảnh nào hợp lệ."""
-    coll, cloud_prop, scale = _optical_collection(dataset, start_date, end_date)
+    if dataset in ('sentinel2', 'landsat') and method in ('raw', 'mosaic') and (
+            scene_grouping != 'any' or method == 'mosaic'):
+        scene = best_scene_for_roi(dataset, roi, start_date, end_date, composite=True,
+            composite_method=method, max_cloud_pct=max_cloud_pct, platform=platform,
+            scene_grouping=scene_grouping, max_scene_span_days=max_scene_span_days,
+            mosaic_mask_clouds=mosaic_mask_clouds)
+        return (dict(method=method, scenes=list(scene.scenes), scene_count=scene.scene_count,
+                     candidate_scene_count=scene.scene_grouping['candidate_count'], selected_scene_count=scene.scene_count,
+                     date_min=scene.scene_grouping['start_utc'][:10], date_max=scene.scene_grouping['end_utc'][:10],
+                     estimated_seconds=None, scene_grouping=scene.scene_grouping,
+                     mosaic_mask_clouds=scene.mosaic_mask_clouds) if scene else None)
+    coll, cloud_prop, scale = _optical_collection(dataset, start_date, end_date, platform=platform)
     coll = coll.filterBounds(roi)
     if cloud_prop is not None:
         coll = coll.filter(ee.Filter.lt(cloud_prop, max_cloud_pct))
@@ -939,10 +1310,12 @@ def _medoid(coll: ee.ImageCollection, bands: list[str]) -> ee.Image:
     - min(dist) + updateMask + mosaic: vẫn materialize cả stack ảnh masked.
     """
     sel = coll.select(bands)
-    median = sel.median()
+    # Quality bits and optional masked bands must not affect spectral distance.
+    distance_bands = ["B2", "B3", "B4", "B8", "B11", "B12"] if "B2" in bands else bands
+    median = sel.select(distance_bands).median()
 
     def _with_dist(img: ee.Image) -> ee.Image:
-        dist = img.subtract(median).pow(2).reduce(ee.Reducer.sum())
+        dist = img.select(distance_bands).subtract(median).pow(2).reduce(ee.Reducer.sum())
         # Tên băng KHÔNG được bắt đầu bằng "_" — GEE từ chối với
         # "Image.rename: Invalid band name" (đã từng dính khi đặt "__dist").
         return img.addBands(dist.multiply(-1).rename("medoidQ"))
@@ -1007,7 +1380,7 @@ def _composite_scene_info(
         size = coll.size().getInfo()
     if dataset == "sentinel2":
         masked = coll.map(_mask_s2_clouds)
-        bands = ["B2", "B3", "B4", "B8", "B11", "B12"]
+        bands = S2_EXPORT_BANDS
     else:
         masked = coll.map(_mask_landsat_clouds)
         bands = ["SR_B2", "SR_B3", "SR_B4", "SR_B5", "SR_B6", "SR_B7"]
@@ -1015,6 +1388,10 @@ def _composite_scene_info(
         composite = _medoid(masked, bands).clip(roi)
     else:
         composite = masked.median().clip(roi)
+        if dataset == "sentinel2":
+            # Median can invent fractional class IDs and invalid QA bit patterns.
+            categorical = masked.select(S2_CATEGORICAL_BANDS).mode().clip(roi)
+            composite = composite.addBands(categorical, None, True).select(bands)
 
     date = (
         f"{_fmt_time_start(coll.aggregate_min('system:time_start').getInfo())} → "
@@ -1052,13 +1429,16 @@ def best_scene_for_roi(
     end_date: str,
     *,
     composite: bool = False,
-    composite_method: str = "medoid",
+    composite_method: str = "raw",
     max_cloud_pct: float = 60.0,
+    platform: str | None = None,
+    color_balance: bool = False,
+    scene_grouping: str = 'any', max_scene_span_days: int = 3, mosaic_mask_clouds: bool = True,
 ) -> SceneInfo | None:
     """Return an image over ``roi``.
 
     Point mode gets the least-cloudy single scene. Province mode composites:
-    ``composite_method="medoid"`` (default) picks, per pixel, the actual band
+    ``composite_method="medoid"`` picks, per pixel, the actual band
     values of the scene closest to the median — màu trung thực, không phai;
     ``composite_method="median"`` takes the per-pixel median of the selected
     cloud-masked scenes — khử mây residual tốt hơn nhưng màu có thể phai.
@@ -1067,13 +1447,13 @@ def best_scene_for_roi(
     metadata cloud percentage;
     ``composite_method="mosaic"`` mosaics the least-cloudy scene of
     each tile covering the ROI (see ``_least_cloudy_per_tile``).
-    ``composite_method="raw"`` giống mosaic nhưng KHÔNG mask mây — mỗi tile
-    lấy 1 cảnh trong nhất rồi ghép nguyên gốc, mây giữ nguyên (đẹp thị giác).
+    ``composite_method="raw"`` (default) giữ nguyên mây và pixel của cảnh ưu tiên;
+    các ngày khác chỉ bù phần footprint/NoData thiếu, kể cả trong cùng tile.
     ``composite_method="base-score"`` puts the best-scored masked scene on
     top of a small fallback stack per tile, so fallbacks only fill its cloud
     holes and do not replace clear base pixels.
     """
-    coll, cloud_prop, scale = _optical_collection(dataset, start_date, end_date)
+    coll, cloud_prop, scale = _optical_collection(dataset, start_date, end_date, platform=platform)
 
     coll = coll.filterBounds(roi)
     if cloud_prop is not None:
@@ -1089,6 +1469,11 @@ def best_scene_for_roi(
         )
 
     if composite:
+        if dataset in ('sentinel2', 'landsat') and composite_method in ('raw', 'mosaic') and (
+                scene_grouping != 'any' or composite_method == 'mosaic'):
+            return _coherent_optical_scene(coll, dataset, cloud_prop, roi, start_date, end_date,
+                composite_method, scene_grouping, max_scene_span_days,
+                mosaic_mask_clouds=mosaic_mask_clouds, color_balance=color_balance)
         if composite_method in ("median", "medoid") and dataset in (
             "sentinel2",
             "landsat",
@@ -1119,7 +1504,8 @@ def best_scene_for_roi(
         if dataset in ("sentinel2", "landsat"):
             is_raw = composite_method == "raw"
             image, picked = _least_cloudy_per_tile(
-                coll, dataset, cloud_prop, roi, keep_clouds=is_raw
+                coll, dataset, cloud_prop, roi, keep_clouds=is_raw,
+                **({'color_balance': True} if color_balance and is_raw else {})
             )
             return SceneInfo(
                 dataset=dataset,
@@ -1138,9 +1524,11 @@ def best_scene_for_roi(
                         "scene_id": p["scene_id"],
                         "date": p["date"],
                         "cloud": p["cloud"],
+                        **({'color_balance': p['color_balance']} if 'color_balance' in p else {}),
                     }
                     for p in picked
                 ),
+                color_balance=_color_balance_report(picked) if color_balance and is_raw else None,
             )
         image = ee.Image(coll.sort("system:time_start", False).first())
         return SceneInfo(
@@ -1208,14 +1596,35 @@ def best_scene(
     merge_scenes: bool = False,
     roi: ee.Geometry | None = None,
     bbox: Bbox | None = None,
+    platform: str | None = None,
+    color_balance: bool = False,
+    freeze_assets: bool = False,
+    composite_method: str = 'raw', scene_grouping: str = 'any', max_scene_span_days: int = 3,
+    mosaic_mask_clouds: bool = True,
 ) -> SceneInfo | None:
     """Select a scene using the supplied true ROI and its search envelope."""
+    platform = validate_platform(dataset, platform)
     bbox = bbox or point_bbox(lon, lat, radius_m)
     selection = roi if roi is not None else bbox_to_ee_geom(bbox)
     if dataset in ("sentinel2", "landsat"):
+        if merge_scenes:
+            if scene_grouping != 'any' or composite_method == 'mosaic':
+                coll, cloud_prop, _ = _optical_collection(dataset, start_date, end_date, platform=platform)
+                coll = coll.filterBounds(selection).filter(ee.Filter.lt(cloud_prop, max_cloud_pct))
+                return _coherent_optical_scene(coll, dataset, cloud_prop, selection, start_date, end_date,
+                    composite_method, scene_grouping, max_scene_span_days,
+                    mosaic_mask_clouds=mosaic_mask_clouds, color_balance=color_balance, clip_output=roi is None)
+            return _raw_optical_scene(
+                dataset, selection, start_date, end_date, max_cloud_pct,
+                clip_output=roi is None, platform=platform,
+                **({'color_balance': True} if color_balance else {}),
+                **({'freeze_assets': True} if freeze_assets else {}),
+            )
         return _point_optical_scene(
             dataset, selection, start_date, end_date,
-            max_cloud_pct, merge_scenes, **({"clip_output": False} if roi is not None else {}),
+            max_cloud_pct, merge_scenes, platform=platform,
+            **({"clip_output": False} if roi is not None else {}),
+            **({'freeze_assets': True} if freeze_assets else {}),
         )
     return best_scene_for_roi(
         dataset,
@@ -1223,6 +1632,7 @@ def best_scene(
         start_date,
         end_date,
         max_cloud_pct=max_cloud_pct,
+        platform=platform,
     )
 
 
@@ -1293,17 +1703,17 @@ class _DownloadURL:
 
     def url(self) -> str:
         if self._url is None:
-            self._url = self._image.getDownloadURL(self._params)
+            self._url = measure_download('create_url', self._image.getDownloadURL, self._params)
         return self._url
 
     def refresh(self) -> str:
-        self._url = self._image.getDownloadURL(self._params)
+        self._url = measure_download('create_url', self._image.getDownloadURL, self._params)
         return self._url
 
     def discard(self) -> None:
         """Bỏ URL hiện tại — lần url() kế tiếp tạo URL mới.
 
-        download_geotiff tạo URL eagerly để phát hiện vùng vượt 48 MB cần chia
+        download_geotiff tạo URL eagerly để phát hiện vùng vượt 32 MiB cần chia
         tile, rồi discard: URL có thời hạn nên merge_band_tiffs sẽ tạo lại
         ngay trước lúc tải từng tile.
         """
@@ -1317,11 +1727,13 @@ def download_geotiff(
     scale: float,
     clip_region: ee.Geometry | None = None,
     max_tile_pixels: float | None = None,
+    s2_auxiliary_bands: list[str] | None = None,
+    *, s2_band_preset: str | None = None,
 ) -> list[tuple[str, _DownloadURL]]:
     """Fetch per-band GeoTIFFs of the ROI via getDownloadURL.
 
     Returns a list of (band_name, _DownloadURL). GEE limits a single
-    getDownloadURL request to 2^25 bytes (~48 MB); a large ROI at float32
+    getDownloadURL request to 2^25 bytes (32 MiB); a large ROI at float32
     easily exceeds that, so we download each band separately AND, when a band
     still exceeds the limit, split the ROI into tiles (4 -> 9 -> 16 ...).
     Tiles are merged by the caller (see merge_band_tiffs) via the band name
@@ -1330,7 +1742,7 @@ def download_geotiff(
     max_tile_pixels (nếu đặt) buộc mỗi tile ≤ số pixel ước lượng — dùng cho
     composite medoid/base-score: lỗi "User memory limit exceeded" của graph
     nhiều cảnh chỉ xuất hiện LÚC FETCH (400), không phải lúc tạo URL, nên
-    probe 48 MB không phát hiện được; phải chia nhỏ tile sẵn từ đầu theo diện
+    probe 32 MiB không phát hiện được; phải chia nhỏ tile sẵn từ đầu theo diện
     tích.
 
     The scene images coming from best_scene() already have their scale/offset
@@ -1345,9 +1757,12 @@ def download_geotiff(
     if dataset == "dynamic_world":
         bands = [DYNAMIC_WORLD_LABEL_BAND]
     elif dataset == "sentinel2":
-        bands = ["B2", "B3", "B4", "B8", "B11", "B12"]
+        bands = s2_export_bands(s2_auxiliary_bands, s2_band_preset=s2_band_preset)
     elif dataset == "nicfi":
         bands = ["B", "G", "R", "N"]
+    elif dataset.startswith("s5p_"):
+        from .s5p import product_metadata
+        bands = [product_metadata(dataset.removeprefix("s5p_"))["band"]]
     elif dataset == "dem":
         bands = ["elevation"]
     elif dataset == "s1gee":
@@ -1360,7 +1775,7 @@ def download_geotiff(
     def _band_urls_for_region(
         band: str, region: ee.Geometry, tag: str
     ) -> list[tuple[str, _DownloadURL]]:
-        """1 URL cho 1 band trong 1 region; nếu vượt 48 MB thì raise EEException."""
+        """1 URL cho 1 band trong 1 region; nếu vượt 32 MiB thì raise EEException."""
         selected = image.select([band])
         if categorical:
             # Expand the masked image footprint before filling it.  With the
@@ -1375,7 +1790,7 @@ def download_geotiff(
             nodata = DYNAMIC_WORLD_NODATA
         else:
             one_band = selected.multiply(1.0).toFloat()
-            if dataset == "dem":
+            if dataset in ("dem", "sentinel2") or dataset.startswith("s5p_"):
                 one_band = one_band.unmask(-9999, sameFootprint=False)
             dtype = "float"
             nodata = -9999
@@ -1390,14 +1805,14 @@ def download_geotiff(
             "formatOptions": {"noData": nodata},
         }
         url = _DownloadURL(one_band, download_params)
-        # Probe eager để phát hiện vượt 48 MB cần chia tile; cũng có thể
+        # Probe eager để phát hiện vượt 32 MiB cần chia tile; cũng có thể
         # dính RefreshError/EEException tạm thời do gateway chặn — retry.
         for k in range(1, 6):
             try:
                 url.url()
                 break
             except ee.EEException:
-                raise  # lỗi thật của graph (vd vượt 48 MB) — nhường cho caller
+                raise  # lỗi thật của graph (vd vượt 32 MiB) — nhường cho caller
             except Exception:
                 if k == 5:
                     raise
@@ -1407,18 +1822,20 @@ def download_geotiff(
 
     # Ước lượng tổng số pixel của bbox (1° ≈ 111 km, đủ chính xác để chọn n).
     # Nếu caller giới hạn kích thước tile thì chia sẵn từ đầu thay vì chỉ
-    # dựa vào probe 48 MB (không bắt được lỗi bộ nhớ lúc fetch).
+    # dựa vào probe 32 MiB (không bắt được lỗi bộ nhớ lúc fetch).
     approx_px = (
         (bbox.east - bbox.west) * 111320.0 / scale
         * (bbox.north - bbox.south) * 111320.0 / scale
     )
-    min_n = 1
-    if max_tile_pixels and approx_px > max_tile_pixels:
-        min_n = max(2, math.ceil(math.sqrt(approx_px / max_tile_pixels)))
+    # A Float32 tile stays below GEE's 32 MiB request limit, even for huge
+    # envelopes that need more than eight tiles per axis. Callers may request
+    # smaller tiles for expensive computation graphs.
+    tile_pixel_limit = min(max_tile_pixels or 8_000_000, 8_000_000)
+    min_n = max(1, math.ceil(math.sqrt(approx_px / tile_pixel_limit)))
 
     band_urls: list[tuple[str, _DownloadURL]] = []
     for band in bands:
-        # Thử nguyên vùng; nếu vượt giới hạn 48 MB thì chia lưới tile tăng dần.
+        # Thử nguyên vùng; nếu vượt giới hạn 32 MiB thì chia lưới tile tăng dần.
         region = ee.Geometry.Rectangle([bbox.west, bbox.south, bbox.east, bbox.north])
         whole_exc: Exception | None = None
         if min_n == 1:
@@ -1430,7 +1847,7 @@ def download_geotiff(
 
         tiled = False
         last_exc: Exception | None = None
-        for n in (2, 3, 4, 5, 6, 7, 8):
+        for n in range(max(2, min_n), max(8, min_n + 2) + 1):
             if n < min_n:
                 continue
             try:
@@ -1454,7 +1871,7 @@ def download_geotiff(
             # KHÔNG dùng bare `raise` ở đây: ngoài except context nó thành
             # "No active exception to reraise". Ném lại lỗi thật — ưu tiên
             # lỗi của tile (thường là lỗi thật của graph, vd vượt bộ nhớ),
-            # fallback về lỗi của vùng nguyên (vd vượt 48 MB).
+            # fallback về lỗi của vùng nguyên (vd vượt 32 MiB).
             raise (last_exc or whole_exc or RuntimeError(
                 f"Cannot create download URL for band {band}"
             ))
@@ -1483,6 +1900,64 @@ def _fetch_with_retry(url: str, max_retries: int = 5, timeout: int = 600) -> byt
     raise last_exc  # type: ignore[misc]
 
 
+def _mosaic_placements(sources, profile):
+    """Anchor source sampling to the whole mosaic, independent of block edges.
+
+    Match the full Rasterio merge's global intersection and pixel rounding.
+    Recomputing these against every output block shifts fractional tile origins.
+    """
+    from rasterio.windows import Window, bounds, from_bounds
+
+    transform = profile["transform"]
+    west, south, east, north = bounds(
+        Window(0, 0, profile["width"], profile["height"]), transform)
+    placements = []
+    for source in sources:
+        overlap = (max(west, source.bounds.left), max(south, source.bounds.bottom),
+                   min(east, source.bounds.right), min(north, source.bounds.top))
+        if overlap[0] >= overlap[2] or overlap[1] >= overlap[3]:
+            continue
+        source_window = from_bounds(*overlap, source.transform)
+        target = from_bounds(*overlap, transform)
+        target = Window(math.floor(target.col_off + 0.1), math.floor(target.row_off + 0.1),
+                        math.floor(target.width + 0.5), math.floor(target.height + 0.5))
+        if target.width and target.height:
+            placements.append((source, source_window, target))
+    return placements
+
+
+def _read_mosaic_window(placements, window, dtype, nodata):
+    """Read one first-valid-pixel mosaic block using globally anchored sampling."""
+    import numpy as np
+    from rasterio.windows import Window
+
+    fill = 0 if nodata is None else nodata
+    result = np.full((int(window.height), int(window.width)), fill, dtype=dtype)
+    for source, source_window, target in placements:
+        left, top = max(window.col_off, target.col_off), max(window.row_off, target.row_off)
+        right = min(window.col_off + window.width, target.col_off + target.width)
+        bottom = min(window.row_off + window.height, target.row_off + target.height)
+        if left >= right or top >= bottom:
+            continue
+        width, height = int(right - left), int(bottom - top)
+        scale_x, scale_y = source_window.width / target.width, source_window.height / target.height
+        sampling = Window(source_window.col_off + (left - target.col_off) * scale_x,
+                          source_window.row_off + (top - target.row_off) * scale_y,
+                          width * scale_x, height * scale_y)
+        data = source.read(1, window=sampling, out_shape=(height, width), masked=True)
+        row, column = int(top - window.row_off), int(left - window.col_off)
+        region = result[row:row + height, column:column + width]
+        if np.isnan(fill):
+            empty = np.isnan(region)
+        elif np.issubdtype(region.dtype, np.floating):
+            empty = np.isclose(region, fill)
+        else:
+            empty = region == fill
+        np.copyto(region, data.data, where=empty & ~np.ma.getmaskarray(data), casting="unsafe")
+    return result
+
+
+@bulk_export
 def merge_band_tiffs(
     band_urls: list[tuple[str, "_DownloadURL"]],
     out_path,
@@ -1498,10 +1973,12 @@ def merge_band_tiffs(
     bands are stacked. Raises requests.RequestException if any download
     fails.
     """
+    if not band_urls:
+        raise ValueError("No band URLs to merge")
+
     # Local imports: heavy deps only needed for the merge step.
     import numpy as np
     import rasterio
-    from rasterio.merge import merge as rio_merge
 
     tmp_dir = Path(out_path).parent / (Path(out_path).stem + "_bands_tmp")
     tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -1547,7 +2024,7 @@ def merge_band_tiffs(
             for attempt in range(1, 7):
                 url = _get_url(url_obj, first=attempt == 1)
                 try:
-                    data = _fetch_with_retry(url)
+                    data = measure_download('transfer', _fetch_with_retry, url)
                 except requests.RequestException:
                     # URL hết hạn (401) sau nhiều lần thử lại — tạo URL mới
                     if attempt == 6:
@@ -1582,81 +2059,73 @@ def merge_band_tiffs(
         for base, urls in groups.items():
             paths[base] = [tmp_dir / f"{base}_{k}.tif" for k in range(len(urls))]
 
-        # Mosaic các tile của từng band (nếu có nhiều), rồi stack
-        band_files: list[tuple[str, Path]] = []
-        for base in order:
-            files = paths[base]
-            if len(files) == 1:
-                band_files.append((base, files[0]))
-                continue
-            mosaic_path = tmp_dir / f"{base}_mosaic.tif"
-            srcs = [rasterio.open(f) for f in files]
-            try:
-                # rio_merge defaults to nearest-neighbour, which is required
-                # for class labels and is also safe for the existing downloads.
-                arr, transform = rio_merge(srcs, **({"nodata": float("nan"), "dtype": "float32"} if preserve_masks and not categorical else {}))
-                profile = srcs[0].profile.copy()
-                if preserve_masks and not categorical:
-                    profile.update(dtype="float32", nodata=float("nan"))
-                if categorical:
-                    arr = arr.astype("uint8", copy=False)
-                    profile.update(dtype="uint8", nodata=DYNAMIC_WORLD_NODATA)
-
-                profile.update(
-                    height=arr.shape[1], width=arr.shape[2],
-                    count=1, transform=transform,
-                )
-                with rasterio.open(mosaic_path, "w", **profile) as dst:
-                    dst.write(arr[0], 1)
-            finally:
-                for s in srcs:
-                    s.close()
-            band_files.append((base, mosaic_path))
-
-        with rasterio.open(band_files[0][1]) as ref:
-            height, width = ref.height, ref.width
-            profile = ref.profile
-            nodata = ref.nodata
-
-        dtype = np.uint8 if categorical else np.float32
-        stack = np.zeros((len(band_files), height, width), dtype=dtype)
-        for i, (band, path) in enumerate(band_files):
-            with rasterio.open(path) as src:
-                if (src.height, src.width) != (height, width):
-                    raise RuntimeError(
-                        f"Band {band} has size {src.width}x{src.height}, "
-                        f"expected {width}x{height}"
-                    )
-                if preserve_masks:
-                    fill = DYNAMIC_WORLD_NODATA if categorical else float("nan")
-                    stack[i] = src.read(1, masked=True).astype(dtype).filled(fill)
-                else:
-                    stack[i] = src.read(1).astype(dtype)
-
-        if preserve_masks:
-            profile.pop("blockxsize", None)
-            profile.pop("blockysize", None)
-        profile.update(
-            count=len(band_files),
-            dtype="uint8" if categorical else "float32",
-            compress="deflate",
-            tiled=True,
-        )
-        if categorical:
-            profile.update(nodata=DYNAMIC_WORLD_NODATA)
-        elif preserve_masks:
-            nodata = float("nan")
-            profile.update(nodata=nodata)
-        with rasterio.open(out_path, "w", **profile) as dst:
-            dst.write(stack)
-            for i, (band, _p) in enumerate(band_files, start=1):
-                dst.set_band_description(i, band)
-            # giữ nodata như band gốc (GEE ghi -inf cho pixel bị mask)
-            if categorical:
-                dst.nodata = DYNAMIC_WORLD_NODATA
-            elif nodata is not None:
-                dst.nodata = nodata
+        merge_local_band_tiffs(paths, out_path, categorical=categorical, preserve_masks=preserve_masks)
     finally:
         import shutil
 
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def merge_local_band_tiffs(paths, out_path, *, categorical=False, preserve_masks=False, check=lambda: None):
+    """Mosaic verified local transport tiles using the established block writer."""
+    import numpy as np
+    import rasterio
+    order = list(paths)
+    if not order or any(not values for values in paths.values()):
+        raise ValueError("No local band tiles to merge")
+    # Mosaic and stack in bounded windows; never allocate a full band/image.
+    from contextlib import ExitStack
+    from rasterio.transform import from_origin
+    from .raster_grid import GEOTIFF_OPTIONS, atomic_raster_path
+
+    dtype = "uint8" if categorical else "float32"
+    with atomic_raster_path(out_path) as temporary, ExitStack() as output_context:
+        dst = None
+        for index, base in enumerate(order, 1):
+            with ExitStack() as sources_context:
+                srcs = [sources_context.enter_context(rasterio.open(p)) for p in paths[base]]
+                ref = srcs[0]
+                profile = ref.profile.copy()
+                if len(srcs) > 1:
+                    if any(s.crs != ref.crs or s.transform.b or s.transform.d
+                           or s.transform.a <= 0 or s.transform.e >= 0 for s in srcs):
+                        raise RuntimeError(f"Band {base} tiles must share a north-up CRS/grid")
+                    west = min(s.bounds.left for s in srcs)
+                    south = min(s.bounds.bottom for s in srcs)
+                    east = max(s.bounds.right for s in srcs)
+                    north = max(s.bounds.top for s in srcs)
+                    profile.update(
+                        width=int(round((east - west) / ref.res[0])),
+                        height=int(round((north - south) / ref.res[1])),
+                        transform=from_origin(west, north, *ref.res),
+                    )
+                if dst is None:
+                    if categorical:
+                        profile.update(nodata=DYNAMIC_WORLD_NODATA)
+                    elif preserve_masks:
+                        profile.update(nodata=float("nan"))
+                    profile.update(count=len(order), dtype=dtype, **GEOTIFF_OPTIONS)
+                    dst = output_context.enter_context(rasterio.open(temporary, "w", **profile))
+                elif (profile["width"] != dst.width or profile["height"] != dst.height
+                      or ref.crs != dst.crs
+                      or not profile["transform"].almost_equals(dst.transform, precision=1e-9)):
+                    raise RuntimeError(f"Band {base} grid does not match the first band")
+
+                placements = _mosaic_placements(srcs, profile) if len(srcs) > 1 else None
+                for _, window in dst.block_windows(index):
+                    check()
+                    if len(srcs) == 1:
+                        data = ref.read(1, window=window, masked=preserve_masks)
+                        if preserve_masks:
+                            data = data.astype(dtype).filled(dst.nodata)
+                    else:
+                        mosaic_nodata = float("nan") if preserve_masks and not categorical else ref.nodata
+                        data = _read_mosaic_window(placements, window, dtype, mosaic_nodata)
+                    dst.write(data.astype(dtype, copy=False), index, window=window)
+                dst.set_band_description(index, base)
+                dst.update_tags(index, **ref.tags(1))
+                scales, offsets, units = list(dst.scales), list(dst.offsets), list(dst.units)
+                scales[index - 1], offsets[index - 1], units[index - 1] = ref.scales[0], ref.offsets[0], ref.units[0]
+                dst.scales, dst.offsets, dst.units = scales, offsets, units
+                if index == 1:
+                    dst.update_tags(**ref.tags())
