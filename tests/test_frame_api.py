@@ -73,6 +73,11 @@ class FrameAPITests(unittest.TestCase):
         self.assertEqual(r.status_code, 400)
         self.assertEqual(self.client.get('/api/matched-frame/references/not-a-uuid').status_code, 404)
 
+    def test_reference_upload_limit_is_512_mib(self):
+        from app.frame_models import MAX_UPLOAD_BYTES, MAX_BODY_BYTES
+        self.assertEqual(MAX_UPLOAD_BYTES, 512 * 1024 * 1024)
+        self.assertGreater(MAX_BODY_BYTES, MAX_UPLOAD_BYTES)
+
     def test_stream_body_limit_without_length(self):
         app = FastAPI()
         register_frame_routes(app, self.service)

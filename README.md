@@ -111,7 +111,7 @@ Kiểm thử offline: `.venv\\Scripts\\python.exe -m unittest tests.test_s5p` v�
 ## Tải ảnh đồng khung từ GeoTIFF mẫu
 
 Trong **Khám phá → Cách chọn vùng → Theo GeoTIFF mẫu**, chọn một ảnh `.tif`/`.tiff`
-(tối đa 256 MiB). Backend đọc metadata và xóa tệp upload ngay sau đó; không nhận
+(tối đa 512 MiB). Backend đọc metadata và xóa tệp upload ngay sau đó; không nhận
 đường dẫn máy chủ tùy ý và không gửi pixel ảnh mẫu sang GEE. ROI là toàn khung
 bốn góc affine, kể cả khung xoay/shear, không phải vùng alpha hoặc mask đường.
 
@@ -309,6 +309,10 @@ Chọn **Sentinel-1 SAR GEE** → bật **Ghép nhiều cảnh SAR (bù vùng th
 API `POST /api/s1gee/scene` và `GET /api/s1gee/download` thêm
 `merge_scenes=true` (mặc định false). Link tải giữ lựa chọn này.
 
+Kết quả tìm kiếm trên giao diện hiển thị riêng hướng bay ASCENDING và
+DESCENDING khi có dữ liệu. Chọn hướng bay để xem preview, độ phủ và danh sách
+cảnh tương ứng; link tải giữ các ID cảnh đã chọn và kiểm tra lại chúng khi tải.
+
 Giữ pixel cảnh chính; chỉ lấp phần thiếu bằng cảnh IW cùng phân cực, hướng bay
 và quỹ đạo tương đối, ưu tiên gần thời điểm cảnh chính. Xét tối đa 24 cảnh bổ
 sung, chỉ giữ cảnh tăng độ phủ, dừng khi đạt ≥99%. Không lấy trung bình dB và
@@ -317,7 +321,7 @@ các band trên toàn ROI, kể cả phần không có footprint; ước lượn
 Nếu vẫn dưới 99%, hiển thị cảnh báo nhưng vẫn cho tải phần có dữ liệu; cần mở
 rộng khoảng ngày/thu nhỏ ROI. Kết quả liệt kê số cảnh, ngày và ID sử dụng.
 Mosaic có tên vùng/khoảng ngày/số cảnh, không giả là một sản phẩm nguyên gốc.
-Preview và download truy vấn lại cùng quy tắc, chưa phải snapshot bất biến.
+Link tải giữ danh sách cảnh nhưng chưa phải snapshot bất biến của toàn bộ yêu cầu.
 Ghép khác ngày vẫn có thể gây đường nối/chênh lệch tán xạ; không thay thế chuỗi
 SAR cùng quỹ đạo dùng cho phân tích biến động.
 

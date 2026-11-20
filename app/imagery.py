@@ -429,6 +429,8 @@ def _s1_collection(start: str, end: str, polarization: str, platform: str | None
         .filterDate(start, end)
         .filter(ee.Filter.eq("instrumentMode", "IW"))
     )
+    for band in bands[1:]:
+        collection = collection.filter(ee.Filter.listContains('transmitterReceiverPolarisation', band))
     return apply_platform_filter(collection, 's1gee', platform).map(to_db)
 
 
@@ -646,35 +648,13 @@ def best_s1_scene(
 def _pick_s1_covering(
     coll: ee.ImageCollection, roi: ee.Geometry
 ) -> ee.Image | None:
-    """Chọn cảnh S1 phủ ROI tốt nhất: ưu tiên độ phủ, DESC, rồi mới nhất.
+    """Rank by valid data across the entire ROI, then by acquisition time."""
+    from .s1_mosaic import ranked_s1_sources
 
-    filterBounds chỉ cần footprint CHẠM ROI — với ROI lớn (cấp tỉnh) các
-    cảnh chạm mép có thể phủ <5% diện tích, trong khi cảnh cùng ngày từ
-    track khác phủ trọn. Ta tính tỷ lệ pixel có mask trong ROI (thang
-    thô 1 km cho nhanh), xếp hạng: cover DESC → orbit DESC → mới nhất.
-    Giữ tối đa 12 cảnh có cover cao nhất để giảm số lời gọi reduceRegion.
-    """
-    if coll.size().getInfo() == 0:
+    ranked = ranked_s1_sources(coll, roi)
+    if not ranked:
         return None
-
-    def add_cover(img: ee.Image) -> ee.Image:
-        frac = (
-            img.select(0)
-            .mask()
-            .reduceRegion(
-                ee.Reducer.mean(), roi, 1000, bestEffort=True, maxPixels=1e7
-            )
-            .get(img.bandNames().get(0))
-        )
-        return img.set("s1_cover", frac)
-
-    scored = coll.map(add_cover).sort("s1_cover", False).limit(12)
-    # orbit ASC làm hạng phụ: cảnh DESC (góc nhìn ổn định cho thay đổi đất)
-    # xếp trước cảnh ASC cùng mức phủ.
-    desc = scored.filter(ee.Filter.eq("orbitProperties_pass", "DESCENDING"))
-    if desc.size().getInfo() > 0:
-        scored = desc
-    return ee.Image(scored.sort("system:time_start", False).first())
+    return ee.Image(coll.filter(ee.Filter.eq('system:index', ranked[0]['system:index'])).first())
 
 
 def best_s1_scene_for_roi(

@@ -8,7 +8,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-MAX_UPLOAD_BYTES = 256 * 1024 * 1024
+MAX_UPLOAD_BYTES = 512 * 1024 * 1024
 MAX_BODY_BYTES = MAX_UPLOAD_BYTES + 1024 * 1024
 MAX_DIMENSION = 30000
 MAX_OUTPUT_PIXELS = 100000000

@@ -259,7 +259,7 @@
     if (!files?.length) { controls(); return; }
     const file = files[0];
     if (files.length !== 1 || !/\.tiff?$/i.test(file.name)) { error('Chọn đúng một GeoTIFF .tif hoặc .tiff.', 'mfFile'); return; }
-    if (file.size > 256 * 1024 * 1024 || file.size === 0) { error('GeoTIFF phải lớn hơn 0 và không quá 256 MiB. Chọn tệp nhỏ hơn.', 'mfFile'); return; }
+    if (file.size > 512 * 1024 * 1024 || file.size === 0) { error('GeoTIFF phải lớn hơn 0 và không quá 512 MiB. Chọn tệp nhỏ hơn.', 'mfFile'); return; }
     const form = new FormData();
     form.append('file', file);
     uploadController = new AbortController();

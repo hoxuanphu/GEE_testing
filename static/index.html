@@ -29,6 +29,8 @@
   button:hover { filter: brightness(1.1); }
   button:disabled { opacity: .5; cursor: wait; }
   .row { display: flex; gap: 8px; } .row > div { flex: 1; }
+  .s1-orbit-options { display: grid; gap: 6px; margin-bottom: 10px; }
+  .s1-orbit-options button[aria-pressed="false"] { background: var(--panel); color: var(--ink); border: 1px solid var(--input-border); }
   #coords { font-family: ui-monospace, monospace; font-size: 13px; color: #38bdf8; min-height: 18px; }
   #status { font-size: 13px; color: #fbbf24; min-height: 18px; }
   #result { display: none; background: #0f172a; border-radius: 10px; padding: 12px; font-size: 13px; }
@@ -120,7 +122,7 @@
   </section>
   <section id="referenceSelection" hidden aria-labelledby="mfReferenceTitle">
     <h3 id="mfReferenceTitle">Đồng khung từ GeoTIFF mẫu</h3>
-    <label for="mfFile">Một GeoTIFF mẫu (.tif / .tiff, tối đa 256 MiB)</label>
+    <label for="mfFile">Một GeoTIFF mẫu (.tif / .tiff, tối đa 512 MiB)</label>
     <input id="mfFile" type="file" accept=".tif,.tiff,image/tiff" aria-describedby="mfUploadHelp mfFieldError" />
     <p id="mfUploadHelp" class="hint">Chỉ đọc metadata trên máy chủ cục bộ rồi xóa tệp upload. Pixel mẫu không gửi sang GEE, không dùng làm dữ liệu xuất. Footprint là toàn khung, không phải alpha/NoData.</p>
     <div id="mfUploadStatus" role="status" aria-live="polite"></div>
@@ -565,7 +567,7 @@ if (typeof L === 'undefined') {
   document.write('<script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js"><\/script>');
 }
 </script>
-<script src="/rectangle.js?v=roi-copy-20261115-2"></script>
+<script src="/rectangle.js?v=upload-512mib-20261119"></script>
 <script src="/selection-state.js?v=1"></script>
 <script src="/s2-layers.js?v=2"></script>
 <script>
@@ -1699,11 +1701,12 @@ async function searchS1Gee(lon, lat) {
       rotation_deg: rotationValue(),
       polarization: 'vvvh',
       platform: window.MatchedFrame?.platform() ?? null,
-      merge_scenes: $('sar_merge_scenes').checked
+      merge_scenes: $('sar_merge_scenes').checked,
+      group_by_orbit: true
     };
     if (selectionMode === 'vector') body = {...window.VectorLayers.request(),
       start_date:$('start_date').value, end_date:$('end_date').value, polarization:'vvvh',
-      platform:window.MatchedFrame?.platform() ?? null, merge_scenes:$('sar_merge_scenes').checked};
+      platform:window.MatchedFrame?.platform() ?? null, merge_scenes:$('sar_merge_scenes').checked, group_by_orbit:true};
     else if (selectionMode === 'rectangle') body = RectangleROI.body(body, rectangleEditor.get());
     else if (selectionMode !== 'point') body.rotation_deg = 0;
     const res = await fetch('/api/s1gee/scene', {
@@ -1717,31 +1720,66 @@ async function searchS1Gee(lon, lat) {
     const data = await res.json();
     if (version !== searchGeneration || body.selection_mode === 'vector' && !window.VectorSearch?.isCurrent(version, body.vector_roi_id)) return;
 
-    $('status').textContent = data.warning || '';
-    $('meta').replaceChildren();
-    const summary = document.createElement('div');
-    summary.textContent = `${data.scene_id} | Ngày: ${data.date} | ${data.scale_m} m | ${data.bands.join(', ')} (dB)`;
-    const coverage = document.createElement('div');
-    coverage.textContent = `Độ phủ: ${data.coverage_pct == null ? 'chưa rõ' : Number(data.coverage_pct).toFixed(2) + '%'} (ước lượng 100 m) · ${data.scene_count || 1} cảnh · ${data.composite ? 'Ghép bù vùng thiếu' : 'Một cảnh'}`;
-    $('meta').append(summary, coverage);
-    for (const scene of data.scenes || []) {
-      const row = document.createElement('div');
-      row.textContent = `${scene.date}: ${scene.scene_id}`;
-      row.style.overflowWrap = 'anywhere'; $('meta').appendChild(row);
-    }
-    if (data.preview_url) { $('preview').src = data.preview_url; }
-    $('dl').href = data.download_url;
-    $('dl').textContent = 'Tải GeoTIFF (dB)';
-    window.DownloadJobs?.bindSelection(data);
-
-    renderResponseRoi(data);
-
+    renderS1OrbitResults(data, version);
     $('result').style.display = 'block';
   } catch (e) {
     if (version === searchGeneration) $('status').textContent = 'Lỗi: ' + e.message;
   } finally {
     if (version === searchGeneration) btn.disabled = false;
   }
+}
+
+function renderS1OrbitResults(data, version) {
+  const details = document.createElement('div');
+  const controls = document.createElement('div');
+  controls.className = 's1-orbit-options';
+  controls.setAttribute('role', 'group');
+  controls.setAttribute('aria-label', 'Chọn hướng bay Sentinel-1');
+  const choices = [];
+  const formatCoverage = value => value == null ? 'chưa rõ' : `${Number(value).toFixed(2)}%`;
+
+  function select(result) {
+    if (version !== searchGeneration) return;
+    for (const [button, option] of choices) button.setAttribute('aria-pressed', String(result === option));
+    $('status').textContent = result.warning || '';
+    const summary = document.createElement('div');
+    summary.textContent = `${result.scene_id} | Ngày: ${result.date} | ${result.scale_m} m | ${result.bands.join(', ')} (dB)`;
+    summary.style.overflowWrap = 'anywhere';
+    const coverage = document.createElement('div');
+    coverage.textContent = `Độ phủ: ${formatCoverage(result.coverage_pct)} (ước lượng 100 m) · ${result.scene_count || 1} cảnh · ${result.composite ? 'Ghép bù vùng thiếu' : 'Một cảnh'}`;
+    details.replaceChildren(summary, coverage);
+    for (const scene of result.scenes || []) {
+      const row = document.createElement('div');
+      row.textContent = `${scene.date}: ${scene.scene_id}`;
+      row.style.overflowWrap = 'anywhere';
+      details.appendChild(row);
+    }
+    if (result.preview_url) $('preview').src = result.preview_url;
+    else $('preview').removeAttribute('src');
+    $('dl').href = result.download_url;
+    $('dl').textContent = 'Tải GeoTIFF (dB)';
+    window.DownloadJobs?.bindSelection(result);
+    renderResponseRoi(result);
+  }
+
+  if (!Array.isArray(data.results)) {
+    $('meta').replaceChildren(details);
+    select(data);
+    return;
+  }
+  for (const [pass, label] of [['ASCENDING', 'ASCENDING · Hướng lên'], ['DESCENDING', 'DESCENDING · Hướng xuống']]) {
+    const option = data.results.find(result => result.orbit_pass === pass);
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.disabled = !option;
+    button.textContent = `${label} · ${option ? formatCoverage(option.coverage_pct) : 'Không có cảnh'}`;
+    if (option) button.addEventListener('click', () => select(option));
+    choices.push([button, option]);
+    controls.appendChild(button);
+  }
+  $('meta').replaceChildren(controls, details);
+  const first = data.results.reduce((best, item) => item.coverage_pct > best.coverage_pct ? item : best);
+  select(first);
 }
 
 async function searchS1(lon, lat) {
@@ -2281,7 +2319,7 @@ async function searchS1Pairs(lon, lat) {
 <script src="/esri.js?v=rectangle-1"></script>
 <script src="/download-jobs.js?v=1"></script>
 <script src="/workspace.js?v=download-jobs-1"></script>
-<script src="/matched-frame.js?v=roi-copy-20261115-2"></script>
+<script src="/matched-frame.js?v=upload-512mib-20261119"></script>
 <script src="/scene-inventory.js?v=1"></script>
 <script src="/vector-layers.js?v=1"></script>
 <script src="/vector-search.js?v=2"></script>

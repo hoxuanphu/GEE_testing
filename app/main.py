@@ -12,10 +12,11 @@ import uuid
 import re
 import time
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
+from urllib.parse import urlencode
 
 import requests
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -1475,6 +1476,7 @@ class S1SceneRequest(PointSelectionRequest):
     radius_m: float = Field(2000.0, gt=0, le=_MAX_RADIUS_M)
     polarization: str = Field("vvvh", pattern="^(vvvh|vv|hhhv|hh)$")
     merge_scenes: bool = False
+    group_by_orbit: bool = False
     platform: str | None = None
 
     @field_validator("platform")
@@ -1494,7 +1496,7 @@ class S1SceneRequest(PointSelectionRequest):
 
 @app.post("/api/s1gee/scene")
 def find_s1_scene(req: S1SceneRequest):
-    """Tìm ảnh Sentinel-1 GRD trên GEE (cảnh mới nhất, ưu tiên orbit DESC)."""
+    """Tìm ảnh Sentinel-1 GRD trên GEE theo độ phủ ROI."""
     _ensure_ee()
     if req.start_date > req.end_date:
         raise HTTPException(400, "start_date must be <= end_date")
@@ -1517,8 +1519,16 @@ def find_s1_scene(req: S1SceneRequest):
     end_exclusive = (
         dt.date.fromisoformat(req.end_date) + dt.timedelta(days=1)
     ).isoformat()
+    from .s1_mosaic import prepare_s1, search_s1_by_orbit
     try:
-        if province is not None:
+        if req.group_by_orbit:
+            by_orbit = search_s1_by_orbit(roi, req.start_date, end_exclusive, req.polarization,
+                                         req.merge_scenes, req.platform)
+            if by_orbit:
+                return {'results': [_s1_scene_response(req, result, roi, bbox, province, orbit_pass)
+                                    for orbit_pass, result in by_orbit.items()]}
+            scene = None
+        elif province is not None:
             scene = best_s1_scene_for_roi(
                 roi, req.start_date, end_exclusive, req.polarization, platform=req.platform
             )
@@ -1544,13 +1554,15 @@ def find_s1_scene(req: S1SceneRequest):
             if req.platform is not None else "No Sentinel-1 scene found for this selection/date range.",
         )
 
-    from .s1_mosaic import prepare_s1
     try:
         scene = prepare_s1(scene, roi, req.start_date, end_exclusive,
                            req.polarization, req.merge_scenes, platform=req.platform)
     except Exception as exc:
         raise HTTPException(502, f"Không thể đánh giá/ghép độ phủ SAR: {exc}") from exc
+    return _s1_scene_response(req, scene, roi, bbox, province)
 
+
+def _s1_scene_response(req, scene, roi, bbox, province, orbit_pass=None):
     try:
         available = set(scene.ee_object.bandNames().getInfo())
     except Exception:
@@ -1596,8 +1608,12 @@ def find_s1_scene(req: S1SceneRequest):
         )
     if req.platform is not None:
         download_params += f"&platform={req.platform}"
+    if orbit_pass:
+        source_ids = [source['scene_id'] for source in scene.scenes]
+        download_params += '&' + urlencode({'orbit_pass': orbit_pass, 'scene_ids': source_ids}, doseq=True)
     return {
         "dataset": "s1gee",
+        "orbit_pass": orbit_pass,
         "platform": req.platform,
         "scene_id": scene.scene_id,
         "date": scene.date,
@@ -1652,6 +1668,8 @@ def s1gee_download(
     rotation_deg: float = 0.0,
     merge_scenes: bool = False,
     platform: str | None = None,
+    orbit_pass: Literal['ASCENDING', 'DESCENDING'] | None = None,
+    scene_ids: Annotated[list[str] | None, Query(max_length=25)] = None,
 ):
     """Tải GeoTIFF S1 GRD (dB) theo vùng đã chọn — không cần tài khoản CDSE."""
     try:
@@ -1661,6 +1679,11 @@ def s1gee_download(
     _ensure_ee()
     if polarization not in ("vvvh", "vv", "hhhv", "hh"):
         raise HTTPException(400, "polarization must be vvvh|vv|hhhv|hh")
+    if ((scene_ids is None) != (orbit_pass is None) or scene_ids is not None and (
+            not scene_ids or len(set(scene_ids)) != len(scene_ids) or
+            any(not value.isascii() or not value.replace('_', '').isalnum() or len(value) > 100
+                for value in scene_ids) or (len(scene_ids) > 1 and not merge_scenes))):
+        raise HTTPException(422, 'Danh sách cảnh SAR đã chọn không hợp lệ.')
     roi, bbox, province = _resolve_selection(
         selection_mode,
         lon,
@@ -1679,7 +1702,15 @@ def s1gee_download(
     end_exclusive = (
         dt.date.fromisoformat(end_date) + dt.timedelta(days=1)
     ).isoformat()
-    if province is not None:
+    if scene_ids is not None:
+        from .s1_mosaic import restore_s1_sources
+        try:
+            scene = restore_s1_sources(scene_ids, roi, start_date, end_exclusive, polarization, platform, orbit_pass)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(502, f'Không thể mở các cảnh SAR đã chọn: {exc}') from exc
+    elif province is not None:
         scene = best_s1_scene_for_roi(roi, start_date, end_exclusive, polarization, platform=platform)
     else:
         scene = best_s1_scene(
@@ -1693,7 +1724,7 @@ def s1gee_download(
     if scene is None:
         raise HTTPException(404, f"Không có ảnh Sentinel-1{platform} trong khoảng thời gian/vùng đã chọn."
                             if platform is not None else "No Sentinel-1 scene found for this point/date range")
-    if merge_scenes:
+    if merge_scenes and scene_ids is None:
         from .s1_mosaic import prepare_s1
         try:
             scene = prepare_s1(scene, roi, start_date, end_exclusive, polarization, True, platform=platform)
@@ -1725,7 +1756,8 @@ def s1gee_download(
     )
 
     if (getattr(scene, "scene_count", None) or 1) > 1:
-        fname = f"s1gee_mosaic_{start_date}_{end_date}_n{scene.scene_count}_{polarization}.tif"
+        direction = f'_{orbit_pass.lower()}' if orbit_pass else ''
+        fname = f"s1gee_mosaic_{start_date}_{end_date}{direction}_n{scene.scene_count}_{polarization}.tif"
     else:
         fname = f"{scene.scene_id}_{polarization}.tif"
     if province is not None:
@@ -1743,7 +1775,7 @@ def s1gee_download(
     out = _DOWNLOADS_DIR / f"{uuid.uuid4().hex}.tif"
     raw = out.with_suffix(".source.tif") if output_grid else out
     try:
-        merge_band_tiffs(band_urls, raw, **({"preserve_masks": True} if output_grid or merge_scenes or selection_mode == 'vector' else {}))
+        merge_band_tiffs(band_urls, raw, **({"preserve_masks": True} if output_grid or merge_scenes or scene_ids or selection_mode == 'vector' else {}))
         if output_grid:
             warp_to_grid(raw, out, output_grid)
         if selection_mode == 'vector':

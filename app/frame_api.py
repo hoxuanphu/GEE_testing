@@ -43,7 +43,7 @@ class FrameUploadLimitMiddleware:
             return await self.app(scope, receive, send)
         try:
             if int(headers.get('content-length', '0')) > self.body_limit:
-                return await error_response(413, 'upload_too_large', 'Ảnh mẫu vượt giới hạn 256 MiB.')(scope, receive, send)
+                return await error_response(413, 'upload_too_large', 'Ảnh mẫu vượt giới hạn 512 MiB.')(scope, receive, send)
         except ValueError:
             return await error_response(400, 'invalid_length', 'Kích thước request không hợp lệ.')(scope, receive, send)
         size = 0
@@ -113,7 +113,7 @@ def register_frame_routes(app, get_service):
                         break
                     total += len(block)
                     if total > MAX_UPLOAD_BYTES:
-                        raise FrameError('upload_too_large', 'Ảnh mẫu vượt giới hạn 256 MiB.', 413)
+                        raise FrameError('upload_too_large', 'Ảnh mẫu vượt giới hạn 512 MiB.', 413)
                     await anyio.to_thread.run_sync(output.write, block)
             metadata = await anyio.to_thread.run_sync(read_reference_metadata, temporary, upload.filename or 'reference.tif')
             saved = service().store.save_reference(metadata)
@@ -124,7 +124,7 @@ def register_frame_routes(app, get_service):
             return error_response(exc.status, exc.code, exc.message)
         except (MultiPartException, StarletteHTTPException):
             if request.scope.get('frame_upload_too_large'):
-                return error_response(413, 'upload_too_large', 'Ảnh mẫu vượt giới hạn 256 MiB.')
+                return error_response(413, 'upload_too_large', 'Ảnh mẫu vượt giới hạn 512 MiB.')
             return error_response(400, 'invalid_multipart', 'Tệp upload không hợp lệ; chọn một GeoTIFF và thử lại.')
         except Exception:
             return error_response(422, 'upload_failed', 'Không đọc được ảnh mẫu; kiểm tra tệp và thử lại.')

@@ -76,6 +76,7 @@ class Element {
   replaceChildren(...children) { this.children = children; }
   add(child) { this.children.push(child); }
   closest() { return new Element(); }
+  setAttribute(key, value) { this[key] = value; }
   removeAttribute(key) { delete this[key]; }
   querySelectorAll() { return []; }
   set innerHTML(value) { this.children = []; this._html = value; }
@@ -219,7 +220,29 @@ test('scene and S1 GEE requests contain rectangle only; response cannot replace 
   assert.equal(f.el('result').style.display,'block'); assert.ok(f.editor.group.children.length >= 11);
   f.el('dataset').value='s1gee'; await f.el('dataset').fire('change'); await f.el('btnSearch').fire('click');
   assert.equal(f.requests[1].url,'/api/s1gee/scene'); assert.equal(f.requests[1].body.height_m,2000);
+  assert.equal(f.requests[1].body.group_by_orbit,true);
   assert.ok(!('radius_m' in f.requests[1].body));
+});
+
+test('choosing a SAR direction changes the preview, source details and download together', async () => {
+  const up = {...scene(), orbit_pass:'ASCENDING', scene_id:'up', coverage_pct:99.995,
+    preview_url:'/up.png', download_url:'/download?orbit_pass=ASCENDING'};
+  const down = {...up, orbit_pass:'DESCENDING', scene_id:'down', coverage_pct:69.01,
+    preview_url:null, download_url:'/download?orbit_pass=DESCENDING'};
+  const f = fixture(async () => response({results:[up, down]}));
+  await f.rectangle();
+  f.el('dataset').value='s1gee'; await f.el('dataset').fire('change'); await f.el('btnSearch').fire('click');
+  const [options, details] = f.el('meta').children;
+  const [ascending, descending] = options.children;
+  assert.match(ascending.textContent, /ASCENDING/);
+  assert.match(descending.textContent, /DESCENDING.*69\.01%/);
+  assert.equal(f.el('preview').src, '/up.png');
+  await descending.fire('click');
+  assert.equal(descending['aria-pressed'], 'true');
+  assert.equal(ascending['aria-pressed'], 'false');
+  assert.equal(f.el('dl').href, down.download_url);
+  assert.equal(f.el('preview').src, undefined);
+  assert.match(details.children[0].textContent, /^down/);
 });
 
 test('optical point and rectangle merge requests explicitly select RAW', async () => {

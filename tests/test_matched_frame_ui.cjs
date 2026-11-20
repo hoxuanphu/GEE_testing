@@ -369,7 +369,8 @@ test('multipart upload renders metadata and explicit footprint fit without autom
 });
 test('upload validation and structured API errors have focusable summary and linked field error', async () => {
   const f=fixture(); await f.upload('x.vrt');assert.equal(f.requests.length,0); assert.match(f.el('mfError').textContent,/GeoTIFF/);assert.equal(f.el('mfError').focused,true);
-  await f.upload('large.tif',256*1024*1024+1);assert.equal(f.requests.length,0);
+  await f.upload('large.tif',512*1024*1024+1);assert.equal(f.requests.length,0);
+  await f.upload('limit.tif',512*1024*1024);assert.equal(f.requests.length,1);
   const bad=fixture({handler:() => response({detail:{code:'invalid_crs',message:'CRS không hợp lệ. Chọn tệp khác.'}},422)});
   await bad.upload();assert.match(bad.el('mfError').textContent,/CRS không hợp lệ/);assert.equal(bad.el('mfFile').attributes['aria-invalid'],'true');assert.equal(bad.el('mfFile').value,'');
   await bad.el('mfError').children[1].fire('click');assert.equal(bad.el('mfFile').focused,true);

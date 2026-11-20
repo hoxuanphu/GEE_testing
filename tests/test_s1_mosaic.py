@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+from urllib.parse import parse_qs, urlsplit
 
 from fastapi.testclient import TestClient
 from app import main, s1_mosaic
@@ -58,7 +59,7 @@ class MosaicTests(unittest.TestCase):
         filters.listContains.assert_any_call('transmitterReceiverPolarisation', 'VV')
         filters.listContains.assert_any_call('transmitterReceiverPolarisation', 'VH')
         primary_image = base.ee_object.select.return_value.updateMask.return_value
-        candidate.blend.assert_called_with(primary_image)
+        primary_image.unmask.assert_called_with(candidate, sameFootprint=False)
         collection.limit.assert_called_once_with(24)
 
     def test_missing_orbit_metadata_refuses_unsafe_merge(self):
@@ -71,13 +72,32 @@ class MosaicTests(unittest.TestCase):
     def test_coverage_counts_uncovered_area_as_zero(self):
         image = MagicMock()
         valid = image.mask.return_value.reduce.return_value.rename.return_value
-        valid.unmask.return_value.reduceRegion.return_value.get.return_value.getInfo.return_value = .45
+        valid.unmask.return_value.gt.return_value.reduceRegion.return_value.get.return_value.getInfo.return_value = .45
         with patch.object(s1_mosaic.ee, 'Reducer'):
             self.assertEqual(s1_mosaic.coverage_pct(image, 'roi'), 45)
         valid.unmask.assert_called_once_with(0, sameFootprint=False)
 
 
 class MosaicAPITests(unittest.TestCase):
+    def test_search_exposes_each_orbit_and_pins_its_download_sources(self):
+        from dataclasses import replace
+        up = replace(scene(), scene_id='up', coverage_pct=99.9, scenes=({'scene_id': 'up'}, {'scene_id': 'fill'}))
+        down = replace(scene(), scene_id='down', coverage_pct=76, scenes=({'scene_id': 'down'},))
+        with TestClient(main.app) as client, patch.object(main, '_ensure_ee'), \
+             patch.object(main, '_resolve_selection', return_value=(MagicMock(), Bbox(106, 10, 107, 11), None)), \
+             patch.object(main, 'best_s1_scene', return_value=up), \
+             patch.object(s1_mosaic, 'search_s1_by_orbit', return_value={'ASCENDING': up, 'DESCENDING': down}), \
+             patch.object(main, 'preview_rgb', return_value=None), patch.object(s1_mosaic, 'prepare_s1', return_value=up):
+            response = client.post('/api/s1gee/scene', json=dict(lon=107, lat=11, start_date='2026-05-01',
+                                   end_date='2026-05-31', group_by_orbit=True, merge_scenes=True))
+        self.assertEqual(response.status_code, 200, response.text)
+        results = response.json()['results']
+        self.assertEqual([item['orbit_pass'] for item in results], ['ASCENDING', 'DESCENDING'])
+        for item, expected in zip(results, (['up', 'fill'], ['down'])):
+            query = parse_qs(urlsplit(item['download_url']).query)
+            self.assertEqual(query['scene_ids'], expected)
+            self.assertEqual(query['orbit_pass'], [item['orbit_pass']])
+
     def test_option_metadata_and_download_link_all_modes(self):
         from dataclasses import replace
         result = replace(scene(), scene_id='s1gee_mosaic_2026-05-01_2026-06-01',
