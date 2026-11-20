@@ -74,6 +74,31 @@ class TestDynamicWorldDownloadMask(unittest.TestCase):
         selected.unmask.assert_called_once_with(255, sameFootprint=False)
 
 
+class TestSentinelFullDownload(unittest.TestCase):
+    def test_exports_all_spectral_and_auxiliary_bands_with_nodata(self):
+        from app.geo import Bbox
+        expected = ["B2", "B3", "B4", "B8", "B11", "B12", "B1", "B5", "B6", "B7", "B8A", "B9",
+                    "AOT", "WVP", "SCL", "TCI_R", "TCI_G", "TCI_B", "MSK_CLDPRB", "MSK_SNWPRB",
+                    "QA10", "QA20", "QA60", "MSK_CLASSI_OPAQUE", "MSK_CLASSI_CIRRUS", "MSK_CLASSI_SNOW_ICE"]
+        image = mock.Mock()
+        selected = image.select.return_value
+        selected.multiply.return_value.toFloat.return_value = selected
+        selected.unmask.return_value = selected
+        with mock.patch.object(imagery, "_DownloadURL", return_value=mock.Mock()), \
+             mock.patch.object(imagery.ee.Geometry, "Rectangle", return_value=object()):
+            urls = imagery.download_geotiff(image, "sentinel2", Bbox(107, 10, 107.01, 10.01), 10)
+        self.assertEqual([band for band, _ in urls], expected)
+        self.assertEqual(image.select.call_args_list, [mock.call([band]) for band in expected])
+        self.assertEqual(selected.unmask.call_count, 26)
+        selected.unmask.assert_called_with(-9999, sameFootprint=False)
+        metadata = imagery.timeseries_source_metadata("sentinel2")
+        self.assertEqual(metadata["bands"], expected)
+        self.assertEqual(metadata["band_metadata"]["SCL"]["value_scale"], 1)
+        self.assertEqual(metadata["band_metadata"]["AOT"]["value_scale"], 0.001)
+        self.assertEqual(metadata["band_metadata"]["B1"]["export_scale"], 0.0001)
+        self.assertEqual(metadata["band_metadata"]["QA60"]["export_scale"], 1)
+
+
 class TestDynamicWorldCategoricalMerge(unittest.TestCase):
     def test_merge_preserves_water_zero_and_nodata_255(self):
         with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent.parent) as tmp:
@@ -130,6 +155,11 @@ class _FakeImage:
         self.properties.update(name if isinstance(name, dict) else {name: value})
         return self
 
+    def addBands(self, image, *args):
+        self.operations.extend(image.operations)
+        self.operations.append(("addBands", (image, *args)))
+        return self
+
     def geometry(self):
         return _FakeGeometry(self.covers)
 
@@ -152,6 +182,11 @@ class _FakeList:
 
     def getInfo(self):
         return self.values
+
+
+class _FakeString(str):
+    def cat(self, other):
+        return _FakeString(self + other)
 
 
 class _FakeCollection:
@@ -198,13 +233,19 @@ class TestTimeSeriesImagery(unittest.TestCase):
         self.ee = mock.Mock()
         self.ee.ImageCollection.side_effect = lambda name: _FakeCollection(self.images.get(name, []), self.calls)
         self.ee.Image.side_effect = lambda value: value if isinstance(value, _FakeImage) else _FakeImage(value)
+        self.ee.Image.constant.side_effect = lambda value: _FakeImage("constant")
         self.ee.Dictionary.side_effect = lambda value: value
+        self.ee.String.side_effect = _FakeString
         self.ee.Filter.eq.side_effect = lambda key, value: ("eq", key, value)
         self.ee.Filter.listContains.side_effect = lambda key, value: ("contains", key, value)
         self.ee.Geometry.Point.side_effect = lambda point: point
         self.patch = mock.patch.object(imagery, "ee", self.ee)
         self.patch.start()
         self.addCleanup(self.patch.stop)
+        metadata = mock.patch.object(imagery, '_compute_timeseries_metadata',
+                                     side_effect=lambda graph: graph.getInfo(), create=True)
+        metadata.start()
+        self.addCleanup(metadata.stop)
 
     def add(self, collection, name, timestamp="2025-01-01T12:00:00+00:00", covers=True, **properties):
         properties.update({"system:time_start": int(imagery.dt.datetime.fromisoformat(timestamp).timestamp() * 1000),
@@ -215,6 +256,40 @@ class TestTimeSeriesImagery(unittest.TestCase):
 
     def scenes(self, dataset, polarization="vvvh"):
         return imagery.list_timeseries_scenes(dataset, 107, 10, "2025-01-01", "2025-01-03", polarization)
+
+    def test_listing_all_sources_never_processes_pixels(self):
+        for dataset, collection in [('sentinel2', imagery.S2_COLLECTION),
+                                    ('landsat', imagery.L8_COLLECTION),
+                                    ('nicfi', imagery.NICFI_COLLECTION),
+                                    ('dynamic_world', imagery.DYNAMIC_WORLD_COLLECTION),
+                                    ('s1gee', imagery.S1_COLLECTION)]:
+            with self.subTest(dataset=dataset):
+                self.images = {}
+                image = self.add(collection, 'metadata-only', instrumentMode='IW',
+                                 transmitterReceiverPolarisation=['VV', 'VH'])
+                rows = self.scenes(dataset)
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(image.operations, [], 'Listing metadata must not transform pixels')
+
+    def test_relative_native_ids_become_loadable_full_ids_before_collection_merge(self):
+        for dataset, collections in [
+            ('sentinel2', [imagery.S2_COLLECTION]),
+            ('landsat', [imagery.L8_COLLECTION, imagery.L9_COLLECTION]),
+            ('dynamic_world', [imagery.DYNAMIC_WORLD_COLLECTION]),
+            ('nicfi', [imagery.NICFI_COLLECTION]),
+            ('s1gee', [imagery.S1_COLLECTION]),
+        ]:
+            with self.subTest(dataset=dataset):
+                self.images = {}
+                for collection in collections:
+                    image = self.add(collection, 'same-index', instrumentMode='IW',
+                                     transmitterReceiverPolarisation=['VV', 'VH'])
+                    image.id = lambda: 'same-index'
+                rows = self.scenes(dataset)
+                self.assertEqual([row['asset_id'] for row in rows],
+                                 [collection + '/same-index' for collection in collections])
+                for row in rows:
+                    imagery.load_timeseries_scene(row['asset_id'], dataset)
 
     def test_optical_clouds_full_ids_sorting_dedup_and_center(self):
         for collection, dataset, cloud_key in [
@@ -255,6 +330,23 @@ class TestTimeSeriesImagery(unittest.TestCase):
         self.assertEqual(rows[1]["timestamp"], "2025-01-01T12:00:00.001000Z")
         self.assertEqual(rows[0]["cloud_pct"], 0.0)
         self.assertIsNone(rows[1]["cloud_pct"])
+
+    def test_platform_filtered_before_enumeration_and_absent_does_not_broaden(self):
+        for code in 'AC':
+            self.add(imagery.S2_COLLECTION, 'scene_' + code, SPACECRAFT_NAME='Sentinel-2' + code,
+                     CLOUDY_PIXEL_PERCENTAGE=0)
+        with mock.patch('app.platforms.ee.Filter.eq', side_effect=lambda key, value: ('eq', key, value)):
+            rows = imagery.list_timeseries_scenes('sentinel2', 107, 10,
+                '2025-01-01', '2025-01-03', platform='C')
+            self.assertEqual([row['source_metadata']['SPACECRAFT_NAME'] for row in rows], ['Sentinel-2C'])
+            self.assertEqual(imagery.list_timeseries_scenes('sentinel2', 107, 10,
+                '2025-01-01', '2025-01-03', platform='B'), [])
+        self.assertIn(('filter', ('eq', 'SPACECRAFT_NAME', 'Sentinel-2C')), self.calls)
+        self.ee.ImageCollection.reset_mock()
+        with self.assertRaises(ValueError):
+            imagery.list_timeseries_scenes('sentinel2', 107, 10,
+                '2025-01-01', '2025-01-03', platform='D')
+        self.ee.ImageCollection.assert_not_called()
 
     def test_errors_are_not_silently_treated_as_empty_results(self):
         self.ee.ImageCollection.side_effect = RuntimeError("collection unavailable")
@@ -302,8 +394,7 @@ class TestTimeSeriesImagery(unittest.TestCase):
                 self.assertEqual(rows[0]["source_metadata"]["orbitProperties_pass"], "ASCENDING")
                 self.assertIsNone(rows[0]["cloud_pct"])
                 for image in self.images[imagery.S1_COLLECTION][:2]:
-                    self.assertIn(("clamp", (-30.0, 10.0)), image.operations)
-                    self.assertNotIn("log10", [op[0] for op in image.operations])
+                    self.assertEqual(image.operations, [], 'SAR listing must not clamp pixels')
                 for band in bands:
                     self.assertIn(("filter", ("contains", "transmitterReceiverPolarisation", band)), self.calls)
 
@@ -320,15 +411,20 @@ class TestTimeSeriesImagery(unittest.TestCase):
             with self.subTest(dataset=dataset, collection=collection):
                 asset_id = collection + "/exact-scene"
                 image = imagery.load_timeseries_scene(asset_id, dataset)
-                self.ee.Image.assert_called_with(asset_id)
+                self.ee.Image.assert_any_call(asset_id)
+                self.assertEqual([call.args[0] for call in self.ee.Image.call_args_list
+                                  if isinstance(call.args[0], str)][-1], asset_id)
                 self.assertIn(operation, image.operations)
                 self.assertIn(("select", (imagery.timeseries_source_metadata(dataset)["bands"],)), image.operations)
-                self.assertFalse({"log10", "updateMask", "mosaic", "median"} & {op[0] for op in image.operations})
+                forbidden = {"log10", "mosaic", "median"}
+                if dataset != "sentinel2":
+                    forbidden.add("updateMask")
+                self.assertFalse(forbidden & {op[0] for op in image.operations})
         self.ee.ImageCollection.assert_not_called()
 
     def test_source_metadata_scales_bands_and_polarizations(self):
         for dataset, scale, factor, count in [
-            ("sentinel2", 10, 0.0001, 6), ("landsat", 30, 0.0000275, 6),
+            ("sentinel2", 10, 0.0001, 26), ("landsat", 30, 0.0000275, 6),
             ("nicfi", 4.77, 0.0001, 4), ("dynamic_world", 10, 1, 1),
         ]:
             metadata = imagery.timeseries_source_metadata(dataset)

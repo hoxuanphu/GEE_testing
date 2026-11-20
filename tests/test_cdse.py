@@ -71,6 +71,60 @@ def _resp(payload: dict) -> mock.Mock:
     return resp
 
 
+class TestS3Credentials(unittest.TestCase):
+    def setUp(self):
+        self.env = mock.patch.dict(cdse.os.environ, {}, clear=True)
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        self.ensure = mock.patch.object(cdse, "_ensure_env")
+        self.ensure.start()
+        self.addCleanup(self.ensure.stop)
+        cdse._reset_s3_creds_cache()
+        self.addCleanup(cdse._reset_s3_creds_cache)
+
+    def test_uses_local_keys_without_auth_or_key_management(self):
+        cdse.os.environ.update(Access_Key_S3=" access ", Secret_Key_S3=" secret ")
+        with mock.patch.object(cdse, "get_token") as token, \
+                mock.patch.object(cdse.requests, "post") as post, \
+                mock.patch.object(cdse.requests, "delete") as delete:
+            self.assertEqual(cdse.get_s3_credentials(), ("access", "secret"))
+            cdse.os.environ["Secret_Key_S3"] = "updated"
+            self.assertEqual(cdse.get_s3_credentials(), ("access", "secret"))
+            self.assertEqual(cdse.get_s3_credentials(force_new=True), ("access", "updated"))
+        token.assert_not_called()
+        post.assert_not_called()
+        delete.assert_not_called()
+
+    def test_missing_or_partial_keys_never_fall_back_to_password(self):
+        for values in ({}, {"Access_Key_S3": "access"}, {"Secret_Key_S3": "secret"}):
+            with self.subTest(names=list(values)), \
+                    mock.patch.dict(cdse.os.environ, values, clear=True), \
+                    mock.patch.object(cdse, "get_token") as token:
+                with self.assertRaisesRegex(RuntimeError, "S3 credentials missing"):
+                    cdse.get_s3_credentials()
+                token.assert_not_called()
+
+    def test_download_403_fails_without_retries_or_key_management(self):
+        response = mock.Mock(status_code=403, text="AccessDenied")
+        with mock.patch.object(cdse.requests, "get", return_value=response) as get, \
+                mock.patch.object(cdse, "get_s3_credentials") as credentials:
+            with self.assertRaisesRegex(RuntimeError, "S3 access denied"):
+                list(cdse.iter_s3_object("example/data.tiff", ("access", "secret"), 10))
+        get.assert_called_once()
+        response.close.assert_called_once()
+        credentials.assert_not_called()
+
+    def test_listing_403_never_recreates_keys(self):
+        response = mock.Mock(status_code=403)
+        error = cdse.requests.HTTPError(response=response)
+        with mock.patch.object(cdse, "_s3_list_product_files", side_effect=error) as listing, \
+                mock.patch.object(cdse, "get_s3_credentials") as credentials:
+            with self.assertRaises(cdse.requests.HTTPError):
+                cdse.s3_list_product_files("product", ("access", "secret"))
+        listing.assert_called_once()
+        credentials.assert_not_called()
+
+
 class TestParseIsoUtc(unittest.TestCase):
     def test_full_timestamp(self):
         ts = cdse._parse_iso_utc("2026-01-05T01:30:02.178000Z")

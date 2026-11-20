@@ -34,6 +34,35 @@ class TestEsriAPI(unittest.TestCase):
         self.service.start.side_effect = ValueError('too large')
         self.assertEqual(self.client.post('/api/esri/jobs', json={'commune_id': '1'}).status_code, 400)
 
+    def test_point_contract_and_rotation_validation(self):
+        point = dict(lon=105, lat=21, radius_m=500, rotation_deg=45)
+        self.service.start.return_value = {
+            'job_id': 'rotated', 'status': 'queued', 'rotation_deg': 45,
+            'roi_geometry': {'type': 'Polygon', 'coordinates': []}, 'output_grid': {'width': 10}}
+        with patch.object(main, '_ensure_ee', side_effect=AssertionError('No GEE')):
+            response = self.client.post('/api/esri/jobs', json=point)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.service.start.call_args.args[0].rotation_deg, 45)
+        self.assertEqual(response.json()['rotation_deg'], 45)
+        self.assertIn('roi_geometry', response.json())
+        self.assertIn('output_grid', response.json())
+        for angle in (0,360):
+            self.assertEqual(self.client.post('/api/esri/jobs', json={**point, 'rotation_deg': angle}).status_code, 200)
+            self.assertEqual(self.service.start.call_args.args[0].rotation_deg, 0)
+        invalid = [{**point, 'bbox': [104,20,106,22]}, {**point, 'commune_id': '001'},
+                   {key: value for key,value in point.items() if key != 'lat'},
+                   {**point, 'radius_m': 0}, {**point, 'radius_m': 45001},
+                   {**point, 'rotation_deg': -1}, {**point, 'rotation_deg': 361},
+                   {**point, 'rotation_deg': 'NaN'}, {**point, 'rotation_deg': 'Infinity'},
+                   {**point, 'lon': 'NaN'}, {**point, 'lat': 'Infinity'},
+                   {**point, 'lon': 180}, {**point, 'lat': 86},
+                   {'bbox': [104,20,106,22], 'rotation_deg': 45},
+                   {'commune_id': '001', 'rotation_deg': 45}]
+        before = self.service.start.call_count
+        for body in invalid:
+            self.assertEqual(self.client.post('/api/esri/jobs', json=body).status_code, 422, body)
+        self.assertEqual(self.service.start.call_count, before)
+
     def test_lifespan_recovers_and_shuts_down(self):
         self.service._closed = False
         with TestClient(main.app):

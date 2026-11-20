@@ -1,7 +1,12 @@
 """Bounded, resumable Esri World Imagery downloads (no Earth Engine initialization).
 
 Limits: 20,000 requested tiles, 500 million bounding-raster pixels, 8 workers.
-Disk reservations conservatively allow 5 bytes/output pixel + 2 MB/requested tile,
+Rectangle requests require selection_mode='rectangle' and center_lon/center_lat/
+width_m/height_m. They always use a local-metre rectangular grid, even at 0 degrees,
+with the same zoom-derived ground sampling as rotated points and a source halo.
+Legacy point/bbox/commune requests do not require selection_mode.
+Disk reservations allow 5 bytes/source pixel, 17 bytes/local-grid output pixel
+(float RGB plus mask/overhead), and 2 MB/requested tile,
 with 256 MiB free-space reserve, 6 GiB/download and 12 GiB/service storage caps.
 These additional budgets may reject requests below the tile/pixel ceilings.
 No automatic deletion: operators explicitly remove old owned job/cache folders.
@@ -25,7 +30,7 @@ from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import rasterio
@@ -34,7 +39,7 @@ from PIL import Image
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from rasterio.features import rasterize
 from rasterio.transform import from_origin
-from rasterio.warp import transform_geom
+from rasterio.warp import transform as transform_coords, transform_geom
 from rasterio.windows import Window, transform as window_transform
 
 TILE_SIZE = 256
@@ -51,11 +56,18 @@ def _disk_usage(root):
     return sum(p.stat().st_size for p in Path(root).rglob('*') if p.is_file())
 
 
+def _raster_bytes(plan):
+    estimate = plan.width * plan.height * 5
+    if plan.output_grid is not None:
+        estimate += plan.output_grid['width'] * plan.output_grid['height'] * 17
+    return estimate
+
+
 def _check_disk(plan, root, budget=MAX_JOB_DISK):
     # RGB + internal mask, TIFF block overhead, and maximum verified JPEG bytes.
-    estimate = plan.width * plan.height * 5 + len(plan.tiles) * MAX_TILE_BYTES
+    estimate = _raster_bytes(plan) + len(plan.tiles) * MAX_TILE_BYTES
     existing = _disk_usage(root)
-    if existing + estimate > budget:
+    if estimate > MAX_JOB_DISK or existing + estimate > budget:
         raise ValueError('Disk budget exceeded; reduce area/zoom or remove owned job/cache files')
     if shutil.disk_usage(root).free < estimate + DISK_RESERVE:
         raise ValueError('Insufficient free disk space for imagery and cache')
@@ -74,16 +86,48 @@ class CancelledError(RuntimeError):
 
 class EsriRequest(BaseModel):
     model_config = ConfigDict(extra='forbid')
+    selection_mode: Literal['point', 'bbox', 'commune', 'rectangle'] | None = None
+    center_lon: float | None = Field(default=None, allow_inf_nan=False)
+    center_lat: float | None = Field(default=None, allow_inf_nan=False)
+    width_m: float | None = Field(default=None, allow_inf_nan=False)
+    height_m: float | None = Field(default=None, allow_inf_nan=False)
     bbox: list[float] | None = None
     commune_id: str | None = None
+    lon: float | None = None
+    lat: float | None = None
+    radius_m: float | None = Field(default=None, gt=0, le=45000, allow_inf_nan=False)
+    rotation_deg: float = Field(default=0, ge=0, le=360, allow_inf_nan=False)
     zoom: int = Field(default=18, ge=1, le=19)
     workers: int = Field(default=4, ge=1, le=8)
     max_tiles: int = Field(default=4000, ge=1, le=20000)
 
     @model_validator(mode='after')
     def validate_area(self):
-        if (self.bbox is None) == (self.commune_id is None):
-            raise ValueError('Specify exactly one of bbox or commune_id')
+        point = any(v is not None for v in (self.lon, self.lat, self.radius_m))
+        rectangle = self.selection_mode == 'rectangle'
+        rectangle_values = (self.center_lon, self.center_lat, self.width_m, self.height_m)
+        if not rectangle and any(v is not None for v in rectangle_values):
+            raise ValueError('Rectangle fields require selection_mode=rectangle')
+        if sum((point, rectangle, self.bbox is not None, self.commune_id is not None)) != 1:
+            raise ValueError('Specify exactly one of point (lon/lat/radius_m), rectangle, bbox or commune_id')
+        mode = 'rectangle' if rectangle else 'point' if point else 'bbox' if self.bbox is not None else 'commune'
+        if self.selection_mode is not None and self.selection_mode != mode:
+            raise ValueError('selection_mode does not match the supplied area')
+        self.rotation_deg %= 360
+        if rectangle:
+            if any(v is None for v in rectangle_values):
+                raise ValueError('Rectangle requires center_lon, center_lat, width_m and height_m')
+            from .geo import RectangleROI
+            RectangleROI(center_lon=self.center_lon, center_lat=self.center_lat,
+                         width_m=self.width_m, height_m=self.height_m,
+                         rotation_deg=self.rotation_deg)
+        elif point:
+            if any(v is None for v in (self.lon, self.lat, self.radius_m)):
+                raise ValueError('Point requires lon, lat and radius_m')
+            from .geo import point_roi
+            point_roi(self.lon, self.lat, self.radius_m, self.rotation_deg)
+        elif self.rotation_deg:
+            raise ValueError('rotation_deg is only supported for point or rectangle selections')
         if self.bbox is not None:
             validate_bbox(self.bbox)
         if self.commune_id is not None and not self.commune_id.strip():
@@ -139,17 +183,25 @@ class Plan:
     geometry: dict
     tiles: list[tuple[int, int]]
     transform: Any
+    bbox: list[float] | None = None
+    roi_geometry: dict | None = None
+    output_grid: dict | None = None
+    source_halo: bool = False
+    rotation_deg: float = 0
 
     def window(self, x, y):
         return Window((x-self.x0)*256, (y-self.y0)*256, 256, 256)
 
     def mask(self, x, y):
+        if self.source_halo:
+            return np.full((256, 256), 255, dtype='uint8')
         return rasterize([(self.geometry, 255)], out_shape=(256, 256),
                          transform=window_transform(self.window(x, y), self.transform),
                          fill=0, dtype='uint8')
 
 
-def make_plan(bbox, zoom=18, max_tiles=4000, geometry=None, pad=0, workers=4):
+def make_plan(bbox, zoom=18, max_tiles=4000, geometry=None, pad=0, workers=4,
+              source_halo=False):
     validate_bbox(bbox)
     if not isinstance(zoom, int) or not 1 <= zoom <= 19:
         raise ValueError('zoom must be 1..19')
@@ -182,7 +234,8 @@ def make_plan(bbox, zoom=18, max_tiles=4000, geometry=None, pad=0, workers=4):
     res = 2 * ORIGIN_SHIFT / (2 ** zoom * 256)
     plan = Plan(zoom, x0, y0, width, height,
                 transform_geom('EPSG:4326', 'EPSG:3857', geometry), [],
-                from_origin(tile_x_to_merc(x0, zoom), tile_y_to_merc(y0, zoom), res, res))
+                from_origin(tile_x_to_merc(x0, zoom), tile_y_to_merc(y0, zoom), res, res),
+                bbox=list(bbox), roi_geometry=geometry, source_halo=source_halo)
     for y in range(y0, y1+1):
         for x in range(x0, x1+1):
             if plan.mask(x, y).any():
@@ -194,7 +247,61 @@ def make_plan(bbox, zoom=18, max_tiles=4000, geometry=None, pad=0, workers=4):
     return plan
 
 
-def request_plan(body):
+def _local_pixel_scale(plan, lon, lat):
+    # Match the existing rotated-point sampling in local metres, not Mercator metres.
+    cx, cy = transform_coords('EPSG:4326', 'EPSG:3857', [lon], [lat])
+    half = plan.transform.a / 2
+    lons, _ = transform_coords('EPSG:3857', 'EPSG:4326',
+                               [cx[0]-half, cx[0]+half], [cy[0], cy[0]])
+    delta_lon = (lons[1]-lons[0]+180) % 360 - 180
+    return abs(delta_lon) * 111320 * math.cos(math.radians(lat))
+
+
+def request_plan(body, snapshot=None):
+    rectangle = body.selection_mode == 'rectangle'
+    local_grid = rectangle or bool(body.rotation_deg)
+    if snapshot is not None:
+        plan = make_plan(snapshot['bbox'], body.zoom, body.max_tiles,
+                         snapshot['roi_geometry'], pad=1 if local_grid else 0,
+                         workers=body.workers, source_halo=local_grid)
+        plan.rotation_deg = body.rotation_deg
+        plan.output_grid = snapshot.get('output_grid')
+        if plan.output_grid is not None:
+            grid = plan.output_grid
+            if grid['width'] * grid['height'] > MAX_PIXELS:
+                raise ValueError(f'Output exceeds {MAX_PIXELS} raster pixels; reduce zoom/area')
+        return plan
+    if rectangle:
+        from .geo import RectangleROI
+        roi = RectangleROI(center_lon=body.center_lon, center_lat=body.center_lat,
+                           width_m=body.width_m, height_m=body.height_m,
+                           rotation_deg=body.rotation_deg)
+        geometry, b = roi.model_geometry()
+        plan = make_plan([b.west, b.south, b.east, b.north], body.zoom, body.max_tiles,
+                         geometry, pad=1, workers=body.workers, source_halo=True)
+        grid = roi.output_grid(_local_pixel_scale(plan, roi.center_lon, roi.center_lat))
+        if grid['width'] * grid['height'] > MAX_PIXELS:
+            raise ValueError(f'Output exceeds {MAX_PIXELS} raster pixels; reduce zoom/area')
+        plan.output_grid = grid
+        plan.rotation_deg = roi.rotation_deg
+        return plan
+    if body.lon is not None:
+        from .geo import point_roi
+        from .raster_grid import build_rotated_grid
+        geometry, b = point_roi(body.lon, body.lat, body.radius_m, body.rotation_deg)
+        bbox = [b.west, b.south, b.east, b.north]
+        plan = make_plan(bbox, body.zoom, body.max_tiles, geometry,
+                         pad=1 if body.rotation_deg else 0, workers=body.workers,
+                         source_halo=bool(body.rotation_deg))
+        plan.rotation_deg = body.rotation_deg
+        if body.rotation_deg:
+            scale = _local_pixel_scale(plan, body.lon, body.lat)
+            grid = build_rotated_grid(body.lon, body.lat, body.radius_m,
+                                      body.rotation_deg, scale)
+            if grid['width'] * grid['height'] > MAX_PIXELS:
+                raise ValueError(f'Output exceeds {MAX_PIXELS} raster pixels; reduce zoom/area')
+            plan.output_grid = grid
+        return plan
     if body.commune_id is not None:
         from .commune_boundaries import get_commune
         commune = get_commune(body.commune_id)
@@ -283,6 +390,41 @@ def _tile(plan, x, y, cache, cancel):
 
 
 def download(plan, output, cache, workers=4, cancel=None, progress=None, overwrite=False):
+    """Publish only a complete final grid; keep halo imagery uncut until warping."""
+    if plan.output_grid is None:
+        return _download_source(plan, output, cache, workers, cancel, progress, overwrite)
+    from .raster_grid import warp_to_grid
+    output, cache = Path(output), Path(cache)
+    if output.exists() and not overwrite:
+        raise FileExistsError(f'{output} exists; use --overwrite')
+    cancel = cancel or threading.Event()
+    token = uuid.uuid4().hex
+    source = output.with_name(output.name + '.' + token + '.source.part')
+    final = output.with_name(output.name + '.' + token + '.rotated.part')
+    try:
+        stats = _download_source(plan, source, cache, workers, cancel, progress)
+        if cancel.is_set():
+            raise CancelledError('Download cancelled')
+        warp_to_grid(source, final, plan.output_grid)
+        with rasterio.open(final, 'r+') as dst:
+            dst.update_tags(roi_geometry=json.dumps(plan.roi_geometry),
+                            bbox=json.dumps(plan.bbox), rotation_deg=str(plan.rotation_deg),
+                            output_grid=json.dumps(plan.output_grid))
+        if cancel.is_set():
+            raise CancelledError('Download cancelled')
+        if overwrite:
+            os.replace(final, output)
+        else:
+            os.link(final, output)
+            final.unlink()
+        return stats
+    finally:
+        for path in (source, final):
+            path.unlink(missing_ok=True)
+            Path(str(path) + '.msk').unlink(missing_ok=True)
+
+
+def _download_source(plan, output, cache, workers=4, cancel=None, progress=None, overwrite=False):
     """Publish a masked TIFF atomically. Reuse only fully decoded cached JPEGs."""
     if not isinstance(workers, int) or not 1 <= workers <= 8:
         raise ValueError('workers must be 1..8')
@@ -292,7 +434,7 @@ def download(plan, output, cache, workers=4, cancel=None, progress=None, overwri
     output.parent.mkdir(parents=True, exist_ok=True)
     cache.mkdir(parents=True, exist_ok=True)
     _check_disk(plan, cache)
-    output_estimate = plan.width * plan.height * 5 + DISK_RESERVE
+    output_estimate = _raster_bytes(plan) + DISK_RESERVE
     if shutil.disk_usage(output.parent).free < output_estimate:
         raise ValueError('Insufficient free disk space for output')
     cancel = cancel or threading.Event()
@@ -425,6 +567,9 @@ class EsriService:
                        progress=dict(processed=0, total=len(plan.tiles), succeeded=0, failed=0, cached=0),
                        error=None, attribution=ATTRIBUTION, source=TILE_URL,
                        acquisition_date=None, native_resolution=None)
+            if body.lon is not None or body.selection_mode == 'rectangle':
+                job.update(bbox=plan.bbox, roi_geometry=plan.roi_geometry,
+                           rotation_deg=plan.rotation_deg, output_grid=plan.output_grid)
             self._jobs[job_id] = job
             self._launch(job, plan)
             return self.get(job_id)
@@ -443,11 +588,9 @@ class EsriService:
         def progress(stats):
             with self._lock:
                 job['progress'] = stats
-                self._save(job)
         try:
             with self._lock:
                 job['status'] = 'running'
-                self._save(job)
             stats = download(plan, folder / 'imagery.tif', folder / 'cache',
                              workers=job['request']['workers'], cancel=cancel,
                              progress=progress, overwrite=True)
@@ -484,7 +627,8 @@ class EsriService:
                 return None
             if job['status'] == 'completed':
                 return self.get(job_id)
-            plan = request_plan(EsriRequest(**job['request']))
+            snapshot = job if job.get('roi_geometry') is not None else None
+            plan = request_plan(EsriRequest(**job['request']), snapshot=snapshot)
             _check_disk(plan, self.root, MAX_SERVICE_DISK)
             self._launch(job, plan)
             return self.get(job_id)

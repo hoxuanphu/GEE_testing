@@ -180,6 +180,178 @@ class EsriTests(unittest.TestCase):
                 self.service().start(esri.EsriRequest(commune_id='missing'))
         self.assertFalse(Session.calls)
 
+    def test_point_validation_and_legacy_zero_grid(self):
+        point = dict(lon=105, lat=21, radius_m=500, zoom=14)
+        for angle in (0, 360):
+            body = esri.EsriRequest(**point, rotation_deg=angle)
+            plan = esri.request_plan(body)
+            legacy = esri.make_plan(plan.bbox, zoom=14)
+            self.assertIsNone(plan.output_grid)
+            self.assertFalse(plan.source_halo)
+            self.assertEqual(plan.tiles, legacy.tiles)
+            self.assertEqual(plan.transform, legacy.transform)
+            for tile in plan.tiles:
+                np.testing.assert_array_equal(plan.mask(*tile), legacy.mask(*tile))
+        invalid = [dict(lon=105), dict(lon=105, lat=21),
+                   dict(lon=105, lat=21, radius_m=0),
+                   dict(lon=105, lat=21, radius_m=45001),
+                   {**point, 'bbox': [104,20,106,22]}, {**point, 'commune_id': '001'},
+                   {**point, 'lon': float('nan')}, {**point, 'lat': float('inf')},
+                   {**point, 'lon': 180}, {**point, 'lat': 85.05112878},
+                   *[{**point, 'rotation_deg': angle} for angle in (-1,361,float('nan'),float('inf'))],
+                   dict(bbox=[104,20,106,22], rotation_deg=1),
+                   dict(commune_id='001', rotation_deg=45)]
+        for kwargs in invalid:
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                esri.EsriRequest(**kwargs)
+        self.assertFalse(Session.calls)
+
+    def test_rotated_point_halo_local_scale_and_full_valid_grid(self):
+        from affine import Affine
+        from app.geo import point_roi
+        from rasterio.warp import transform
+        for angle in (1,30,45,90,180,270,359):
+            with self.subTest(angle=angle):
+                body = esri.EsriRequest(lon=105, lat=60, radius_m=400,
+                                        rotation_deg=angle, zoom=14)
+                plan = esri.request_plan(body)
+                grid = plan.output_grid
+                scale = plan.transform.a * (111320 / (esri.ORIGIN_SHIFT / 180)) * .5
+                self.assertEqual(grid['width'], math.ceil(800/scale))
+                self.assertEqual(grid['height'], grid['width'])
+                self.assertEqual(len(plan.tiles), plan.width*plan.height//256**2)
+                self.assertTrue(all(np.all(plan.mask(*tile) == 255) for tile in plan.tiles))
+                output = self.root / f'rotated-{angle}.tif'
+                esri.download(plan, output, self.root / f'cache-{angle}')
+                with rasterio.open(output) as src:
+                    self.assertEqual(src.shape, (grid['height'], grid['width']))
+                    self.assertEqual(src.transform, Affine(*grid['transform']))
+                    self.assertTrue(np.all(src.dataset_mask() == 255))
+                    np.testing.assert_allclose(src.read(), 80)
+                    self.assertEqual(float(src.tags()['rotation_deg']), angle)
+                    self.assertEqual(json.loads(src.tags()['output_grid']), grid)
+                    corners = [src.transform * p for p in ((0,0),(src.width,0),
+                                                          (src.width,src.height),(0,src.height))]
+                    xs, ys = transform(src.crs, 'EPSG:4326', *zip(*corners))
+                    geometry, _ = point_roi(105,60,400,angle)
+                    vertices = geometry['coordinates'][0][:-1]
+                    for x,y in zip(xs,ys):
+                        self.assertLess(min(math.hypot(x-v[0],y-v[1]) for v in vertices), 1e-7)
+        self.assertFalse(list(self.root.rglob('*.part')))
+
+    def test_rotated_zero_values_and_real_missing_tiles(self):
+        body = esri.EsriRequest(lon=0, lat=1, radius_m=4000, rotation_deg=45, zoom=14)
+        plan = esri.request_plan(body)
+        output = self.root / 'zero.tif'
+        Session.responder = lambda url: Response(data=jpeg((0,0,0)))
+        esri.download(plan, output, self.root / 'zero-cache')
+        with rasterio.open(output) as src:
+            self.assertTrue(np.all(src.dataset_mask() == 255))
+            self.assertTrue(np.all(src.read() == 0))
+        Session.responder = lambda url: Response(blank=True) if int(url.split('/')[-1]) >= 8192 else Response()
+        stats = esri.download(plan, self.root / 'missing.tif', self.root / 'missing-cache')
+        self.assertGreater(stats['failed'], 0)
+        with rasterio.open(self.root / 'missing.tif') as src:
+            self.assertTrue((src.dataset_mask() == 0).any())
+            self.assertTrue((src.dataset_mask() == 255).any())
+
+    def test_rotated_resources_checked_before_job_creation(self):
+        body = esri.EsriRequest(lon=105, lat=21, radius_m=400, rotation_deg=45, zoom=14)
+        plan = esri.request_plan(body)
+        self.assertEqual(esri._raster_bytes(plan), plan.width*plan.height*5 +
+                         plan.output_grid['width']*plan.output_grid['height']*17)
+        service = self.service()
+        for limit, message in [('MAX_PIXELS', 'pixels'), ('MAX_JOB_DISK', 'budget')]:
+            with patch.object(esri, limit, 1), self.assertRaisesRegex(ValueError, message):
+                service.start(body)
+            self.assertEqual(list(service.root.iterdir()), [])
+        with self.assertRaisesRegex(ValueError, 'tiles'):
+            esri.request_plan(body.model_copy(update={'max_tiles': 1}))
+        with patch('app.raster_grid.build_rotated_grid', return_value={
+                **plan.output_grid, 'width': esri.MAX_PIXELS, 'height': 2}):
+            with self.assertRaisesRegex(ValueError, 'pixels'):
+                service.start(body)
+        self.assertEqual(list(service.root.iterdir()), [])
+        self.assertFalse(Session.calls)
+
+    def test_rotated_cancellation_before_atomic_publish(self):
+        from app import raster_grid
+        plan = esri.request_plan(esri.EsriRequest(lon=105, lat=21, radius_m=400,
+                                                 rotation_deg=45, zoom=14))
+        output = self.root / 'cancelled.tif'
+        output.write_bytes(b'previous completed raster')
+        cancel = threading.Event()
+        original = raster_grid.warp_to_grid
+        def cancelled_warp(*args, **kwargs):
+            original(*args, **kwargs)
+            cancel.set()
+        with patch.object(raster_grid, 'warp_to_grid', side_effect=cancelled_warp):
+            with self.assertRaises(esri.CancelledError):
+                esri.download(plan, output, self.root / 'cancel-cache', cancel=cancel, overwrite=True)
+        self.assertEqual(output.read_bytes(), b'previous completed raster')
+        self.assertFalse(list(self.root.rglob('*.part')))
+        self.assertFalse(list(self.root.rglob('*.msk')))
+
+    def test_rotated_snapshot_resume_and_atomic_failure(self):
+        from app import raster_grid
+        body = esri.EsriRequest(lon=105, lat=21, radius_m=400, rotation_deg=45, zoom=14)
+        service = self.service()
+        with patch.object(raster_grid, 'warp_to_grid', side_effect=RuntimeError('warp failed')):
+            job_id = service.start(body)['job_id']
+            failed = self.finish(service, job_id)
+        self.assertEqual(failed['status'], 'failed')
+        self.assertIsNone(service.download_path(job_id))
+        self.assertFalse(list(self.root.rglob('*.part')))
+        original = json.loads((service.root/job_id/'job.json').read_text())
+        body.rotation_deg = 90
+        service.shutdown()
+        recovered = self.service()
+        with patch.object(raster_grid, 'build_rotated_grid', side_effect=AssertionError('snapshot grid required')):
+            recovered.resume(job_id)
+            done = self.finish(recovered, job_id)
+        self.assertEqual(done['status'], 'completed')
+        self.assertEqual(done['request']['rotation_deg'], 45)
+        self.assertEqual(done['output_grid'], original['output_grid'])
+        self.assertEqual(done['roi_geometry'], original['roi_geometry'])
+        self.assertEqual(done['bbox'], original['bbox'])
+        self.assertEqual(done['progress']['cached'], done['progress']['total'])
+        with rasterio.open(recovered.download_path(job_id)) as src:
+            self.assertEqual(json.loads(src.tags()['output_grid']), original['output_grid'])
+        self.assertFalse(list(self.root.rglob('*.part')))
+
+    def test_progress_stays_in_memory_until_job_finishes(self):
+        service = self.service()
+        progress_seen = threading.Event()
+        release = threading.Event()
+        stats = dict(processed=1, total=2, succeeded=1, failed=0, cached=0)
+
+        def fake_download(plan, output, cache, **kwargs):
+            kwargs['progress'](stats)
+            progress_seen.set()
+            if not release.wait(5):
+                raise RuntimeError('Test timed out')
+            return {**stats, 'processed': 2, 'succeeded': 2}
+
+        with patch.object(esri, 'download', side_effect=fake_download), \
+                patch.object(service, '_save', wraps=service._save) as save:
+            job_id = service.start(esri.EsriRequest(bbox=[-1,1,1,5], zoom=3))['job_id']
+            try:
+                self.assertTrue(progress_seen.wait(5))
+                self.assertEqual(service.get(job_id)['progress'], stats)
+                self.assertEqual(service.get(job_id)['status'], 'running')
+                self.assertEqual(save.call_count, 1)
+                state = json.loads((service.root / job_id / 'job.json').read_text(encoding='utf-8'))
+                self.assertEqual(state['status'], 'queued')
+                self.assertEqual(state['progress']['processed'], 0)
+            finally:
+                release.set()
+            done = self.finish(service, job_id)
+            self.assertEqual(done['status'], 'completed')
+            self.assertEqual(save.call_count, 2)
+            state = json.loads((service.root / job_id / 'job.json').read_text(encoding='utf-8'))
+            self.assertEqual(state['status'], 'completed')
+            self.assertEqual(state['progress'], done['progress'])
+
     def test_service_persistence_partial_resume(self):
         service = self.service()
         Session.responder = lambda url: Response(blank=True) if url.endswith('/4') else Response()
@@ -201,6 +373,27 @@ class EsriTests(unittest.TestCase):
         self.assertIsNone(recovered.get('../unsafe'))
         self.assertIsNone(recovered.download_path('../unsafe'))
         self.assertEqual(json.loads((self.root/'jobs'/job_id/'job.json').read_text())['status'], 'completed')
+
+    def test_legacy_snapshot_without_point_fields_resumes(self):
+        service = self.service()
+        job_id = service.start(esri.EsriRequest(bbox=[1,1,2,2], zoom=3))['job_id']
+        self.assertEqual(self.finish(service, job_id)['status'], 'completed')
+        service.shutdown()
+        path = service.root/job_id/'job.json'
+        state = json.loads(path.read_text())
+        state['status'] = 'interrupted'
+        for field in ('lon', 'lat', 'radius_m', 'rotation_deg'):
+            state['request'].pop(field, None)
+        path.write_text(json.dumps(state))
+        recovered = self.service()
+        recovered.resume(job_id)
+        done = self.finish(recovered, job_id)
+        self.assertEqual(done['status'], 'completed')
+        self.assertEqual(done['progress']['cached'], done['progress']['total'])
+        with rasterio.open(recovered.download_path(job_id)) as src:
+            self.assertEqual(src.crs.to_epsg(), 3857)
+            self.assertEqual(src.transform.b, 0)
+            self.assertEqual(src.transform.d, 0)
 
     def test_busy_cancel_stale_output_and_shutdown(self):
         entered, release = threading.Event(), threading.Event()
