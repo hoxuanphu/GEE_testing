@@ -79,16 +79,17 @@ function fixture({handler, saved, blocked = false, legacy = false} = {}) {
   }
   el('selection_mode').value=legacy ? 'point' : 'reference';
   el('start_date').value='2026-10-01'; el('end_date').value='2026-10-22';
-  const doc=Object.assign(new Element(), {hidden:false, documentElement:new Element(), createElement:tag => new Element('',tag), getElementById:el,
+  const doc=Object.assign(new Element(), {hidden:false, documentElement:new Element(), body:new Element(), createElement:tag => new Element('',tag), getElementById:el,
     querySelectorAll:selector => selector.includes('[aria-invalid]') ? [...elements.values()].filter(element => element.attributes['aria-invalid']) : [...elements.values()].filter(element => ['INPUT','SELECT'].includes(element.tagName))});
   const win=new Element(); win.SatelliteWorkspace={showView:value => views.push(value)};
   const container=new Element(); container.ownerDocument=doc;
-  const map={setView() {return this;}, on() {}, off() {}, fitBounds:value => fits.push(value), hasLayer:value => visible.has(value), removeLayer:value => visible.delete(value), getContainer:() => container, getCenter:() => ({lat:12,lng:105})};
+  doc.body.classList = {add() {}, remove() {}};
+  const map={createPane:() => new Element(), setView() {return this;}, on() {}, off() {}, fitBounds:value => fits.push(value), hasLayer:value => visible.has(value), removeLayer:value => visible.delete(value), getContainer:() => container, getCenter:() => ({lat:12,lng:105})};
   map.latLngToContainerPoint=([lat,lng]) => ({x:lng*100,y:-lat*100});
   map.containerPointToLatLng=([x,y]) => ({lng:x/100,lat:-y/100});
   for (const key of ['dragging','doubleClickZoom','scrollWheelZoom','boxZoom','keyboard','touchZoom']) map[key]={enabled:() => true, enable() {},disable() {}};
   const layer = () => ({children:[], addTo(target) { if (target.children) target.children.push(this); else visible.add(this); return this; }, getBounds:() => ['footprint'], clearLayers() {this.children=[];}, getElement:() => null, bindTooltip() {},on() {},setLatLng() {}});
-  const L={map:() => map,tileLayer:layer,layerGroup:layer,polygon:layer,polyline:layer,marker:layer,geoJSON:layer,divIcon:value => value, control:{layers:() => ({addTo() {return this;}, addOverlay() {}})}};
+  const L={map:() => map,tileLayer:layer,layerGroup:layer,featureGroup:layer,polygon:layer,polyline:layer,marker:layer,geoJSON:layer,divIcon:value => value, control:{layers:() => ({addTo() {return this;}, addOverlay() {}})}};
   const defaultHandler=(url, options) => {
     if (url === `${API}/references`) return response(frame('reference-1'));
     if (url === `${API}/searches`) return response({search_id:'search-1', total:12, offset:0, limit:50, parameters:JSON.parse(options.body), scenes:Array.from({length:12},(_,i) => scene(i))});
@@ -113,7 +114,10 @@ function fixture({handler, saved, blocked = false, legacy = false} = {}) {
   const dateHome=new Element('dateHome'),dateNext=new Element('dateNext');
   dateHome.append(el('dateSelection'),dateNext);
   el('dateSelection').nextElementSibling=dateNext;
-  if (legacy) vm.runInContext(inline,context);
+  if (legacy) {
+    vm.runInContext(fs.readFileSync(path.join(root,'static','scene-footprints.js'),'utf8'), context);
+    vm.runInContext(inline,context);
+  }
   const selectionFile=path.join(root,'static','selection-state.js');
   if (fs.existsSync(selectionFile)) vm.runInContext(fs.readFileSync(selectionFile,'utf8'),context);
   vm.runInContext(script,context);

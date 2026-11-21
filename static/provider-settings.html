@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'">
+  <meta name="referrer" content="no-referrer">
+  <title>Cấu hình nguồn dữ liệu</title>
+  <link rel="stylesheet" href="/provider-settings.css?v=1">
+  <script defer src="/provider-settings.js?v=1"></script>
+</head>
+<body>
+  <main>
+    <a href="/">← Satellite Workspace</a>
+    <h1>Cấu hình nguồn dữ liệu</h1>
+    <p>Nhập khóa của bạn cho từng nguồn cần dùng. Sau khi lưu, khởi động lại backend để áp dụng.</p>
+    <p id="providerStatus" role="status"></p>
+
+    <form method="post" data-provider="gee" autocomplete="off">
+      <h2>Google Earth Engine</h2>
+      <label for="geeKeyFile">Tệp JSON service account</label>
+      <input id="geeKeyFile" name="key_file" type="file" accept=".json,application/json" required>
+      <footer><button type="submit" disabled>Lưu khóa GEE</button><p data-state role="status"></p></footer>
+    </form>
+
+    <form method="post" data-provider="cdse" autocomplete="off">
+      <h2>Copernicus Data Space</h2>
+      <label for="cdseUsername">Email đăng nhập</label>
+      <input id="cdseUsername" name="username" type="email" autocomplete="off" maxlength="320" required>
+      <label for="cdsePassword">Mật khẩu CDSE</label>
+      <input id="cdsePassword" name="password" type="password" autocomplete="new-password" maxlength="1024" required>
+      <footer><button type="submit" disabled>Lưu tài khoản CDSE</button><p data-state role="status"></p></footer>
+    </form>
+
+    <form method="post" data-provider="s3" autocomplete="off">
+      <h2>S3 CDSE</h2>
+      <label for="s3AccessKey">Access Key</label>
+      <input id="s3AccessKey" name="access_key" autocomplete="off" spellcheck="false" maxlength="256" required>
+      <label for="s3SecretKey">Secret Key</label>
+      <input id="s3SecretKey" name="secret_key" type="password" autocomplete="new-password" maxlength="1024" required>
+      <footer><button type="submit" disabled>Lưu khóa S3 CDSE</button><p data-state role="status"></p></footer>
+    </form>
+  </main>
+</body>
+</html>

@@ -157,7 +157,7 @@ class FrameService:
         return {**result, 'total': len(scenes), 'offset': offset, 'limit': limit,
                 'scenes': scenes[offset:offset + limit]}
 
-    def preview(self, key, token):
+    def preview(self, key, token, dimensions=512):
         from .frame_search import make_frame_preview
         result = self.store.get_search(key)
         validate_roi_identity(result['parameters'])
@@ -166,11 +166,13 @@ class FrameService:
             raise FrameError('not_found', 'Cảnh không thuộc kết quả tìm kiếm.', 404)
         from .frame_store import identifier
         directory = self.store.root / 'previews' / identifier(key)
-        path = directory / f'{identifier(token)}.png'
+        suffix = '-thumbnail' if dimensions == 192 else ''
+        path = directory / f'{identifier(token)}{suffix}.png'
         with self.store.lock:
             if path.is_file():
                 return path.read_bytes()
-        content = make_frame_preview(scene, result['parameters'])
+        content = (make_frame_preview(scene, result['parameters']) if dimensions == 512 else
+                   make_frame_preview(scene, result['parameters'], dimensions=dimensions))
         if not content.startswith(b'\x89PNG\r\n\x1a\n') or len(content) > 8 * 1024 * 1024:
             raise FrameError('invalid_preview', 'Không đọc được ảnh xem trước.', 502)
         with self.store.lock:

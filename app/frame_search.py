@@ -438,7 +438,7 @@ def _search(request, frame: dict) -> list[dict]:
         return rank_frame_scenes([_scene_row(row, request) for row in raw], request)
 
 
-def make_frame_preview(scene: dict, parameters: dict) -> bytes:
+def make_frame_preview(scene: dict, parameters: dict, *, dimensions=512) -> bytes:
     """Render a separate, display-only graph; return PNG bytes, never signed URLs."""
     from .reference_frame import validate_roi_identity
     validate_roi_identity(parameters)
@@ -446,18 +446,19 @@ def make_frame_preview(scene: dict, parameters: dict) -> bytes:
     bands = ["B4", "B3", "B2"] if dataset == "sentinel2" else [
         "VV" if "VV" in parameters["bands"] else "HH"]
     validate_asset(scene["asset_id"], dataset, bands)
-    deadline = time.monotonic() + 180
-    with _RPC(120, deadline) as rpc:
+    budget, attempt = (18, 10) if dimensions == 192 else (180, 120)
+    deadline = time.monotonic() + budget
+    with _RPC(attempt, deadline) as rpc:
         image = ee.Image(scene["asset_id"]).select(bands).toFloat()
         if dataset == "sentinel2":
             image = image.multiply(0.0001)
-        params = {"region": _frame_roi(parameters["reference"], parameters), "dimensions": 512,
+        params = {"region": _frame_roi(parameters["reference"], parameters), "dimensions": dimensions,
                   "format": "png", "bands": bands,
                   "min": 0 if dataset == "sentinel2" else -25,
                   "max": 0.3 if dataset == "sentinel2" else 0}
 
         def operation():
-            data = rpc.thumbnail_once(image, params, deadline=min(deadline, time.monotonic() + 120), preview=True)
+            data = rpc.thumbnail_once(image, params, deadline=min(deadline, time.monotonic() + attempt), preview=True)
             if not data.startswith(b"\x89PNG\r\n\x1a\n"):
                 raise _TransientError()
             return data

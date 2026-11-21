@@ -69,7 +69,7 @@
   .rectangle-handle.move { cursor:move; }
   .rectangle-handle.rotate { border-radius:50%; background:#38bdf8; cursor:grab; }
 </style>
-<link rel="stylesheet" href="/workspace.css?v=download-jobs-1" />
+<link rel="stylesheet" href="/workspace.css?v=scene-thumbnails-3" />
 <style>
   #matchedFrameResults input[type=radio] { width:20px; height:20px; min-height:0; flex:0 0 20px; accent-color:var(--accent); padding:0; }
   #mfSelectedSources ol { padding-left:24px; }
@@ -92,6 +92,7 @@
       <option value="light">Sáng</option>
       <option value="dark">Tối</option>
     </select>
+    <a id="providerSettingsLink" href="/provider-settings.html" hidden>Cấu hình nguồn</a>
   </div>
 </header>
 <div id="sidebar">
@@ -411,6 +412,7 @@
   </div>
   <section id="sceneCatalogResults" hidden aria-label="Danh sách ảnh theo phần trăm mây">
     <div id="sceneCatalogMeta"></div>
+    <div id="sceneCatalogFootprintSummary" class="hint" role="status"></div>
     <div id="sceneCatalogRows"></div>
     <div class="row"><button id="sceneCatalogPrev" type="button">Trang trước</button><button id="sceneCatalogNext" type="button">Trang sau</button></div>
   </section>
@@ -567,9 +569,11 @@ if (typeof L === 'undefined') {
   document.write('<script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js"><\/script>');
 }
 </script>
-<script src="/rectangle.js?v=upload-512mib-20261119"></script>
+<script src="/rectangle.js?v=scene-thumbnails-2"></script>
 <script src="/selection-state.js?v=1"></script>
 <script src="/s2-layers.js?v=2"></script>
+<script src="/scene-footprints.js?v=1"></script>
+<script src="/scene-thumbnails.js?v=3"></script>
 <script>
 const $ = id => document.getElementById(id);
 
@@ -583,6 +587,7 @@ function formatError(err) {
   return JSON.stringify(err.detail);
 }
 const map = L.map('map').setView([16.0, 107.0], 6); // Việt Nam
+const sceneFootprints = new window.SceneFootprints.Controller(map, L);
 
 // Base layers: dùng các tile server không bị proxy công ty chặn
 const layers = {
@@ -895,13 +900,25 @@ function renderCompositePlan(data) {
     `<b>${methodName}</b><br>` +
     `Khoảng ngày: ${data.date_min} → ${data.date_max}<br>` + summary + mosaicOptionsSummary(data.scene_grouping,data.mosaic_mask_clouds);
   const scenes = data.scenes || [];
-  $('planScenes').innerHTML = scenes.length
-    ? scenes.map(s => `<div class="plan-scene"><b>${s.date}</b> · mây: ${Number(s.cloud).toFixed(2)}%${s.score != null ? ` · score: ${Number(s.score).toFixed(4)}` : ''}<br><span style="color:#94a3b8">${s.scene_id}</span></div>`).join('')
-    : (isBaseScore
+  $('planScenes').replaceChildren();
+  for (const scene of scenes) {
+    const row = document.createElement('div');
+    row.className = 'plan-scene';
+    window.SceneThumbnails?.append(row, scene, scene.scene_id);
+    const info = document.createElement('div');
+    info.textContent = `${scene.date} · mây: ${Number(scene.cloud).toFixed(2)}%` +
+      (scene.score == null ? '' : ` · score: ${Number(scene.score).toFixed(4)}`);
+    const name = document.createElement('div');
+    name.className = 'hint';
+    name.textContent = scene.scene_id;
+    row.append(info, name);
+    $('planScenes').append(row);
+  }
+  if (!scenes.length) $('planScenes').innerHTML = isBaseScore
       ? '<div class="hint">Base-score giữ tối đa 6 scene tốt nhất cho mỗi MGRS/WRS tile.</div>'
       : isFullComposite
         ? `<div class="hint">${methodName} xếp hạng cảnh theo độ trong (mean băng xanh) rồi giữ tối đa 20 cảnh.</div>`
-        : '');
+        : '';
   $('plan').style.display = 'block';
 }
 
@@ -1040,6 +1057,7 @@ function renderTimeSeriesResults(data) {
   for (const scene of data.scenes || []) {
     const row = document.createElement('div');
     row.className = 'timeseries-scene';
+    window.SceneThumbnails?.append(row, scene, scene.asset_id);
     const timestamp = typeof scene.timestamp === 'number'
       ? new Date(scene.timestamp).toISOString() : (scene.timestamp || scene.date);
     const heading = document.createElement('div');
@@ -1378,28 +1396,75 @@ function updateCloudSelection() {
   $('btnSearch').textContent = $('dataset').value === 's5p' ? 'Liệt kê từng ảnh Sentinel-5P' : dem ? 'Tải DEM GeoTIFF (30 m)' : listing ? 'Liệt kê ảnh theo % mây' : timeSeries ? 'Tìm chuỗi thời gian' : rectangleExternal ? 'Liệt kê ảnh (bao ngoài ROI)' : 'Tìm ảnh (ít mây nhất)';
   sceneCatalog = null;
   sceneCatalogGeneration++;
+  sceneFootprints.clear();
+  document.body.classList.remove('has-catalog-results');
   $('sceneCatalogResults').hidden = true;
 }
 function renderSceneCatalog(data) {
+  const newSearch = sceneCatalog?.search_id !== data.search_id;
   sceneCatalog = data;
-  $('sceneCatalogResults').hidden = false;
+  const gee = data.parameters.source === 'gee';
   $('sceneCatalogMeta').textContent = `${data.total} ảnh — ${data.total ? data.offset + 1 : 0}–${data.offset + data.scenes.length}; mây ${data.parameters.cloud_min}–${data.parameters.cloud_max}%` +
     (data.parameters.truncated ? ' — Đã chạm giới hạn catalogue; thu hẹp khoảng ngày để xem đủ ảnh.' : '') +
     (data.parameters.selection_mode === 'rectangle' && ['aws', 'cdse'].includes(data.parameters.source)
-      ? ' — Tìm theo bao ngoài ROI; cảnh có thể chỉ giao một phần khung xoay. Crop dùng snapshot hình chữ nhật.' : '');
+      ? ' — Tìm theo bao ngoài ROI; cảnh có thể chỉ giao một phần khung xoay. Crop dùng snapshot hình chữ nhật.' : '') +
+    (gee && data.scenes.some(scene => scene.full_scene_download_url)
+      ? ' · Nguyên cảnh có thể vài GB. Trình duyệt bắt đầu tải khi máy chủ tạo xong GeoTIFF.' : '');
   const container = $('sceneCatalogRows'); container.replaceChildren();
-  data.scenes.forEach(scene => {
-    const row = document.createElement('div'); row.style.cssText = 'border-top:1px solid var(--line);padding:8px 0;overflow-wrap:anywhere';
-    const label = document.createElement('div');
-    label.textContent = `${scene.date || ''} | Mây: ${scene.cloud_pct == null ? 'không rõ' : scene.cloud_pct + '%'} | ${scene.platform || ''}`;
+  sceneFootprints.clear();
+  let footprintCount = 0;
+  let thumbnailCount = 0;
+  data.scenes.forEach((scene, index) => {
+    const row = document.createElement('div'); row.className = 'scene-catalog-row';
+    const label = `${scene.date || ''} · Mây: ${scene.cloud_pct == null ? 'không rõ' : scene.cloud_pct + '%'} · ${scene.platform || ''}`;
+    const thumbnailUrl = `/api/scene-catalog/${encodeURIComponent(data.search_id)}/thumbnail/${data.offset + index}`;
+    let content = row;
+    const external = ['aws', 'cdse'].includes(data.parameters.source);
+    if (scene.thumbnail_url === thumbnailUrl || external && window.SceneThumbnails?.valid(scene.thumbnail_url)) {
+      thumbnailCount++;
+      row.className += ' scene-catalog-with-thumbnail';
+      const thumbnail = window.SceneThumbnails.create(scene.thumbnail_url, label);
+      content = document.createElement('div');
+      row.append(thumbnail, content);
+    } else if (external) window.SceneThumbnails?.append(row, scene, label);
     const id = document.createElement('div'); id.textContent = scene.asset_id || scene.name || scene.id;
-    row.append(label, id);
-    if (scene.download_url) {
-      const link = document.createElement('a'); link.textContent = 'Tải ảnh này (GeoTIFF, snapshot ROI)'; link.href = scene.download_url;
-      link.style.color = 'var(--accent)';
-      row.appendChild(link);
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'scene-catalog-select';
+    if (sceneFootprints.bind(row, button, scene.footprint)) {
+      footprintCount++;
+      button.textContent = label;
+      button.setAttribute('aria-label', `Chọn footprint ${label} · ${id.textContent}`);
+      const selected = document.createElement('span');
+      selected.className = 'scene-catalog-selected';
+      selected.textContent = 'Đã chọn';
+      selected.setAttribute('aria-hidden', 'true');
+      button.append(selected);
+      content.append(button);
     } else {
-      const note = document.createElement('div'); note.textContent = 'Nguồn catalogue này chưa hỗ trợ tải/cắt ROI.'; row.appendChild(note);
+      const heading = document.createElement('div');
+      heading.textContent = label;
+      content.append(heading);
+    }
+    content.append(id);
+    if (scene.download_url) {
+      const link = document.createElement('a');
+      link.textContent = gee ? 'Tải theo ROI' : 'Tải ảnh này (GeoTIFF, snapshot ROI)';
+      link.href = scene.download_url;
+      link.style.color = 'var(--accent)';
+      content.appendChild(link);
+      const expected = `/api/scene-catalog/${encodeURIComponent(data.search_id)}/download/${data.offset + index}?extent=scene`;
+      if (gee && scene.full_scene_download_url === expected) {
+        const full = document.createElement('a');
+        full.textContent = 'Tải nguyên cảnh';
+        full.href = expected;
+        full.target = '_blank';
+        full.rel = 'noopener';
+        full.style.cssText = 'color:var(--accent);display:block';
+        content.appendChild(full);
+      }
+    } else {
+      const note = document.createElement('div'); note.textContent = 'Nguồn catalogue này chưa hỗ trợ tải/cắt ROI.'; content.appendChild(note);
     }
     const params = data.parameters || {};
     if (params.selection_mode === 'rectangle' && ['aws', 'cdse'].includes(params.source) && scene.id) {
@@ -1408,14 +1473,33 @@ function renderSceneCatalog(data) {
       crop.href = (params.source === 'aws' ? '/api/s2/aws/download?' : '/api/s2/bands?action=download&') +
         `product_id=${encodeURIComponent(scene.id)}&${RectangleROI.query(rect)}`;
       crop.textContent = params.source === 'aws' ? ' · AWS crop ROI' : ' · CDSE bands crop ROI';
-      crop.style.color = 'var(--accent)'; row.appendChild(crop);
+      crop.style.color = 'var(--accent)'; content.appendChild(crop);
       if (params.source === 'cdse') {
         const raw = document.createElement('a');
         raw.href = `/api/s2/download?product_id=${encodeURIComponent(scene.id)}&filename=${encodeURIComponent((scene.name || scene.id) + '.zip')}`;
-        raw.textContent = ' · ZIP nguyên sản phẩm (không cắt ROI)'; raw.style.color = 'var(--accent)'; row.appendChild(raw);
+        raw.textContent = ' · ZIP nguyên sản phẩm (không cắt ROI)'; raw.style.color = 'var(--accent)'; content.appendChild(raw);
       }
     }
     container.appendChild(row);
+  });
+  let footprintSummary = '';
+  if (footprintCount) {
+    footprintSummary = `${footprintCount}/${data.scenes.length} cảnh có ranh giới trên bản đồ · Chọn một dòng để giữ nổi bật.`;
+  } else if (data.scenes.length) {
+    footprintSummary = data.scenes.some(scene => Object.hasOwn(scene, 'footprint'))
+      ? 'Trang này chưa có ranh giới cảnh từ nguồn dữ liệu.'
+      : 'Kết quả này được tạo bằng backend chưa hỗ trợ footprint. Mở bản web đã cập nhật rồi tìm lại.';
+  }
+  if (!thumbnailCount && data.scenes.length && data.parameters.source === 'gee') {
+    footprintSummary += ' Backend cần được khởi động lại để nạp thumbnail. Sau đó tìm lại ảnh.';
+  }
+  $('sceneCatalogFootprintSummary').textContent = footprintSummary;
+  document.body.classList.add('has-catalog-results');
+  $('sceneCatalogResults').hidden = false;
+  if (newSearch && footprintCount) requestAnimationFrame(() => {
+    if (sceneCatalog === data && document.body.classList.contains('has-results')) {
+      sceneFootprints.fit(data.parameters.bbox);
+    }
   });
   $('sceneCatalogPrev').disabled = data.offset === 0;
   $('sceneCatalogNext').disabled = data.offset + data.scenes.length >= data.total;
@@ -1750,8 +1834,11 @@ function renderS1OrbitResults(data, version) {
     details.replaceChildren(summary, coverage);
     for (const scene of result.scenes || []) {
       const row = document.createElement('div');
-      row.textContent = `${scene.date}: ${scene.scene_id}`;
       row.style.overflowWrap = 'anywhere';
+      window.SceneThumbnails?.append(row, scene, scene.scene_id);
+      const label = document.createElement('span');
+      label.textContent = `${scene.date}: ${scene.scene_id}`;
+      row.append(label);
       details.appendChild(row);
     }
     if (result.preview_url) $('preview').src = result.preview_url;
@@ -1804,6 +1891,7 @@ async function searchS1(lon, lat) {
     for (const p of data.products) {
       const div = document.createElement('div');
       div.style.cssText = 'border:1px solid var(--line); border-radius:8px; padding:8px; display:flex; justify-content:space-between; align-items:center; gap:8px;';
+      window.SceneThumbnails?.append(div, p, p.name, 'scene-provider-row');
       const info = document.createElement('div');
       info.innerHTML = `<b>${p.date}</b> · ${p.online ? '🟢 online' : '⚪ offline'}${p.cog ? ' · <span style="color:var(--warning);">COG</span>' : ''}<br>` +
         `<span style="color:var(--muted); font-size:11px;">${p.name.slice(0, 42)}… · ${p.size_gb.toFixed(2)} GB</span>`;
@@ -1869,6 +1957,7 @@ async function searchS2(lon, lat, source) {
     for (const p of data.products) {
       const div = document.createElement('div');
       div.style.cssText = 'border:1px solid var(--line); border-radius:8px; padding:8px; display:flex; justify-content:space-between; align-items:center; gap:8px;';
+      window.SceneThumbnails?.append(div, p, p.name, 'scene-provider-row');
       const info = document.createElement('div');
       const cloud = p.cloud_pct != null ? ` · ☁ ${p.cloud_pct.toFixed(1)}%` : '';
       const tile = p.tile ? ` · tile ${p.tile}` : '';
@@ -2091,6 +2180,7 @@ async function searchProvinceScenes(dataset) {
       for (const p of g.scenes) {
         const div = document.createElement('div');
         div.style.cssText = 'border:1px solid var(--line); border-radius:8px; padding:8px; display:flex; justify-content:space-between; align-items:center; gap:8px;';
+        window.SceneThumbnails?.append(div, p, p.name, 'scene-provider-row');
         const info = document.createElement('div');
         const cloud = p.cloud_pct != null ? ` · ☁ ${p.cloud_pct.toFixed(1)}%` : '';
         const size = p.size_gb != null ? ` · ${p.size_gb.toFixed(2)} GB` : '';
@@ -2162,6 +2252,7 @@ async function searchS3(lon, lat) {
     for (const p of data.products) {
       const div = document.createElement('div');
       div.style.cssText = 'border:1px solid var(--line); border-radius:8px; padding:8px; display:flex; justify-content:space-between; align-items:center; gap:8px;';
+      window.SceneThumbnails?.append(div, p, p.name, 'scene-provider-row');
       const info = document.createElement('div');
       info.innerHTML = `<b>${p.date}</b> · ${p.online ? '🟢 online' : '⚪ offline'}${p.cog ? ' · <span style="color:var(--warning);">COG</span>' : ''}<br>` +
         `<span style="color:var(--muted); font-size:11px;">${p.name.slice(0, 48)}… · ${p.size_gb.toFixed(2)} GB</span>`;
@@ -2239,6 +2330,7 @@ async function searchS1Slc(lon, lat) {
     for (const p of data.products) {
       const div = document.createElement('div');
       div.style.cssText = 'border:1px solid var(--line); border-radius:8px; padding:8px; display:flex; justify-content:space-between; align-items:center; gap:8px;';
+      window.SceneThumbnails?.append(div, p, p.name, 'scene-provider-row');
       const info = document.createElement('div');
       info.innerHTML = `<b>${escapeHtml(p.timestamp ? p.timestamp.replace('T', ' ').slice(0, 19) + ' UTC' : p.date)}</b>` +
         ` · ${p.online ? '🟢 online' : '⚪ offline'}${escapeHtml(slcMetaText(p))}<br>` +
@@ -2292,6 +2384,7 @@ async function searchS1Pairs(lon, lat) {
         const p = pair[role];
         const row = document.createElement('div');
         row.style.cssText = 'display:flex; justify-content:space-between; align-items:center; gap:8px; padding:4px 0;';
+        window.SceneThumbnails?.append(row, p, p.name, 'scene-provider-row');
         const info = document.createElement('div');
         info.innerHTML = `<b>${escapeHtml(role === 'master' ? 'Master' : 'Secondary')}</b> — ` +
           `${escapeHtml(p.timestamp ? p.timestamp.replace('T', ' ').slice(0, 19) + ' UTC' : p.date)}<br>` +
@@ -2315,11 +2408,11 @@ async function searchS1Pairs(lon, lat) {
   }
 }
 </script>
-<script src="/s5p.js?v=1"></script>
+<script src="/s5p.js?v=scene-thumbnails-2"></script>
 <script src="/esri.js?v=rectangle-1"></script>
 <script src="/download-jobs.js?v=1"></script>
 <script src="/workspace.js?v=download-jobs-1"></script>
-<script src="/matched-frame.js?v=upload-512mib-20261119"></script>
+<script src="/matched-frame.js?v=scene-thumbnails-2"></script>
 <script src="/scene-inventory.js?v=1"></script>
 <script src="/vector-layers.js?v=1"></script>
 <script src="/vector-search.js?v=2"></script>
@@ -2327,6 +2420,7 @@ async function searchS1Pairs(lon, lat) {
 <script>
 $('time_series_yearly').addEventListener('change', updateTimeSeriesVisibility);
 updateTimeSeriesVisibility();
+$('providerSettingsLink').hidden = !['localhost', '127.0.0.1', '[::1]'].includes(location.hostname);
 </script>
 </body>
 </html>

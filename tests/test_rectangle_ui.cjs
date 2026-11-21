@@ -7,6 +7,8 @@ const ROI = require('../static/rectangle.js');
 const html = fs.readFileSync(path.join(__dirname, '..', 'static', 'index.html'), 'utf8');
 const inline = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(match => match[1]).find(code => code.includes('const $ ='));
 const esri = fs.readFileSync(path.join(__dirname, '..', 'static', 'esri.js'), 'utf8');
+const footprints = fs.readFileSync(path.join(__dirname, '..', 'static', 'scene-footprints.js'), 'utf8');
+const thumbnails = fs.readFileSync(path.join(__dirname, '..', 'static', 'scene-thumbnails.js'), 'utf8');
 const base = {center_lon:105, center_lat:12, width_m:8000, height_m:2000, rotation_deg:30};
 const plain = value => JSON.parse(JSON.stringify(value));
 function close(a,b,tolerance=1e-8) { assert.ok(Math.abs(a-b) < tolerance, `${a} != ${b}`); }
@@ -61,7 +63,7 @@ class Element {
   constructor(id = '') {
     this.id = id; this.value = ''; this.checked = false; this.hidden = false; this.disabled = false;
     this.style = {}; this.dataset = {}; this.children = []; this.listeners = {}; this.textContent = '';
-    this.classList = {toggle() {}};
+    this.classList = {toggle() {}, add() {}, remove() {}};
   }
   addEventListener(type, callback) { (this.listeners[type] ||= []).push(callback); }
   removeEventListener(type, callback) { this.listeners[type] = (this.listeners[type] || []).filter(fn => fn !== callback); }
@@ -93,12 +95,12 @@ function fixture(fetchHandler = async () => response({})) {
   el('selection_mode').value = 'point'; el('dataset').value = 'sentinel2';
   el('esriMode').value = 'point'; el('s2_source').value = 'cdse'; el('slc_mode').value = 'scenes';
   const inputIds = [...html.matchAll(/<(?:input|select)\b[^>]*id="([^"]+)"/g)].map(match => match[1]);
-  const doc = Object.assign(new Element(), {getElementById:el, querySelectorAll:selector => inputIds.filter(id => !selector.includes(':not(#time_series_enabled)') || id !== 'time_series_enabled').map(el), createElement:() => new Element(), activeElement:null});
+  const doc = Object.assign(new Element(), {body:new Element(), getElementById:el, querySelectorAll:selector => inputIds.filter(id => !selector.includes(':not(#time_series_enabled)') || id !== 'time_series_enabled').map(el), createElement:() => new Element(), activeElement:null});
   const container = new Element(); container.ownerDocument = doc;
   container.setPointerCapture = id => { container.captured = id; };
   container.hasPointerCapture = id => container.captured === id;
   container.releasePointerCapture = () => { container.captured = null; };
-  const map = {getContainer:() => container, setView() { return this; }, on() {}, off() {},
+  const map = {getContainer:() => container, createPane:() => new Element(), setView() { return this; }, on() {}, off() {},
     fitBounds:bounds => fits.push(bounds), hasLayer:layer => visible.has(layer), removeLayer:layer => visible.delete(layer),
     mouseEventToLatLng:event => event.latlng, getCenter:() => ({lat:12,lng:105}),
     latLngToContainerPoint:([lat,lng]) => ({x:lng*100,y:-lat*100}),
@@ -107,7 +109,7 @@ function fixture(fetchHandler = async () => response({})) {
     map[key] = {state:key !== 'scrollWheelZoom', enabled() { return this.state; }, enable() { this.state = true; }, disable() { this.state = false; }};
   }
   function layer() { return {children:[], addTo(target) { if (target.children) target.children.push(this); else visible.add(this); return this; }, clearLayers() { this.children = []; }, getElement:() => ({dataset:{},style:{}}), getBounds:() => [], setLatLng() {}, bindTooltip() {}, on() {}, bringToFront() {}}; }
-  const L = {map:() => map, tileLayer:layer, layerGroup:layer, polygon:layer, polyline:layer, marker:layer, divIcon:x => x,
+  const L = {map:() => map, tileLayer:layer, layerGroup:layer, featureGroup:layer, polygon:layer, polyline:layer, marker:layer, divIcon:x => x,
     geoJSON:layer, control:{layers:() => ({addTo() { return this; }, addOverlay() {}})}, DomEvent:{stopPropagation() {}}};
   const context = vm.createContext({document:doc, window:{addEventListener() {}}, L, RectangleROI:ROI, console,
     fetch:async (url, options = {}) => {
@@ -118,6 +120,8 @@ function fixture(fetchHandler = async () => response({})) {
     AbortController, URL, URLSearchParams, encodeURIComponent, Option:class {},
     performance:{now:() => 100}, location:{origin:'http://localhost'},
     setTimeout:() => 1, clearTimeout() {}, requestAnimationFrame:fn => { fn(); return 1; }, cancelAnimationFrame() {}});
+  vm.runInContext(footprints,context);
+  vm.runInContext(thumbnails,context);
   vm.runInContext(inline,context);
   const run = code => vm.runInContext(code,context);
   return {context,run,el,map,container,requests,fits,visible,
@@ -277,6 +281,54 @@ test('rectangle catalogue searches use envelope endpoint, retain cloud controls 
   f.editor.set({...base,height_m:5000}); assert.equal(crop.href,original); assert.equal(f.el('sceneCatalogResults').hidden,true);
   f.el('least_cloud_enabled').checked=false; f.el('cloud_min').value='12'; f.el('cloud_max').value='48';
   await f.el('btnSearch').fire('click'); assert.equal(saved.cloud_min,12); assert.equal(saved.cloud_max,48);
+});
+test('catalogue explains when result metadata predates footprint support', () => {
+  const f = fixture();
+  f.context.cataloguePage = {
+    search_id: 'old-search', offset: 0, total: 1,
+    parameters: {source: 'gee', dataset: 'sentinel2', selection_mode: 'point', cloud_min: 0, cloud_max: 100},
+    scenes: [{asset_id: 'scene', cloud_pct: 20}],
+  };
+  f.run('renderSceneCatalog(cataloguePage)');
+  assert.match(f.el('sceneCatalogFootprintSummary').textContent, /backend.*tìm lại/i);
+
+  f.context.cataloguePage.scenes[0].footprint = null;
+  f.run('renderSceneCatalog(cataloguePage)');
+  assert.match(f.el('sceneCatalogFootprintSummary').textContent, /nguồn dữ liệu/i);
+});
+test('catalogue rows lazily load only thumbnail URLs for their own snapshot position', () => {
+  const f = fixture();
+  f.context.cataloguePage = {
+    search_id: 'search', offset: 2, total: 4,
+    parameters: {source: 'gee', dataset: 'sentinel2', selection_mode: 'point', cloud_min: 0, cloud_max: 100},
+    scenes: [
+      {asset_id: 'one', thumbnail_url: '/api/scene-catalog/search/thumbnail/2'},
+      {asset_id: 'two', thumbnail_url: '/api/scene-catalog/search/thumbnail/2'},
+    ],
+  };
+  f.run('renderSceneCatalog(cataloguePage)');
+  const [first, second] = f.el('sceneCatalogRows').children;
+  const thumbnail = first.children.find(node => node.className === 'scene-catalog-thumbnail');
+  assert.ok(thumbnail);
+  assert.equal(thumbnail.children[0].loading, 'lazy');
+  assert.equal(thumbnail.children[0].src, '/api/scene-catalog/search/thumbnail/2');
+  assert.ok(!second.children.some(node => node.className === 'scene-catalog-thumbnail'));
+});
+
+test('GEE catalogue offers both download extents for the correct page row', () => {
+  const f = fixture();
+  const url = '/api/scene-catalog/search/download/2';
+  const scenes = [
+    {asset_id:'correct', download_url:url, full_scene_download_url:url + '?extent=scene'},
+    {asset_id:'other', download_url:url.replace('/2','/3'), full_scene_download_url:url + '?extent=scene'},
+  ];
+  f.context.cataloguePage = {search_id:'search', offset:2, total:4, scenes,
+    parameters:{source:'gee', dataset:'sentinel2', selection_mode:'point', cloud_min:0, cloud_max:100}};
+  f.run('renderSceneCatalog(cataloguePage)');
+  const [correct, other] = f.el('sceneCatalogRows').children;
+  assert.ok(correct.children.some(node => node.href === url && /ROI/.test(node.textContent)));
+  assert.ok(correct.children.some(node => node.href === url + '?extent=scene' && /nguyên cảnh/i.test(node.textContent)));
+  assert.ok(other.children.every(node => node.href !== url + '?extent=scene'));
 });
 test('time series rectangle body omits radius and survives page/download snapshot flow', async () => {
   const f = fixture(async url => response(url === '/api/timeseries/jobs'

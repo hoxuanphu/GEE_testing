@@ -16,6 +16,7 @@ from starlette.datastructures import UploadFile
 from .frame_models import (FrameError, FrameSearchRequest, FramePreflightRequest, FrameJobRequest,
                            MAX_BODY_BYTES, MAX_UPLOAD_BYTES)
 from .frame_store import identifier
+from . import scene_thumbnails
 from .reference_frame import read_reference_metadata
 
 PREFIX = '/api/matched-frame'
@@ -145,7 +146,9 @@ def register_frame_routes(app, get_service):
     def page(search_id, offset=0, limit=50):
         data = invoke(service().search_page, search_id, offset, limit)
         for scene in data['scenes']:
-            scene['preview_url'] = f"{PREFIX}/searches/{data['search_id']}/scenes/{scene['scene_token']}/preview"
+            base = f"{PREFIX}/searches/{data['search_id']}/scenes/{scene['scene_token']}"
+            scene['preview_url'] = base + '/preview'
+            scene['thumbnail_url'] = base + '/thumbnail'
         return data
 
     @router.get('/references/{reference_id}')
@@ -166,6 +169,12 @@ def register_frame_routes(app, get_service):
         invoke(identifier, scene_token)
         image = invoke(service().preview, search_id, scene_token)
         return Response(image, media_type='image/png', headers={'Cache-Control': 'private, max-age=300'})
+
+    @router.get('/searches/{search_id}/scenes/{scene_token}/thumbnail')
+    async def thumbnail(search_id: str, scene_token: str):
+        invoke(identifier, scene_token)
+        content = await scene_thumbnails.load(invoke, service().preview, search_id, scene_token, 192)
+        return scene_thumbnails.response(content)
 
     @router.post('/preflight')
     def preflight(body: FramePreflightRequest):

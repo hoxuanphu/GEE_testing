@@ -13,6 +13,7 @@ from pydantic import ConfigDict, Field, model_validator
 from starlette.background import BackgroundTask
 from typing import Literal
 from .vector_mask import mask_raster_to_polygon
+from . import imagery, scene_thumbnails
 
 SCALE_M = 1113.2
 PRODUCTS = {
@@ -117,7 +118,8 @@ def register_s5p(api):
             raise HTTPException(404, 'Search not found')
         for index, scene in enumerate(result['scenes'], offset):
             base = f'/api/s5p/search/{search_id}/scenes/{index}'
-            scene.update(download_url=base + '/download', preview_url=base + '/preview')
+            scene.update(download_url=base + '/download', preview_url=base + '/preview',
+                         thumbnail_url=base + '/thumbnail')
         return result
 
     def search(body: SearchRequest):
@@ -175,6 +177,17 @@ def register_s5p(api):
             raise HTTPException(502, 'Sentinel-5P preview unavailable') from exc
         return dict(url=url, timestamp=scene['timestamp'], unit=params['unit'], warning=WARNING)
 
+    def thumbnail_content(search_id, index):
+        params, _, image, roi = selected(search_id, index)
+        try:
+            return imagery.render_thumbnail_png(image, roi, params['visualization'])
+        except Exception:
+            raise HTTPException(502, 'Sentinel-5P thumbnail unavailable') from None
+
+    async def thumbnail(search_id: str, index: int):
+        content = await scene_thumbnails.load(thumbnail_content, search_id, index)
+        return scene_thumbnails.response(content)
+
     def download(search_id: str, index: int):
         params, scene, image, roi = selected(search_id, index)
         grid = params.get('output_grid')
@@ -206,5 +219,6 @@ def register_s5p(api):
     api.add_api_route('/api/s5p/search', search, methods=['POST'])
     api.add_api_route('/api/s5p/search/{search_id}', page, methods=['GET'])
     api.add_api_route('/api/s5p/search/{search_id}/scenes/{index}/preview', preview, methods=['GET'])
+    api.add_api_route('/api/s5p/search/{search_id}/scenes/{index}/thumbnail', thumbnail, methods=['GET'])
     api.add_api_route('/api/s5p/search/{search_id}/scenes/{index}/download', download, methods=['GET'])
     return store

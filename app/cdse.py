@@ -20,26 +20,34 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import hmac
+import io
 import os
 import re
 import time
 import urllib.parse
 import xml.etree.ElementTree as ET
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterator
 
 import requests
+from PIL import Image
 
 from .ee_session import _load_dotenv, _load_extra_cas
+from .provider_credentials import active_credentials
 
 _TOKEN_URL = (
     "https://identity.dataspace.copernicus.eu/auth/realms/CDSE"
     "/protocol/openid-connect/token"
 )
 _CATALOG_URL = "https://catalogue.dataspace.copernicus.eu/odata/v1/Products"
+_ODATA_UUID = re.compile(r'[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}')
+_QUICKLOOK_MAX_BYTES = 8 * 1024 * 1024
+_QUICKLOOK_MAX_PIXELS = 16_000_000
 _DOWNLOAD_URL = (
     "https://download.dataspace.copernicus.eu/odata/v1/Products({pid})/$value"
 )
+_QUICKLOOK_URL = 'https://download.dataspace.copernicus.eu/odata/v1/Assets({asset_id})/$value'
 
 # Giới hạn an toàn khi đọc nhiều trang catalogue (@odata.nextLink)
 _MAX_CATALOG_PAGES = 5
@@ -75,14 +83,54 @@ def _ensure_env() -> None:
     _load_extra_cas()
 
 
+def thumbnail_path(product_id):
+    if isinstance(product_id, str) and _ODATA_UUID.fullmatch(product_id):
+        return f'/api/cdse/thumbnail/{product_id}'
+    return None
+
+
+@lru_cache(maxsize=64)
+def scene_thumbnail(product_id):
+    """Read only the public quicklook of a CDSE product, without downloading it."""
+    if not thumbnail_path(product_id):
+        raise LookupError('Invalid CDSE product ID')
+    _ensure_env()
+    timeout = (4, 10)
+    with requests.get(f'{_CATALOG_URL}({product_id})', params={'$expand': 'Assets'},
+                      timeout=timeout, allow_redirects=False) as response:
+        if response.status_code == 404:
+            raise LookupError('CDSE product not found')
+        response.raise_for_status()
+        assets = response.json().get('Assets') or []
+    asset_id = next((a.get('Id') for a in assets if isinstance(a, dict) and a.get('Type') == 'QUICKLOOK'), None)
+    if not isinstance(asset_id, str) or not _ODATA_UUID.fullmatch(asset_id):
+        raise LookupError('No CDSE quicklook')
+    with requests.get(_QUICKLOOK_URL.format(asset_id=asset_id), timeout=timeout, stream=True,
+                      allow_redirects=False) as response:
+        response.raise_for_status()
+        content = bytearray()
+        for chunk in response.iter_content(32768):
+            content.extend(chunk)
+            if len(content) > _QUICKLOOK_MAX_BYTES:
+                raise ValueError('CDSE quicklook exceeds size limit')
+    with Image.open(io.BytesIO(content), formats=('JPEG', 'PNG')) as image:
+        if image.width * image.height > _QUICKLOOK_MAX_PIXELS:
+            raise ValueError('CDSE quicklook exceeds pixel limit')
+        image.thumbnail((192, 192))
+        output = io.BytesIO()
+        image.convert('RGBA').save(output, format='PNG')
+    return 'image/png', output.getvalue()
+
+
 def get_token() -> str:
     """Get (and cache) a password-grant access token for downloads."""
     if _token["access"] and time.time() < _token["expires_at"] - 60:
         return _token["access"]
 
     _ensure_env()
-    username = os.getenv("CDSE_USERNAME", "").strip()
-    password = os.getenv("CDSE_PASSWORD", "").strip()
+    saved = active_credentials('cdse')
+    username = saved['username'] if saved else os.getenv("CDSE_USERNAME", "").strip()
+    password = saved['password'] if saved else os.getenv("CDSE_PASSWORD", "").strip()
     if not username or not password:
         raise RuntimeError(
             "CDSE credentials missing: set CDSE_USERNAME and CDSE_PASSWORD "
@@ -125,6 +173,14 @@ def _normalize_attributes(raw: list | None) -> dict:
     return out
 
 
+def _cloud_bounds(cloud_min, cloud_max):
+    attribute = 'OData.CSC.DoubleAttribute'
+    return ''.join(
+        f" and Attributes/{attribute}/any(d:d/Name eq 'cloudCover' and d/{attribute}/Value {op} {float(value)})"
+        for op, value in (('le', cloud_max), ('ge', cloud_min)) if value is not None
+    )
+
+
 def _normalize_product(p: dict, with_metadata: bool) -> dict:
     """Chuẩn hóa 1 product OData.
 
@@ -140,6 +196,8 @@ def _normalize_product(p: dict, with_metadata: bool) -> dict:
         "online": bool(p.get("Online", False)),
         "cog": "_COG.SAFE" in p["Name"],
     }
+    if url := thumbnail_path(product['id']):
+        product['thumbnail_url'] = url
     if with_metadata:
         meta = _normalize_attributes(p.get("Attributes"))
         product["timestamp"] = timestamp
@@ -215,10 +273,7 @@ def search_s2(
         f"ContentDate/Start le {end_date}T23:59:59.999Z and "
         f"OData.CSC.Intersects(area=geography'SRID=4326;{polygon}')"
     )
-    if cloud_max is not None:
-        filt += f" and Attributes/OData.CSC.Doubles/any(d:d/Name eq 'cloudCover' and d/Value le {float(cloud_max)})"
-    if cloud_min is not None:
-        filt += f" and Attributes/OData.CSC.Doubles/any(d:d/Name eq 'cloudCover' and d/Value ge {float(cloud_min)})"
+    filt += _cloud_bounds(cloud_min, cloud_max)
     params = {
         "$filter": filt,
         "$orderby": "ContentDate/Start desc",
@@ -267,15 +322,13 @@ def search_s2_area(
         f"ContentDate/Start le {end_date}T23:59:59.999Z and "
         f"OData.CSC.Intersects(area=geography'SRID=4326;{_bbox_wkt(bbox)}')"
     )
-    if cloud_max is not None:
-        filt += f" and Attributes/OData.CSC.Doubles/any(d:d/Name eq 'cloudCover' and d/Value le {float(cloud_max)})"
-    if cloud_min is not None:
-        filt += f" and Attributes/OData.CSC.Doubles/any(d:d/Name eq 'cloudCover' and d/Value ge {float(cloud_min)})"
+    filt += _cloud_bounds(cloud_min, cloud_max)
     params = {"$filter": filt, "$orderby": "ContentDate/Start desc"}
     value = _fetch_products(params, max_results, expand=True)
     products = []
     for p in value:
         norm = _normalize_product(p, with_metadata=False)
+        norm["footprint"] = p.get("GeoFootprint")
         norm["cloud_pct"] = next((a.get("Value") for a in p.get("Attributes", []) if a.get("Name") == "cloudCover"), None)
         m = re.search(r"_T(\d{2}[A-Z]{3})_", p["Name"])
         norm["tile"] = m.group(1) if m else None
@@ -763,8 +816,9 @@ def get_s3_credentials(force_new: bool = False) -> tuple[str, str]:
         return _S3_CREDS_CACHE
 
     _ensure_env()
-    access_key = os.getenv("Access_Key_S3", "").strip()
-    secret = os.getenv("Secret_Key_S3", "").strip()
+    saved = active_credentials('s3')
+    access_key = saved['access_key'] if saved else os.getenv("Access_Key_S3", "").strip()
+    secret = saved['secret_key'] if saved else os.getenv("Secret_Key_S3", "").strip()
     if not access_key or not secret:
         raise RuntimeError(
             "S3 credentials missing: set Access_Key_S3 and Secret_Key_S3 "
