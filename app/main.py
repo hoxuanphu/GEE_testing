@@ -23,12 +23,13 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from rasterio.errors import RasterioError
+from starlette.background import BackgroundTask
 
 from .request_timing import SearchTimingMiddleware, measure_call
 from . import cdse, imagery, scene_thumbnails
 from .scene_snapshots import SceneSnapshots
 from .download_metrics import DownloadTimingMiddleware, measure as measure_download
-from .export_resources import bulk_export, QueueTimeout
+from .export_resources import CURRENT_SCENE, QueueTimeout, TransferCancelled, bulk_export, scene_download_admission
 from .esri import EsriRequest, EsriService, BusyError as EsriBusyError
 from .timeseries import BusyError, TimeSeriesService, TimeSeriesStore
 from .timeseries_batches import BatchStore, BatchService
@@ -81,6 +82,7 @@ from .geo import (
     bbox_to_ee_geom,
     point_roi,
     source_bbox,
+    source_footprint,
 )
 from .raster_grid import build_rotated_grid, warp_to_grid, grid_profile, write_grid_band
 from .imagery import (
@@ -111,7 +113,7 @@ _timeseries_service = TimeSeriesService(_timeseries_store)
 _batch_store = BatchStore(_DOWNLOADS_DIR / 'timeseries')
 _batch_service = BatchService(_batch_store, _timeseries_service)
 _esri_root = _DOWNLOADS_DIR / "esri"
-_esri_service = EsriService(_esri_root)
+_esri_service = EsriService(_esri_root, recover=False)
 
 from .frame_store import FrameStore
 from .frame_jobs import FrameService
@@ -121,7 +123,7 @@ _frame_service = FrameService(_frame_store)
 
 
 @asynccontextmanager
-async def _lifespan(application):
+async def _application_lifespan(application):
     global _timeseries_service, _esri_service, _frame_service, _batch_service, _download_service
     for provider in PROVIDERS:
         active_credentials(provider)
@@ -143,6 +145,11 @@ async def _lifespan(application):
     _batch_service = BatchService(_batch_store, _timeseries_service)
     _batch_store.recover()
     _batch_store.cleanup()
+    for row in _batch_store.queued_tasks():
+        if row['kind'] == 'timeseries':
+            _timeseries_service.submit_task(row['id'], _timeseries_service.run_timeseries_job, row['id'])
+        else:
+            _timeseries_service.submit_task('batch:' + row['id'], _batch_service.run_batch, row['id'])
 
     async def cleanup_loop():
         while True:
@@ -162,10 +169,27 @@ async def _lifespan(application):
             await cleanup_task
         await asyncio.to_thread(_batch_service.pause_active)
         await asyncio.to_thread(_esri_service.shutdown)
+        if _esri_service._thread is not None:
+            await asyncio.to_thread(_esri_service._thread.join)
         await asyncio.to_thread(_timeseries_service.shutdown)
         await asyncio.to_thread(_frame_service.shutdown)
         if _download_service is not None:
             await asyncio.to_thread(_download_service.shutdown)
+            if _download_service._thread is not None:
+                await asyncio.to_thread(_download_service._thread.join)
+
+
+@asynccontextmanager
+async def _lifespan(application):
+    from .task_lock import TaskLock
+    task_lock = TaskLock(_DOWNLOADS_DIR)
+    if not task_lock.acquire():
+        raise RuntimeError('Một server khác đang quản lý thư mục tải này.')
+    try:
+        async with _application_lifespan(application):
+            yield
+    finally:
+        task_lock.release()
 
 
 app = FastAPI(title="GEE Surface Reflectance Downloader", version="0.1.0", lifespan=_lifespan)
@@ -454,6 +478,7 @@ class SceneResponse(BaseModel):
     cloud_pct: float
     bbox: dict[str, float]
     roi_geometry: dict | None = None
+    footprint: dict | None = None
     rotation_deg: float = 0
     scale_m: float
     bands: list[str]
@@ -640,6 +665,7 @@ class TimeSeriesSceneResponse(BaseModel):
     dataset: str | None = None
     collection: str | None = None
     source_metadata: dict = Field(default_factory=dict)
+    footprint: dict | None = None
 
 
 class TimeSeriesJobRequest(BaseModel):
@@ -671,6 +697,7 @@ def search_timeseries(body: TimeSeriesRequest) -> dict:
                                        rectangle.center_lon if rectangle else body.lon or 0,
                                        rectangle.center_lat if rectangle else body.lat or 0,
                                        body.start_date, end_exclusive, body.polarization,
+                                       include_footprint=True,
                                        **({"roi": roi} if rectangle or body.rotation_deg or body.selection_mode == 'vector' else {}),
                                        **({'platform': body.platform} if body.platform is not None else {}))
         stage = 'parameters'
@@ -759,6 +786,13 @@ def _component_thumbnail_links(scenes, dataset, geometry, polarization='vvvh'):
             for index, scene in enumerate(scenes)]
 
 
+def _optical_scene_footprints(scenes, dataset):
+    try:
+        return imagery.source_scene_footprints(scenes, dataset)
+    except Exception:
+        return list(scenes)
+
+
 @app.get('/api/scene-components/{dataset}/{token}/thumbnail/{index}')
 async def component_thumbnail(dataset: Literal['sentinel2', 'landsat', 's1gee'], token: str, index: int):
     try:
@@ -814,7 +848,9 @@ def download_timeseries_job(job_id: str):
     path = _timeseries_store.download_path(job_id)
     if path is None:
         raise HTTPException(409, "ZIP is not ready")
-    return FileResponse(path, media_type="application/zip", filename=f"timeseries_{job_id}.zip")
+    from .task_files import TaskFileResponse
+    return TaskFileResponse(path, task_directory=path.parent, media_type="application/zip",
+                            filename=f"timeseries_{job_id}.zip")
 
 
 @app.post("/api/esri/jobs")
@@ -1096,6 +1132,17 @@ def find_scene(req: SceneRequest) -> SceneResponse:
     if selection_token:
         download_params += f'&selection_token={selection_token}'
 
+    sources = _optical_scene_footprints(scene.scenes, req.dataset)
+    footprint = source_footprint(sources)
+    if footprint is None and not sources:
+        try:
+            geometry = scene.footprint_geometry
+            if geometry is None:
+                geometry = imagery.scene_geometry(scene.ee_object)
+            footprint = source_footprint([{'footprint': geometry.getInfo()}])
+        except Exception:
+            pass
+
     return SceneResponse(
         dataset=req.dataset,
         platform=req.platform,
@@ -1103,6 +1150,7 @@ def find_scene(req: SceneRequest) -> SceneResponse:
         date=scene.date,
         cloud_pct=scene.cloud_pct,
         bbox=bbox_dict,
+        footprint=footprint,
         roi_geometry=(
             province.geometry
             if province
@@ -1131,7 +1179,7 @@ def find_scene(req: SceneRequest) -> SceneResponse:
             else req.composite_method if province is not None or point_merge else None
         ),
         scene_count=scene.scene_count,
-        scenes=list(scene.scenes),
+        scenes=sources,
         estimated_seconds=scene.estimated_seconds,
         color_balance=scene.color_balance if req.color_balance else None,
         scene_grouping=getattr(scene, 'scene_grouping', None),
@@ -1168,8 +1216,9 @@ def plan_composite(req: SceneRequest) -> dict:
     if plan is None:
         raise HTTPException(404, f"Không có ảnh Sentinel-2{req.platform} trong khoảng thời gian/vùng đã chọn."
                             if req.platform is not None else "No image found for this selection/date range")
-    if plan.get('scenes') and getattr(_province, 'geometry', None):
-        plan = {**plan, 'scenes': _component_thumbnail_links(plan['scenes'], req.dataset, _province.geometry)}
+    if plan.get('scenes'):
+        scenes = _optical_scene_footprints(plan['scenes'], req.dataset)
+        plan = {**plan, 'scenes': _component_thumbnail_links(scenes, req.dataset, getattr(_province, 'geometry', None))}
     return plan
 
 
@@ -1562,6 +1611,7 @@ class S1SceneRequest(PointSelectionRequest):
     polarization: str = Field("vvvh", pattern="^(vvvh|vv|hhhv|hh)$")
     merge_scenes: bool = False
     group_by_orbit: bool = False
+    list_scenes: bool = False
     platform: str | None = None
 
     @field_validator("platform")
@@ -1604,7 +1654,35 @@ def find_s1_scene(req: S1SceneRequest):
     end_exclusive = (
         dt.date.fromisoformat(req.end_date) + dt.timedelta(days=1)
     ).isoformat()
-    from .s1_mosaic import prepare_s1, search_s1_by_orbit
+    from .s1_mosaic import list_s1_results, prepare_s1, province_search_roi, search_s1_by_orbit
+    if req.list_scenes:
+        province_search = req.selection_mode == 'province' and isinstance(province, Province)
+        try:
+            search_roi = province_search_roi(province) if province_search else roi
+            results = list_s1_results(search_roi, req.start_date, end_exclusive, req.polarization,
+                                      req.merge_scenes, req.platform)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(502, f"Earth Engine query failed: {exc}") from exc
+        items = [_s1_scene_response(req, item, roi, bbox, province, direction)
+                 for direction, item in results]
+        geometry = items[0]['roi_geometry'] if items else None
+        if items:
+            sources = {source['scene_id']: source for item in items for source in item['scenes']}
+            thumbnail_geometry = geometry
+            if province_search:
+                from shapely.geometry import box, mapping
+                thumbnail_geometry = mapping(box(bbox.west, bbox.south, bbox.east, bbox.north))
+            thumbnails = _component_thumbnail_links(list(sources.values()), 's1gee',
+                                                    thumbnail_geometry, req.polarization)
+            by_id = {source['scene_id']: source for source in thumbnails}
+            for item in items:
+                item.pop('roi_geometry')
+                item['scenes'] = [by_id[source['scene_id']] for source in item['scenes']]
+                if not item['composite']:
+                    item['preview_url'] = item['scenes'][0].get('thumbnail_url')
+        return {'results': items, 'roi_geometry': geometry}
     try:
         if req.group_by_orbit:
             by_orbit = search_s1_by_orbit(roi, req.start_date, end_exclusive, req.polarization,
@@ -1648,21 +1726,22 @@ def find_s1_scene(req: S1SceneRequest):
 
 
 def _s1_scene_response(req, scene, roi, bbox, province, orbit_pass=None):
-    try:
-        available = set(scene.ee_object.bandNames().getInfo())
-    except Exception:
-        available = set()
-    bands = [b for b in ["VV", "VH", "HH", "HV"] if b in available]
-
-    try:
-        preview_url = preview_rgb(
-            scene.ee_object,
-            "s1gee",
-            bbox,
-            roi if province is not None or req.selection_mode == "rectangle" or req.rotation_deg else None,
-        )
-    except Exception:
-        preview_url = None
+    preview_url = None
+    if req.list_scenes:
+        bands = imagery.S1_POLARIZATIONS[req.polarization]
+    else:
+        try:
+            available = set(scene.ee_object.bandNames().getInfo())
+        except Exception:
+            available = set()
+        bands = [b for b in ["VV", "VH", "HH", "HV"] if b in available]
+        try:
+            preview_url = preview_rgb(
+                scene.ee_object, "s1gee", bbox,
+                roi if province is not None or req.selection_mode == "rectangle" or req.rotation_deg else None,
+            )
+        except Exception:
+            pass
 
     if req.selection_mode == 'vector':
         download_params = (f'?selection_mode=vector&vector_roi_id={req.vector_roi_id}'
@@ -1696,6 +1775,15 @@ def _s1_scene_response(req, scene, roi, bbox, province, orbit_pass=None):
     if orbit_pass:
         source_ids = [source['scene_id'] for source in scene.scenes]
         download_params += '&' + urlencode({'orbit_pass': orbit_pass, 'scene_ids': source_ids}, doseq=True)
+    full_scene_link = {}
+    if (scene.scene_count or 1) == 1 and len(scene.scenes) <= 1:
+        full_query = {'extent': 'scene', 'scene_ids': scene.scene_id, 'polarization': req.polarization,
+                      'start_date': req.start_date, 'end_date': req.end_date}
+        if req.platform is not None:
+            full_query['platform'] = req.platform
+        if orbit_pass is not None:
+            full_query['orbit_pass'] = orbit_pass
+        full_scene_link['full_scene_download_url'] = '/api/s1gee/download?' + urlencode(full_query)
     geometry = (province.geometry if province else
                 _rectangle_model(req.center_lon, req.center_lat, req.width_m, req.height_m, req.rotation_deg).geometry
                 if req.selection_mode == 'rectangle' else
@@ -1709,15 +1797,18 @@ def _s1_scene_response(req, scene, roi, bbox, province, orbit_pass=None):
         "cloud_pct": scene.cloud_pct,
         "bbox": _bbox_dict(bbox),
         "roi_geometry": geometry,
+        "footprint": source_footprint(scene.scenes),
         "rotation_deg": req.rotation_deg,
         "scale_m": S1_SCALE,
         "bands": bands,
         "preview_url": preview_url,
         "download_url": f"/api/s1gee/download{download_params}&merge_scenes={str(req.merge_scenes).lower()}",
+        **full_scene_link,
         "coverage_pct": scene.coverage_pct,
         "coverage_scale_m": 100,
         "scene_count": scene.scene_count,
-        "scenes": _component_thumbnail_links(list(scene.scenes), 's1gee', geometry, req.polarization),
+        "scenes": (list(scene.scenes) if req.list_scenes else
+                   _component_thumbnail_links(list(scene.scenes), 's1gee', geometry, req.polarization)),
         "composite": (scene.scene_count or 1) > 1,
         "warning": ("Độ phủ SAR dưới 99%; vẫn cho tải phần có dữ liệu. Hãy mở rộng khoảng ngày hoặc thu nhỏ ROI."
                     if scene.coverage_pct is not None and scene.coverage_pct < 99 else None),
@@ -1728,6 +1819,56 @@ def _s1_scene_response(req, scene, roi, bbox, province, orbit_pass=None):
         "commune_id": province.id if isinstance(province, Commune) else None,
         "commune_name": province.name if isinstance(province, Commune) else None,
     }
+
+
+def _download_s1_full_scene(scene_ids, start_date, end_date, polarization, platform, orbit_pass):
+    from .full_scene_export import FullSceneDiskSpaceError, export_s1_full_scene
+    from .s1_mosaic import restore_s1_sources
+
+    try:
+        start = dt.date.fromisoformat(start_date)
+        end = dt.date.fromisoformat(end_date)
+        if start > end:
+            raise ValueError
+        end_exclusive = (end + dt.timedelta(days=1)).isoformat()
+    except (ValueError, OverflowError):
+        raise HTTPException(422, 'Khoảng ngày tìm cảnh SAR không hợp lệ.') from None
+
+    scene_id = scene_ids[0]
+    asset_id = f'{imagery.S1_COLLECTION}/{scene_id}'
+    filename = f'{scene_id}_{polarization}_full_scene.tif'
+    out = _DOWNLOADS_DIR / f'{uuid.uuid4().hex}.tif'
+    scene_export = CURRENT_SCENE.get()
+    if scene_export is not None:
+        scene_export.check()
+        scene_export.result = out
+        scene_export.temporary_result = True
+        scene_export.update(filename=filename)
+
+    exported = False
+    try:
+        _ensure_ee()
+        with scene_download_admission():
+            try:
+                scene = restore_s1_sources(scene_ids, None, start.isoformat(), end_exclusive,
+                                           polarization, platform, orbit_pass)
+            except ValueError:
+                raise HTTPException(422, 'Cảnh SAR không khớp khoảng ngày, vệ tinh, hướng bay hoặc phân cực.') from None
+            export_s1_full_scene(asset_id, scene, out, polarization=polarization)
+        exported = True
+    except (HTTPException, QueueTimeout, TransferCancelled):
+        raise
+    except FullSceneDiskSpaceError:
+        raise HTTPException(507, 'Không đủ dung lượng để xuất GeoTIFF SAR nguyên cảnh.') from None
+    except Exception as exc:
+        logging.getLogger(__name__).warning('Full Sentinel-1 export failed: %s', type(exc).__name__)
+        raise HTTPException(502, 'Không tạo được GeoTIFF Sentinel-1 nguyên cảnh từ GEE.') from None
+    finally:
+        if not exported and scene_export is None:
+            with suppress(OSError):
+                out.unlink(missing_ok=True)
+    background = BackgroundTask(out.unlink, missing_ok=True) if scene_export is None else None
+    return FileResponse(out, media_type='image/tiff', filename=filename, background=background)
 
 
 @app.get("/api/s1gee/download")
@@ -1751,20 +1892,27 @@ def s1gee_download(
     platform: str | None = None,
     orbit_pass: Literal['ASCENDING', 'DESCENDING'] | None = None,
     scene_ids: Annotated[list[str] | None, Query(max_length=25)] = None,
+    extent: Literal['roi', 'scene'] = 'roi',
 ):
-    """Tải GeoTIFF S1 GRD (dB) theo vùng đã chọn — không cần tài khoản CDSE."""
+    """Tải GeoTIFF S1 GRD (dB) theo vùng đã chọn hoặc nguyên một cảnh."""
     try:
         platform = validate_platform('s1gee', platform)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
-    _ensure_ee()
-    if polarization not in ("vvvh", "vv", "hhhv", "hh"):
+    if polarization not in imagery.S1_POLARIZATIONS:
         raise HTTPException(400, "polarization must be vvvh|vv|hhhv|hh")
-    if ((scene_ids is None) != (orbit_pass is None) or scene_ids is not None and (
+    if scene_ids is not None and (
             not scene_ids or len(set(scene_ids)) != len(scene_ids) or
             any(not value.isascii() or not value.replace('_', '').isalnum() or len(value) > 100
-                for value in scene_ids) or (len(scene_ids) > 1 and not merge_scenes))):
+                for value in scene_ids)):
         raise HTTPException(422, 'Danh sách cảnh SAR đã chọn không hợp lệ.')
+    if extent == 'scene':
+        if scene_ids is None or len(scene_ids) != 1:
+            raise HTTPException(422, 'Chọn một cảnh SAR để tải nguyên cảnh.')
+        return _download_s1_full_scene(scene_ids, start_date, end_date, polarization, platform, orbit_pass)
+    if (scene_ids is None) != (orbit_pass is None) or (scene_ids and len(scene_ids) > 1 and not merge_scenes):
+        raise HTTPException(422, 'Danh sách cảnh SAR đã chọn không hợp lệ.')
+    _ensure_ee()
     roi, bbox, province = _resolve_selection(
         selection_mode,
         lon,
@@ -1783,10 +1931,14 @@ def s1gee_download(
     end_exclusive = (
         dt.date.fromisoformat(end_date) + dt.timedelta(days=1)
     ).isoformat()
+    pinned_province = selection_mode == 'province' and scene_ids is not None
     if scene_ids is not None:
         from .s1_mosaic import restore_s1_sources
         try:
-            scene = restore_s1_sources(scene_ids, roi, start_date, end_exclusive, polarization, platform, orbit_pass)
+            boundary = {'province_geometry': province.geometry} if pinned_province else {}
+            validation_roi = bbox_to_ee_geom(bbox) if pinned_province else roi
+            scene = restore_s1_sources(scene_ids, validation_roi, start_date, end_exclusive,
+                                       polarization, platform, orbit_pass, **boundary)
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
         except Exception as exc:
@@ -1828,17 +1980,19 @@ def s1gee_download(
         bbox = source_bbox(
             bbox, S1_SCALE, rectangle.center_lat if rectangle is not None else lat
         )
-    band_urls = download_geotiff(
-        scene.ee_object,
-        "s1gee",
-        bbox,
-        S1_SCALE,
-        roi if province is not None else None,
-    )
+    if not pinned_province:
+        band_urls = download_geotiff(
+            scene.ee_object,
+            "s1gee",
+            bbox,
+            S1_SCALE,
+            roi if province is not None else None,
+        )
 
-    if (getattr(scene, "scene_count", None) or 1) > 1:
+    scene_count = getattr(scene, "scene_count", None) or 1
+    if scene_count > 1:
         direction = f'_{orbit_pass.lower()}' if orbit_pass else ''
-        fname = f"s1gee_mosaic_{start_date}_{end_date}{direction}_n{scene.scene_count}_{polarization}.tif"
+        fname = f"s1gee_mosaic_{start_date}_{end_date}{direction}_n{scene_count}_{polarization}.tif"
     else:
         fname = f"{scene.scene_id}_{polarization}.tif"
     if province is not None:
@@ -1856,12 +2010,36 @@ def s1gee_download(
     out = _DOWNLOADS_DIR / f"{uuid.uuid4().hex}.tif"
     raw = out.with_suffix(".source.tif") if output_grid else out
     try:
-        merge_band_tiffs(band_urls, raw, **({"preserve_masks": True} if output_grid or merge_scenes or scene_ids or selection_mode == 'vector' else {}))
+        if pinned_province:
+            from .full_scene_export import (
+                FullSceneDiskSpaceError, SceneDoesNotCoverProvince, export_s1_province,
+            )
+            footprint = source_footprint(scene.scenes)
+            if footprint is None:
+                raise HTTPException(502, 'GEE chưa trả footprint hợp lệ cho các cảnh SAR đã chọn.')
+            try:
+                export_s1_province(scene.ee_object, out, province_geometry=province.geometry,
+                                   footprint=footprint, bbox=bbox,
+                                   bands=imagery.S1_POLARIZATIONS[polarization])
+            except FullSceneDiskSpaceError:
+                raise HTTPException(507, 'Không đủ dung lượng để xuất GeoTIFF SAR theo tỉnh.') from None
+            except SceneDoesNotCoverProvince:
+                raise HTTPException(422, 'Các cảnh SAR đã chọn không phủ ranh giới tỉnh.') from None
+        else:
+            merge_band_tiffs(band_urls, raw, **({"preserve_masks": True} if output_grid or merge_scenes or scene_ids or selection_mode == 'vector' else {}))
         if output_grid:
             warp_to_grid(raw, out, output_grid)
         if selection_mode == 'vector':
             from .vector_mask import mask_raster_to_polygon
             mask_raster_to_polygon(out, province.geometry)
+        from .s1_mosaic import write_s1_export_tags
+        try:
+            write_s1_export_tags(out, scene, polarization,
+                                 extent='province' if pinned_province else 'roi', selection_mode=selection_mode)
+        except (RasterioError, OSError):
+            with suppress(OSError):
+                out.unlink(missing_ok=True)
+            raise HTTPException(502, 'Không ghi được metadata vào GeoTIFF Sentinel-1.') from None
     except requests.RequestException as exc:
         raise HTTPException(502, f"Failed to download GeoTIFF from GEE: {exc}") from exc
     except RuntimeError as exc:
@@ -2058,8 +2236,17 @@ def s1_download(product_id: str, filename: str | None = None):
     return StreamingResponse(
         iter_open_product(resp, first),
         media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="{safe_name}"'},
+        headers=_cdse_zip_headers(resp, safe_name),
     )
+
+
+def _cdse_zip_headers(response, filename):
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    length = response.headers.get('Content-Length')
+    encoding = response.headers.get('Content-Encoding', 'identity')
+    if isinstance(length, str) and length.isascii() and length.isdecimal() and encoding == 'identity':
+        headers['Content-Length'] = length
+    return headers
 
 
 def _ensure_cdse_creds() -> None:
@@ -2336,8 +2523,8 @@ def _s1_crop_impl(product_ids: list[str], province, scale_m: float):
             f"{region_tag}_{pol_tag}.tif"
         )
     request_id = uuid.uuid4().hex
-    out_path = _DOWNLOADS_DIR / (f'{request_id}_{fname}' if rectangle else fname)
-    tmp_dir = _DOWNLOADS_DIR / (f'_crop_{request_id}' if rectangle else f"_crop_{first_pid[:8]}")
+    out_path = _DOWNLOADS_DIR / f'{request_id}_{fname}'
+    tmp_dir = _DOWNLOADS_DIR / f'_crop_{request_id}'
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -2376,13 +2563,19 @@ def _s1_crop_impl(product_ids: list[str], province, scale_m: float):
             for bi, pol in enumerate(pols, start=1):
                 dst.write(out[bi - 1], bi)
                 dst.set_band_description(bi, pol.upper())
+            if len(product_ids) > 1:
+                from .s1_mosaic import mosaic_tags
+                sources = []
+                for pid in product_ids:
+                    measurement = next(item for band_files in all_meas[pid].values() for item in band_files)
+                    product_name = measurement.get('key', '').split('/measurement/', 1)[0].rsplit('/', 1)[-1]
+                    sources.append({'product_id': pid, 'product_name': product_name or None})
+                dst.update_tags(**mosaic_tags(sources, provider='CDSE S3', policy='last_valid_measurement_wins'))
     except HTTPException:
-        if rectangle is not None:
-            out_path.unlink(missing_ok=True)
+        out_path.unlink(missing_ok=True)
         raise
     except Exception as exc:
-        if rectangle is not None:
-            out_path.unlink(missing_ok=True)
+        out_path.unlink(missing_ok=True)
         raise HTTPException(502, f"Warp/cắt GRD thất bại: {exc}") from exc
     finally:
         import shutil  # noqa: PLC0415
@@ -2788,7 +2981,7 @@ def s2_download(product_id: str, filename: str | None = None):
     return StreamingResponse(
         iter_open_product(resp, first),
         media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="{safe_name}"'},
+        headers=_cdse_zip_headers(resp, safe_name),
     )
 
 
@@ -3269,6 +3462,11 @@ _scene_inventory_store = register_scene_inventory(app)
 
 register_vector_routes(app, _vector_store)
 register_batch_routes(app, _batch_store, lambda: _batch_service)
+from .task_center import register_task_center
+register_task_center(app, _timeseries_store, _batch_store, _frame_store,
+                     lambda: _esri_service,
+                     lambda: _get_download_store() if (_DOWNLOADS_DIR / 'gee-downloads' / 'state.sqlite3').is_file() else None,
+                     lambda: _batch_service, _get_download_service)
 app.include_router(local_provider_settings_router)
 
 app.mount("/", StaticFiles(directory=str(_STATIC_DIR), html=True), name="static")

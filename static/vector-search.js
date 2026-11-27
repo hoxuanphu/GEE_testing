@@ -26,7 +26,6 @@
         throw new Error(error && typeof error.detail === 'string' ? error.detail : 'Không thể tải DEM GeoTIFF.');
       }
       const blob = await response.blob();
-      if (!isCurrent(version, selection.vector_roi_id)) return;
       const url = URL.createObjectURL(blob);
       const link = document.createElement('a'); link.href = url;
       const disposition = response.headers.get('Content-Disposition') || '';
@@ -34,7 +33,7 @@
       link.download = filename ? filename[1].replace(/[\\/\u0000-\u001f]/g, '_') : `${dataset}_30m_${Date.now()}.tif`;
       document.body.appendChild(link); link.click(); link.remove();
       setTimeout(() => URL.revokeObjectURL(url), 60000);
-      el('status').textContent = 'Đã tải DEM GeoTIFF theo polygon (độ cao mét, NoData -9999).';
+      if (isCurrent(version, selection.vector_roi_id)) el('status').textContent = 'Đã tải DEM GeoTIFF theo polygon (độ cao mét, NoData -9999).';
     } catch (error) {
       if (isCurrent(version, selection.vector_roi_id)) el('status').textContent = 'Lỗi: ' + errorText(error);
     } finally {

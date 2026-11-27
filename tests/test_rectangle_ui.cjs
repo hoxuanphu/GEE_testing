@@ -108,7 +108,7 @@ function fixture(fetchHandler = async () => response({})) {
   for (const key of ['dragging','doubleClickZoom','scrollWheelZoom','boxZoom','keyboard','touchZoom']) {
     map[key] = {state:key !== 'scrollWheelZoom', enabled() { return this.state; }, enable() { this.state = true; }, disable() { this.state = false; }};
   }
-  function layer() { return {children:[], addTo(target) { if (target.children) target.children.push(this); else visible.add(this); return this; }, clearLayers() { this.children = []; }, getElement:() => ({dataset:{},style:{}}), getBounds:() => [], setLatLng() {}, bindTooltip() {}, on() {}, bringToFront() {}}; }
+  function layer() { return {children:[], eachLayer() {}, addTo(target) { if (target.children) target.children.push(this); else visible.add(this); return this; }, clearLayers() { this.children = []; }, getElement:() => ({dataset:{},style:{}}), getBounds:() => [], setLatLng() {}, bindTooltip() {}, on() {}, bringToFront() {}}; }
   const L = {map:() => map, tileLayer:layer, layerGroup:layer, featureGroup:layer, polygon:layer, polyline:layer, marker:layer, divIcon:x => x,
     geoJSON:layer, control:{layers:() => ({addTo() { return this; }, addOverlay() {}})}, DomEvent:{stopPropagation() {}}};
   const context = vm.createContext({document:doc, window:{addEventListener() {}}, L, RectangleROI:ROI, console,
@@ -225,27 +225,45 @@ test('scene and S1 GEE requests contain rectangle only; response cannot replace 
   f.el('dataset').value='s1gee'; await f.el('dataset').fire('change'); await f.el('btnSearch').fire('click');
   assert.equal(f.requests[1].url,'/api/s1gee/scene'); assert.equal(f.requests[1].body.height_m,2000);
   assert.equal(f.requests[1].body.group_by_orbit,true);
+  assert.equal(f.requests[1].body.list_scenes,true);
   assert.ok(!('radius_m' in f.requests[1].body));
 });
 
-test('choosing a SAR direction changes the preview, source details and download together', async () => {
+test('choosing any SAR scene within an orbit changes preview, source details and download together', async () => {
   const up = {...scene(), orbit_pass:'ASCENDING', scene_id:'up', coverage_pct:99.995,
-    preview_url:'/up.png', download_url:'/download?orbit_pass=ASCENDING'};
-  const down = {...up, orbit_pass:'DESCENDING', scene_id:'down', coverage_pct:69.01,
+    preview_url:'/up.png', download_url:'/download?orbit_pass=ASCENDING',
+    full_scene_download_url:'/api/s1gee/download?extent=scene&scene_ids=up'};
+  const down = {...up, orbit_pass:'DESCENDING', scene_id:'down', coverage_pct:69.01, composite:true, scene_count:2,
     preview_url:null, download_url:'/download?orbit_pass=DESCENDING'};
-  const f = fixture(async () => response({results:[up, down]}));
+  const earlier = {...up, scene_id:'earlier', coverage_pct:94, preview_url:'/earlier.png',
+    download_url:'/download?orbit_pass=ASCENDING&scene_ids=earlier',
+    full_scene_download_url:'/api/s1gee/download?extent=scene&scene_ids=earlier'};
+  const f = fixture(async () => response({results:[up, earlier, down]}));
   await f.rectangle();
   f.el('dataset').value='s1gee'; await f.el('dataset').fire('change'); await f.el('btnSearch').fire('click');
   const [options, details] = f.el('meta').children;
-  const [ascending, descending] = options.children;
-  assert.match(ascending.textContent, /ASCENDING/);
-  assert.match(descending.textContent, /DESCENDING.*69\.01%/);
+  const [upGroup, downGroup] = options.children;
+  const [upTitle, first, other] = upGroup.children;
+  const [downTitle, downRow] = downGroup.children;
+  const ascending = first.children[0];
+  const alternate = other.children[0];
+  const descending = downRow.children[0];
+  assert.match(upTitle.textContent, /ASCENDING.*2/);
+  assert.match(downTitle.textContent, /DESCENDING.*1/);
+  assert.match(descending.textContent, /69\.01%/);
   assert.equal(f.el('preview').src, '/up.png');
+  const fullLink = () => details.children.find(child => child.href?.includes('extent=scene'));
+  assert.equal(fullLink().href, up.full_scene_download_url);
+  await alternate.fire('click');
+  assert.equal(f.el('dl').href, earlier.download_url);
+  assert.equal(f.el('preview').src, '/earlier.png');
+  assert.equal(fullLink().href, earlier.full_scene_download_url);
   await descending.fire('click');
   assert.equal(descending['aria-pressed'], 'true');
   assert.equal(ascending['aria-pressed'], 'false');
   assert.equal(f.el('dl').href, down.download_url);
   assert.equal(f.el('preview').src, undefined);
+  assert.equal(fullLink(), undefined);
   assert.match(details.children[0].textContent, /^down/);
 });
 

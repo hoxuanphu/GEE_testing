@@ -70,6 +70,76 @@ class TestSceneCatalog(unittest.TestCase):
         url = scene['download_url'] + '?extent=scene'
         self.assertEqual(self.client.get(url, follow_redirects=False).status_code, 409)
 
+    def test_gee_sentinel2_province_uses_native_tiles_for_exact_scene(self):
+        asset = 'COPERNICUS/S2_SR_HARMONIZED/EXACT'
+        snapshot = self.store.create_search(
+            {'source': 'gee', 'dataset': 'sentinel2', 'selection_mode': 'province',
+             'province_id': 'test', 'roi_geometry': FOOTPRINT, 's2_band_preset': 'rgbnir'},
+            [{'asset_id': asset, 'footprint': FOOTPRINT}],
+        )
+        def export(asset_id, path, **options):
+            path.write_bytes(b'province-fixture')
+        with patch.object(main, '_DOWNLOADS_DIR', Path(self.temp.name)), \
+             patch.object(main, '_ensure_ee'), \
+             patch.object(main, 'download_geotiff') as legacy, \
+             patch('app.scene_catalog.export_s2_province', create=True, side_effect=export) as native:
+            response = self.client.get(f'/api/scene-catalog/{snapshot["search_id"]}/download/0')
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.content, b'province-fixture')
+        self.assertIn('sentinel2_EXACT_rgbnir.tif', response.headers['content-disposition'])
+        self.assertEqual(native.call_args.args[0], asset)
+        self.assertEqual(native.call_args.kwargs, {
+            'province_geometry': FOOTPRINT, 'footprint': FOOTPRINT, 's2_band_preset': 'rgbnir',
+        })
+        legacy.assert_not_called()
+        self.assertFalse(native.call_args.args[1].exists())
+
+    def test_gee_sentinel2_province_queries_bbox_and_filters_using_exact_polygon(self):
+        from shapely.geometry import box, mapping
+
+        bounds = main.Bbox(105, 9, 107, 11)
+        province_geometry = mapping(box(105, 9, 107, 11).difference(box(105.5, 9.5, 106.5, 10.5)))
+        province = main.Province('test', 'Test', province_geometry, bounds)
+        prefix = 'COPERNICUS/S2_SR_HARMONIZED/'
+        rows = [
+            dict(asset_id=prefix + 'inside', date='2026-01-31', cloud_pct=30,
+                 footprint=mapping(box(105.1, 9.1, 105.3, 9.3))),
+            dict(asset_id=prefix + 'in_hole', date='2026-01-30', cloud_pct=35,
+                 footprint=mapping(box(105.7, 9.7, 106.3, 10.3))),
+        ]
+        with patch.object(main, '_ensure_ee'), \
+             patch.object(main, '_resolve_selection', return_value=('exact-roi', bounds, province)), \
+             patch.object(main, 'bbox_to_ee_geom', return_value='bbox-roi'), \
+             patch.object(main, 'list_timeseries_scenes', return_value=rows) as listing:
+            response = self.client.post('/api/scene-catalog', json={
+                'dataset': 'sentinel2', 'selection_mode': 'province', 'province_id': 'test',
+                'start_date': '2026-01-01', 'end_date': '2026-01-31', 's2_band_preset': 'rgbnir',
+            })
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(listing.call_args.kwargs['roi'], 'bbox-roi')
+        data = response.json()
+        self.assertEqual(data['total'], 1)
+        self.assertEqual(data['scenes'][0]['asset_id'], prefix + 'inside')
+        self.assertEqual(data['parameters']['roi_geometry'], json.loads(json.dumps(province_geometry)))
+        self.assertEqual(data['parameters']['s2_band_preset'], 'rgbnir')
+
+    def test_gee_sentinel2_province_thumbnail_uses_small_window_for_saved_scene(self):
+        from shapely.geometry import box, mapping, shape
+
+        asset = 'COPERNICUS/S2_SR_HARMONIZED/EXACT'
+        province_geometry = mapping(box(105, 9, 107, 11).difference(box(105.5, 9.5, 106.5, 10.5)))
+        snapshot = self.store.create_search(
+            {'source': 'gee', 'dataset': 'sentinel2', 'selection_mode': 'province',
+             'roi_geometry': province_geometry, 'bbox': vars(main.Bbox(105, 9, 107, 11))},
+            [{'asset_id': asset, 'footprint': mapping(box(106.7, 10, 108, 12))}],
+        )
+        with patch.object(main, '_ensure_ee'), \
+             patch('app.imagery.render_catalog_thumbnail', return_value=b'fixture-png') as render:
+            response = self.client.get(f'/api/scene-catalog/{snapshot["search_id"]}/thumbnail/0')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(render.call_args.args[:2], (asset, 'sentinel2'))
+        self.assertTrue(shape(json.loads(render.call_args.args[2])).equals(box(106.7, 10, 107, 11)))
+
     def test_provider_filter_before_snapshot_pagination_and_unknown_cloud(self):
         rows = [dict(id=f'S2A_{i}', date='2026-01-05', cloud_pct=30) for i in range(61)]
         rows += [dict(id='unknown', cloud_pct=None), dict(id='below', cloud_pct=5)]

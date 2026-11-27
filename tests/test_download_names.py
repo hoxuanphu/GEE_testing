@@ -13,7 +13,7 @@ class DownloadNameTests(unittest.TestCase):
     def test_sar_preserves_full_id_in_point_and_administrative_names(self):
         product = 'S1A_IW_GRDH_1SDV_20260520T110616_20260520T110641_064123_080ABC_1234'
         scene = SimpleNamespace(scene_id=product, date='2026-05-20', ee_object=object())
-        with tempfile.TemporaryDirectory() as tmp, patch.object(main, '_DOWNLOADS_DIR', Path(tmp)), patch.object(main, '_ensure_ee'), patch.object(main, 'best_s1_scene', return_value=scene), patch.object(main, 'best_s1_scene_for_roi', return_value=scene), patch.object(main, 'download_geotiff', return_value=[]), patch.object(main, 'merge_band_tiffs'):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(main, '_DOWNLOADS_DIR', Path(tmp)), patch.object(main, '_ensure_ee'), patch.object(main, 'best_s1_scene', return_value=scene), patch.object(main, 'best_s1_scene_for_roi', return_value=scene), patch.object(main, 'download_geotiff', return_value=[]), patch.object(main, 'merge_band_tiffs'), patch('app.s1_mosaic.write_s1_export_tags'):
             for mode in ('point', 'province', 'commune'):
                 region = None if mode == 'point' else SimpleNamespace(id='79')
                 with self.subTest(mode=mode), patch.object(main, '_resolve_selection', return_value=(object(), Bbox(106, 10, 107, 11), region)):

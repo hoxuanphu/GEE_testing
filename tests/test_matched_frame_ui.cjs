@@ -88,7 +88,7 @@ function fixture({handler, saved, blocked = false, legacy = false} = {}) {
   map.latLngToContainerPoint=([lat,lng]) => ({x:lng*100,y:-lat*100});
   map.containerPointToLatLng=([x,y]) => ({lng:x/100,lat:-y/100});
   for (const key of ['dragging','doubleClickZoom','scrollWheelZoom','boxZoom','keyboard','touchZoom']) map[key]={enabled:() => true, enable() {},disable() {}};
-  const layer = () => ({children:[], addTo(target) { if (target.children) target.children.push(this); else visible.add(this); return this; }, getBounds:() => ['footprint'], clearLayers() {this.children=[];}, getElement:() => null, bindTooltip() {},on() {},setLatLng() {}});
+  const layer = () => ({children:[], eachLayer() {}, addTo(target) { if (target.children) target.children.push(this); else visible.add(this); return this; }, getBounds:() => ['footprint'], clearLayers() {this.children=[];}, getElement:() => null, bindTooltip() {},on() {},setLatLng() {}});
   const L={map:() => map,tileLayer:layer,layerGroup:layer,featureGroup:layer,polygon:layer,polyline:layer,marker:layer,geoJSON:layer,divIcon:value => value, control:{layers:() => ({addTo() {return this;}, addOverlay() {}})}};
   const defaultHandler=(url, options) => {
     if (url === `${API}/references`) return response(frame('reference-1'));
@@ -476,9 +476,11 @@ test('copy feature refreshes both script URLs instead of reusing the cached pre-
 
 test('workspace integration observes matched results and keeps scripts, labels, scoped styles and warnings', () => {
   assert.match(workspace,/move\(region, \['mfRoiSource', 'referenceSelection'/);
-  assert.match(workspace,/move\(source, \['mfPlatformSelection'\]\)/);
-  assert.match(workspace,/move\(get\('workspaceResults'\), \[[^\]]*'matchedFrameResults'/);
-  assert.equal((workspace.match(/\['plan','sceneCatalogResults','result','s1result','s5pResults','timeSeriesResults','matchedFrameResults'\]/g)||[]).length,2);
+  assert.match(workspace,/move\(source, \[[^\]]*'mfPlatformSelection'/);
+  assert.match(workspace,/const resultIds = \[[^\]]*'matchedFrameResults'/);
+  assert.match(workspace,/move\(get\('workspaceResultContent'\), resultIds\)/);
+  assert.match(workspace,/const resultNodes = resultIds\.map\(get\)/);
+  assert.match(workspace,/resultNodes\.forEach\(node => observer\.observe\(node/);
   assert.match(workspace,/window.SatelliteWorkspace = Object.freeze\(\{showView, hasResults\}\)/);
   assert.ok(html.indexOf('src="/matched-frame.js') > html.indexOf('src="/workspace.js'));
   for(const id of ['mfFile','mfGridMode','mfResolution','mfBands','mfPolarization','mfSort','mfReferenceDate','mfCloud','mfCloudMin','mfMinCoverage','mfMergeScenes','mfResultMode','mfOrbitPass','mfRelativeOrbit','mfPlatform','mfReferencePass','mfReferenceOrbit','mfAcknowledge']) assert.match(html,new RegExp(`<label for="${id}"`));

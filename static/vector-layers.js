@@ -46,7 +46,6 @@
     element.setAttribute('role', 'status'); element.setAttribute('aria-live', 'polite');
     return element;
   }
-  const heading = node('h3', 'Lớp vector');
   const input = identified(node('input'), 'vectorFiles');
   input.type = 'file'; input.multiple = true; input.accept = '.geojson,.json,.kml,.kmz,.gpx,.zip';
   const help = identified(node('p', 'GeoJSON, KML/KMZ, GPX hoặc Shapefile ZIP. Tối đa 20 MiB mỗi file.'), 'vectorImportHelp');
@@ -59,7 +58,7 @@
   const selectionStatus = status('vectorSelectionStatus');
   const roiStatus = status('vectorRoiStatus');
   const list = identified(node('div', null, 'vector-import-list'), 'vectorImportList');
-  panel.append(heading, labelFor(input, 'Nhập một hoặc nhiều file vector'), help, importStatus, list, selectionStatus, toolbar, roiStatus);
+  panel.append(labelFor(input, 'Nhập một hoặc nhiều file vector'), help, importStatus, list, selectionStatus, toolbar, roiStatus);
 
   function invalidate() {
     if (typeof invalidateSearchResults === 'function') invalidateSearchResults();

@@ -3,20 +3,13 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>GEE Surface Reflectance Downloader</title>
+<title>Satellite Workspace</title>
 <script src="/theme.js?v=1"></script>
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css" />
+<link rel="stylesheet" href="/vendor/leaflet/leaflet.css?v=1.9.4" />
 <style>
   :root { --accent: #2563eb; --bg: #0f172a; --panel: #1e293b; }
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; display: flex; height: 100vh; overflow: hidden; }
-  #sidebar {
-    width: 380px; background: var(--panel); color: #e2e8f0; padding: 20px;
-    overflow-y: auto; flex-shrink: 0; display: flex; flex-direction: column; gap: 14px;
-  }
-  #sidebar h1 { font-size: 18px; color: #fff; }
-  #sidebar h1 small { display: block; font-weight: 400; color: #94a3b8; font-size: 12px; margin-top: 4px; }
+  body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
   label { font-size: 12px; color: #94a3b8; display: block; margin-bottom: 4px; }
   input, select, button {
     width: 100%; padding: 8px 10px; border-radius: 8px; border: 1px solid #334155;
@@ -28,14 +21,16 @@
   }
   button:hover { filter: brightness(1.1); }
   button:disabled { opacity: .5; cursor: wait; }
-  .row { display: flex; gap: 8px; } .row > div { flex: 1; }
+  .row { display: flex; gap: 8px; } .row > div { flex: 1; min-width: 0; }
   .s1-orbit-options { display: grid; gap: 6px; margin-bottom: 10px; }
+  .s1-orbit-options > details > summary { color: var(--ink); font-weight: 700; cursor: pointer; }
+  .s1-orbit-choice { margin-block: 6px; }
+  .s1-orbit-choice button { min-width: 0; overflow-wrap: anywhere; text-align: left; }
   .s1-orbit-options button[aria-pressed="false"] { background: var(--panel); color: var(--ink); border: 1px solid var(--input-border); }
   #coords { font-family: ui-monospace, monospace; font-size: 13px; color: #38bdf8; min-height: 18px; }
   #status { font-size: 13px; color: #fbbf24; min-height: 18px; }
-  #result { display: none; background: #0f172a; border-radius: 10px; padding: 12px; font-size: 13px; }
   #plan { display: none; background: #172554; border: 1px solid #3b82f6; border-radius: 10px; padding: 12px; font-size: 13px; line-height: 1.6; }
-  #planScenes { margin: 8px 0; max-height: 190px; overflow-y: auto; }
+  #planScenes { margin: 8px 0; }
   .plan-scene { border-top: 1px solid #334155; padding: 5px 0; font-size: 12px; }
   #confirmComposite { margin-top: 8px; background: #d97706; }
   #cancelComposite { margin-top: 6px; background: #475569; }
@@ -47,17 +42,18 @@
     background: #059669; color: #fff; text-decoration: none; border-radius: 8px; font-weight: 600;
   }
   #timeSeriesResults { display: none; background: #0f172a; border-radius: 10px; padding: 12px; font-size: 13px; line-height: 1.6; }
-  #timeSeriesScenes { max-height: 300px; overflow-y: auto; margin: 8px 0; }
+  #timeSeriesScenes { margin: 8px 0; }
   .timeseries-scene { border-top: 1px solid #334155; padding: 6px 0; overflow-wrap: anywhere; }
   #timeSeriesResults button { margin-top: 8px; }
   #timeSeriesZip { display: block; margin-top: 8px; color: #4ade80; }
   #timeSeriesZip[hidden] { display: none; }
   #timeSeriesJob { margin-top: 8px; color: #fbbf24; overflow-wrap: anywhere; }
   #time_series_enabled { width: auto; margin-right: 6px; }
-  #map { flex: 1; }
   .hint { font-size: 11px; color: #64748b; }
   #rectangleSelection { border:1px solid #475569; padding:10px; border-radius:8px; }
   #s1list a { white-space:normal; overflow-wrap:anywhere; max-width:160px; }
+  #s1list { display:flex; flex-direction:column; gap:6px; }
+  #s1meta { margin-bottom:8px; }
   #s1list > div, #s1list > div > div { flex-wrap:wrap; }
   #rectangleSelection[hidden], #rectangleGrd[hidden] { display:none; }
   #rectangleSelection .row { margin-bottom:6px; }
@@ -69,7 +65,7 @@
   .rectangle-handle.move { cursor:move; }
   .rectangle-handle.rotate { border-radius:50%; background:#38bdf8; cursor:grab; }
 </style>
-<link rel="stylesheet" href="/workspace.css?v=scene-thumbnails-3" />
+<link rel="stylesheet" href="/workspace.css?v=workspace-layout-2" />
 <style>
   #matchedFrameResults input[type=radio] { width:20px; height:20px; min-height:0; flex:0 0 20px; accent-color:var(--accent); padding:0; }
   #mfSelectedSources ol { padding-left:24px; }
@@ -79,36 +75,40 @@
 </head>
 <body>
 <header class="workspace-header">
-  <div><h1>Satellite Workspace</h1><p>Khám phá và tải dữ liệu vệ tinh</p></div>
+  <div class="workspace-brand">
+    <span class="workspace-mark" aria-hidden="true"></span>
+    <h1>Satellite Workspace</h1>
+  </div>
   <nav class="workspace-nav" aria-label="Không gian làm việc">
-    <button type="button" data-workspace-view="explore" aria-pressed="true">Khám phá</button>
-    <button type="button" data-workspace-view="results" aria-pressed="false">Kết quả</button>
-    <button type="button" data-workspace-view="jobs" aria-pressed="false">Tác vụ tải / Esri</button>
+    <button type="button" data-workspace-view="explore" aria-controls="sidebar" aria-pressed="true">Khám phá</button>
+    <button type="button" data-workspace-view="results" aria-controls="workspaceResults" aria-pressed="false">Kết quả</button>
+    <button type="button" data-workspace-view="jobs" aria-controls="workspaceJobs" aria-pressed="false">Tiến trình tải</button>
   </nav>
-  <div class="workspace-theme">
-    <label for="workspaceTheme">Giao diện</label>
-    <select id="workspaceTheme" aria-label="Chế độ giao diện">
-      <option value="system">Theo hệ thống</option>
-      <option value="light">Sáng</option>
-      <option value="dark">Tối</option>
-    </select>
+  <div class="workspace-utilities">
+    <label class="workspace-theme" for="workspaceTheme">
+      <span>Giao diện</span>
+      <select id="workspaceTheme">
+        <option value="system">Theo hệ thống</option>
+        <option value="light">Sáng</option>
+        <option value="dark">Tối</option>
+      </select>
+    </label>
     <a id="providerSettingsLink" href="/provider-settings.html" hidden>Cấu hình nguồn</a>
   </div>
+  <div id="providerWarning" class="provider-warning" role="status" hidden>
+    <a href="/provider-settings.html"><span></span></a>
+  </div>
 </header>
-<div id="sidebar">
-  <h1>Satellite SR Downloader
-    <small>Surface Directional Reflectance — Sentinel-2 / Landsat 8-9</small>
-  </h1>
-
+<div id="sidebar" class="workspace-pane" role="region" aria-labelledby="workspaceExploreTitle">
   <div>
-    <label>Che do chon vung</label>
+    <label for="selection_mode">Cách chọn vùng</label>
     <select id="selection_mode">
-      <option value="point">Theo vi tri</option>
+      <option value="point">Theo vị trí</option>
       <option value="rectangle">Vẽ hình chữ nhật (ROI)</option>
       <option value="reference">Đồng khung GeoTIFF mẫu</option>
       <option value="vector">Từ polygon lớp vector</option>
-      <option value="province">Theo dia phan hanh chinh (34 tinh/thanh)</option>
-      <option value="commune">Theo xa/phuong</option>
+      <option value="province">Theo tỉnh / thành phố</option>
+      <option value="commune">Theo xã / phường</option>
     </select>
   </div>
 
@@ -213,6 +213,7 @@
     <select id="province_id">
       <option value="">Dang tai danh sach tinh/thanh...</option>
     </select>
+    <button id="clearProvinceSelection" type="button" disabled>Xóa chọn tỉnh</button>
     <div id="provinceInfo" class="hint" style="margin-top:6px">Hoac bam truc tiep vao tinh tren ban do.</div>
   </div>
 
@@ -227,16 +228,15 @@
   </div>
 
   <div>
-    <label>Vị trí (click trên bản đồ hoặc nhập tay)</label>
     <div class="row">
-      <div><input id="lon" type="number" step="0.0001" placeholder="Kinh độ (lon)" /></div>
-      <div><input id="lat" type="number" step="0.0001" placeholder="Vĩ độ (lat)" /></div>
+      <div><label for="lon">Kinh độ</label><input id="lon" type="number" step="0.0001" /></div>
+      <div><label for="lat">Vĩ độ</label><input id="lat" type="number" step="0.0001" /></div>
     </div>
-    <div id="coords" style="margin-top:6px">Chưa chọn vị trí</div>
+    <div id="coords" role="status"></div>
   </div>
 
   <div>
-    <label>Nguồn dữ liệu</label>
+    <label>Bộ dữ liệu</label>
     <select id="dataset">
       <option value="sentinel2">Sentinel-2 SR (10 m)</option>
       <option value="landsat">Landsat 8/9 SR (30 m)</option>
@@ -333,14 +333,15 @@
     <input id="radius_m" type="number" value="2000" min="100" max="15000" step="100" />
   </div>
 
-  <div id="rotationSelection">
+  <details id="rotationSelection" class="workspace-disclosure">
+    <summary>Góc xoay vùng</summary>
     <label for="rotation_deg">Góc xoay (độ, chiều kim đồng hồ)</label>
     <div class="row">
       <div><input id="rotation_deg" type="number" min="0" max="360" step="1" value="0" inputmode="numeric" /></div>
       <div><input id="rotation_slider" type="range" min="0" max="360" step="1" value="0" aria-label="Góc xoay (độ)" /></div>
       <button id="rotation_reset" type="button" style="width:auto; flex:0 0 auto">Đặt lại</button>
     </div>
-  </div>
+  </details>
 
   <div id="pointMergeSelection">
     <label><input id="merge_scenes" type="checkbox" style="width:auto" /> Ghép nhiều cảnh (RAW / Mosaic ổn định)</label>
@@ -451,13 +452,18 @@
     </section>
   </section>
   <section id="imageInventoryControls" aria-label="Đếm ảnh và tải danh sách" aria-busy="false">
-    <button id="btnCountImages" type="button" aria-describedby="imageInventoryHint">Đếm ảnh</button>
-    <p id="imageInventoryHint" class="hint">Mọi cảnh giao ROI trong khoảng ngày, kể cả có mây; cảnh có thể chỉ phủ một phần ROI. Chỉ lấy danh sách, không tải ảnh.</p>
-    <div id="imageCountStatus" role="status" aria-live="polite" aria-atomic="true"></div>
-    <a id="imageInventoryCsv" hidden>Tải danh sách CSV</a>
+    <details class="workspace-disclosure">
+      <summary>Đếm ảnh và xuất CSV</summary>
+      <div class="workspace-details-body">
+        <p id="imageInventoryHint" class="hint">Đếm mọi cảnh giao vùng trong khoảng ngày, kể cả cảnh có mây hoặc chỉ phủ một phần vùng.</p>
+        <button id="btnCountImages" type="button" aria-describedby="imageInventoryHint">Đếm ảnh</button>
+        <div id="imageCountStatus" role="status" aria-live="polite" aria-atomic="true"></div>
+        <a id="imageInventoryCsv" hidden>Tải danh sách CSV</a>
+      </div>
+    </details>
   </section>
-  <button id="btnSearch">Tìm ảnh (ít mây nhất)</button>
-  <div id="status"></div>
+  <button id="btnSearch" type="button">Tìm ảnh (ít mây nhất)</button>
+  <div id="status" role="status" aria-live="polite"></div>
   <div id="searchTiming" class="hint" role="status" aria-live="polite"></div>
   <section id="s5pResults" aria-label="Ảnh Sentinel-5P" hidden>
     <p id="s5pMeta" role="status" aria-live="polite"></p>
@@ -488,16 +494,16 @@
 
   <section id="timeSeriesBatchPanel" hidden aria-label="Tác vụ time series theo năm"></section>
   <section id="downloadJobPanel" class="download-job-panel" hidden aria-label="Tác vụ tải ảnh Sentinel-2"></section>
-  <section id="esriPanel" aria-label="Tải Esri World Imagery" style="margin-top:16px">
-    <h2>Esri World Imagery</h2>
+  <section id="esriPanel" aria-label="Tải Esri World Imagery">
+    <h3>Esri World Imagery</h3>
     <label>Vùng tải Esri</label>
     <select id="esriMode">
       <option value="point">Vị trí + bán kính vùng tải</option>
-      <option value="rectangle">Hình chữ nhật ROI đang chỉnh ở trên</option>
+      <option value="rectangle">Hình chữ nhật từ Khám phá</option>
       <option value="bbox">Khung tọa độ WGS84 (nhập riêng)</option>
-      <option value="commune">Xã/phường đang chọn ở trên</option>
+      <option value="commune">Xã/phường từ Khám phá</option>
     </select>
-    <div id="esriPointInfo" class="hint">Dùng tọa độ và bán kính ở trên. Bán kính 3.000 m tạo khung khoảng 6 × 6 km, không lấy toàn bộ màn hình bản đồ.</div>
+    <div id="esriPointInfo" class="hint">Dùng tọa độ, bán kính và góc xoay đã chọn trong Khám phá.</div>
     <div id="esriBboxFields" hidden>
       <label>West, South, East, North (kinh độ / vĩ độ)</label>
       <div class="row">
@@ -532,9 +538,9 @@
     <a id="dl" href="#">Tải GeoTIFF</a>
   </div>
 
-  <div id="s1result" style="display:none; background:#0f172a; border-radius:10px; padding:12px; font-size:13px;">
-    <div id="s1meta" style="margin-bottom:8px; color:#cbd5e1;"></div>
-    <div id="s1list" style="max-height:300px; overflow-y:auto; display:flex; flex-direction:column; gap:6px;"></div>
+  <div id="s1result" style="display:none; border-radius:10px; font-size:13px;">
+    <div id="s1meta"></div>
+    <div id="s1list"></div>
   </div>
 
   <div class="hint">
@@ -551,28 +557,53 @@
     xử lý tiếp bằng SNAP/SNAPHU hoặc LiCSBAS.
   </div>
 </div>
-<div id="map" aria-label="Bản đồ chọn vùng dữ liệu"></div>
-<aside id="workspaceResults" class="workspace-results" aria-label="Kết quả tìm kiếm" hidden>
-  <button id="workspaceClose" class="workspace-close" type="button">Đóng kết quả</button>
-  <h2>Kết quả</h2>
-  <p id="workspaceEmpty" class="hint">Chưa có kết quả. Chọn vùng và nguồn trong Khám phá, sau đó tìm dữ liệu.</p>
+<div class="workspace-map">
+  <div id="map" role="region" aria-label="Bản đồ chọn vùng dữ liệu"></div>
+  <p id="workspaceMapHint" class="workspace-map-hint">Chọn điểm trên bản đồ hoặc nhập tọa độ.</p>
+</div>
+<aside id="workspaceResults" class="workspace-pane workspace-results" aria-labelledby="workspaceResultsTitle" hidden>
+  <div class="workspace-pane-heading">
+    <h2 id="workspaceResultsTitle" tabindex="-1">Kết quả tìm kiếm</h2>
+    <button id="workspaceClose" class="workspace-quiet" type="button">Sửa bộ lọc</button>
+  </div>
+  <div id="workspaceResultContent" class="workspace-scroll">
+    <p id="workspaceEmpty" class="workspace-empty hint">Chưa có kết quả. Chọn vùng và nguồn trong Khám phá, sau đó tìm dữ liệu.</p>
+  </div>
 </aside>
-<section id="workspaceJobs" class="workspace-jobs" aria-label="Tác vụ tải và Esri" hidden>
-  <h2>Tác vụ tải / Esri</h2>
-  <p class="workspace-notice">Esri dùng vùng đang chọn trong Khám phá. Mỗi tác vụ giữ cấu hình tại thời điểm tạo; thay đổi vùng hoặc góc xoay không thay đổi tác vụ cũ. Tác vụ chuỗi thời gian nằm trong Kết quả.</p>
+<section id="workspaceJobs" class="workspace-pane workspace-jobs" aria-labelledby="workspaceJobsTitle" hidden>
+  <div class="workspace-pane-heading">
+    <h2 id="workspaceJobsTitle" tabindex="-1">Tiến trình tải</h2>
+  </div>
+  <div id="workspaceJobContent" class="workspace-scroll">
+    <section id="taskCenter" aria-label="Danh sách tiến trình tải">
+      <p id="taskCenterStatus" class="hint" role="status" aria-live="polite">Đang tải danh sách tác vụ…</p>
+      <div class="task-filter">
+        <label for="taskFilter">Trạng thái</label>
+        <select id="taskFilter">
+          <option value="all">Tất cả</option>
+          <option value="active">Đang chạy và đang chờ</option>
+          <option value="finished">Đã kết thúc</option>
+        </select>
+      </div>
+      <div id="taskList"></div>
+      <div class="task-pagination">
+        <button id="taskPrevious" type="button">Trang trước</button>
+        <span id="taskPage" class="hint"></span>
+        <button id="taskNext" type="button">Trang sau</button>
+      </div>
+    </section>
+    <details class="workspace-disclosure">
+      <summary>Cấu hình Esri và điều khiển tác vụ hiện tại</summary>
+      <div id="workspaceJobDetails" class="workspace-details-body"></div>
+    </details>
+  </div>
 </section>
 
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-<script>
-// Fallback: nếu unpkg.com bị chặn (mạng công ty), tải Leaflet qua mirror jsdelivr
-if (typeof L === 'undefined') {
-  document.write('<script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js"><\/script>');
-}
-</script>
-<script src="/rectangle.js?v=scene-thumbnails-2"></script>
+<script src="/vendor/leaflet/leaflet.js?v=1.9.4"></script>
+<script src="/rectangle.js?v=task-center-2"></script>
 <script src="/selection-state.js?v=1"></script>
 <script src="/s2-layers.js?v=2"></script>
-<script src="/scene-footprints.js?v=1"></script>
+<script src="/scene-footprints.js?v=2"></script>
 <script src="/scene-thumbnails.js?v=3"></script>
 <script>
 const $ = id => document.getElementById(id);
@@ -588,6 +619,16 @@ function formatError(err) {
 }
 const map = L.map('map').setView([16.0, 107.0], 6); // Việt Nam
 const sceneFootprints = new window.SceneFootprints.Controller(map, L);
+window.ResultFootprints = {
+  clear: () => sceneFootprints.clear(),
+  fit: extent => requestAnimationFrame(() => sceneFootprints.fit(extent)),
+  add(row, footprint) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = 'Footprint';
+    if (sceneFootprints.bind(row, button, footprint)) row.append(button);
+  },
+};
 
 // Base layers: dùng các tile server không bị proxy công ty chặn
 const layers = {
@@ -628,13 +669,14 @@ function provinceStyle(feature) {
 }
 
 function selectProvince(provinceId, fit = true) {
-  if (!provinceId || !provinceLayer) return;
-  selectedProvinceId = provinceId;
-  $('province_id').value = provinceId;
+  const active = $('selection_mode').value === 'province';
+  selectedProvinceId = active && provinceId ? provinceId : null;
+  $('clearProvinceSelection').disabled = !selectedProvinceId;
+  $('provinceInfo').textContent = 'Chọn tỉnh/thành hoặc bấm trực tiếp trên bản đồ.';
   let selectedLayer = null;
-  provinceLayer.eachLayer(layer => {
+  provinceLayer?.eachLayer(layer => {
     layer.setStyle(provinceStyle(layer.feature));
-    if (layer.feature.properties.id === provinceId) selectedLayer = layer;
+    if (layer.feature.properties.id === selectedProvinceId) selectedLayer = layer;
   });
   if (!selectedLayer) return;
   selectedLayer.bringToFront();
@@ -708,6 +750,7 @@ async function setSelectionMode() {
   $('rotationSelection').style.display = administrativeMode || rectangleMode || referenceMode || vectorMode ? 'none' : '';
   $('provinceSelection').style.display = provinceMode ? '' : 'none';
   $('communeSelection').style.display = communeMode ? '' : 'none';
+  selectProvince($('province_id').value, false);
   updateCompositeVisibility();
   if (!communeMode) {
     if (communeRequest) communeRequest.abort();
@@ -885,6 +928,7 @@ function colorBalanceSummary(report) {
 }
 
 function renderCompositePlan(data) {
+  sceneFootprints.clear();
   const isBaseScore = data.method === 'base-score';
   const isFullComposite = !['mosaic', 'raw'].includes(data.method);
   const methodName = COMPOSITE_METHOD_NAMES[data.method] || data.method;
@@ -912,6 +956,7 @@ function renderCompositePlan(data) {
     name.className = 'hint';
     name.textContent = scene.scene_id;
     row.append(info, name);
+    window.ResultFootprints.add(row, scene.footprint);
     $('planScenes').append(row);
   }
   if (!scenes.length) $('planScenes').innerHTML = isBaseScore
@@ -920,6 +965,7 @@ function renderCompositePlan(data) {
         ? `<div class="hint">${methodName} xếp hạng cảnh theo độ trong (mean băng xanh) rồi giữ tối đa 20 cảnh.</div>`
         : '';
   $('plan').style.display = 'block';
+  window.ResultFootprints.fit();
 }
 
 function displaySearchTiming(response, started) {
@@ -1047,6 +1093,7 @@ async function searchTimeSeries(body) {
 }
 
 function renderTimeSeriesResults(data) {
+  sceneFootprints.clear();
   $('timeSeriesMeta').textContent = `Tổng: ${data.total} cảnh · Không lọc ngưỡng mây.`;
   const parameters = document.createElement('div');
   parameters.className = 'hint';
@@ -1066,6 +1113,7 @@ function renderTimeSeriesResults(data) {
     const asset = document.createElement('div');
     asset.textContent = scene.asset_id;
     row.append(heading, asset);
+    window.ResultFootprints.add(row, scene.footprint);
     if (scene.metadata && Object.keys(scene.metadata).length) {
       const details = document.createElement('details');
       const summary = document.createElement('summary');
@@ -1083,6 +1131,7 @@ function renderTimeSeriesResults(data) {
   $('timeSeriesNext').disabled = timeSeriesPageLoading || timeSeriesOffset + 50 >= data.total;
   $('timeSeriesDownload').disabled = !data.total || timeSeriesJobStarted;
   $('timeSeriesResults').style.display = 'block';
+  window.ResultFootprints.fit(data.parameters?.bbox);
 }
 
 async function loadTimeSeriesPage(offset) {
@@ -1123,7 +1172,7 @@ async function startTimeSeriesDownload(searchId) {
       if (job.status === 'partial') $('timeSeriesJob').textContent += ' · Cảnh báo: ZIP chỉ chứa các cảnh tải thành công; xem lỗi trong manifest.';
       $('timeSeriesZip').href = `/api/timeseries/jobs/${encodeURIComponent(job.job_id)}/download`;
       $('timeSeriesZip').hidden = false;
-    } else if (['queued', 'running'].includes(job.status)) {
+    } else if (['queued', 'running', 'cancelling'].includes(job.status)) {
       timeSeriesTimer = setTimeout(async () => {
         timeSeriesTimer = null;
         try {
@@ -1133,7 +1182,7 @@ async function startTimeSeriesDownload(searchId) {
           if (version === timeSeriesVersion) $('timeSeriesJob').textContent = 'Lỗi theo dõi job; đã dừng cập nhật: ' + error.message;
         }
       }, 2000);
-    } else if (!['failed', 'interrupted'].includes(job.status)) {
+    } else if (!['failed', 'interrupted', 'cancelled'].includes(job.status)) {
       $('timeSeriesJob').textContent += ' · Trạng thái không xác định; đã dừng cập nhật.';
     }
   }
@@ -1142,6 +1191,8 @@ async function startTimeSeriesDownload(searchId) {
       method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({search_id: searchId})
     });
     await showJob(job);
+    window.SatelliteWorkspace?.showView('jobs');
+    window.TaskCenter?.refresh();
   } catch (error) {
     if (version === timeSeriesVersion) {
       $('timeSeriesJob').textContent = 'Lỗi tạo job: ' + error.message;
@@ -1241,7 +1292,7 @@ function updatePositionMap(recenter = true) {
       return;
     }
     const lat = Number($('lat').value), lon = Number($('lon').value);
-    $('coords').textContent = `${lat.toFixed(5)}, ${lon.toFixed(5)}`;
+    $('coords').textContent = '';
     if (marker) marker.setLatLng([lat, lon]);
     else marker = L.marker([lat, lon]).addTo(map);
     roiLayer = L.polygon(polygon.map(([x, y]) => [y, x]), {
@@ -1289,6 +1340,10 @@ $('selection_mode').addEventListener('change', setSelectionMode);
 $('dataset').addEventListener('change', updateCompositeVisibility);
 $('slc_mode').addEventListener('change', updateSlcVisibility);
 $('province_id').addEventListener('change', e => selectProvince(e.target.value));
+$('clearProvinceSelection').addEventListener('click', () => {
+  $('province_id').value = '';
+  $('province_id').dispatchEvent(new Event('change', {bubbles: true}));
+});
 $('commune_id').addEventListener('change', e => selectCommune(e.target.value));
 $('commune_search').addEventListener('input', filterCommunes);
 ensureProvinces();
@@ -1397,7 +1452,6 @@ function updateCloudSelection() {
   sceneCatalog = null;
   sceneCatalogGeneration++;
   sceneFootprints.clear();
-  document.body.classList.remove('has-catalog-results');
   $('sceneCatalogResults').hidden = true;
 }
 function renderSceneCatalog(data) {
@@ -1494,7 +1548,6 @@ function renderSceneCatalog(data) {
     footprintSummary += ' Backend cần được khởi động lại để nạp thumbnail. Sau đó tìm lại ảnh.';
   }
   $('sceneCatalogFootprintSummary').textContent = footprintSummary;
-  document.body.classList.add('has-catalog-results');
   $('sceneCatalogResults').hidden = false;
   if (newSearch && footprintCount) requestAnimationFrame(() => {
     if (sceneCatalog === data && document.body.classList.contains('has-results')) {
@@ -1547,6 +1600,7 @@ updateCloudSelection();
 
 $('btnSearch').addEventListener('click', async () => {
   $('searchTiming').textContent = '';
+  sceneFootprints.clear();
   const selectionMode = $('selection_mode').value;
   if (selectionMode === 'vector') {
     if (window.VectorSearch) return window.VectorSearch.search();
@@ -1611,7 +1665,6 @@ $('btnSearch').addEventListener('click', async () => {
         throw new Error(formatError(error));
       }
       const blob = await response.blob();
-      if (version !== searchGeneration) return;
       const url = URL.createObjectURL(blob);
       const link = document.createElement('a'); link.href = url;
       const disposition = response.headers.get('Content-Disposition') || '';
@@ -1619,7 +1672,7 @@ $('btnSearch').addEventListener('click', async () => {
       link.download = serverFilename ? serverFilename[1] : `${dataset}_30m_${Date.now()}_${crypto.randomUUID()}.tif`;
       document.body.appendChild(link); link.click(); link.remove();
       setTimeout(() => URL.revokeObjectURL(url), 60000);
-      $('status').textContent = 'Đã tải DEM GeoTIFF (độ cao mét, NoData -9999).';
+      if (version === searchGeneration) $('status').textContent = 'Đã tải DEM GeoTIFF (độ cao mét, NoData -9999).';
     } catch (error) {
       if (version === searchGeneration) $('status').textContent = 'Lỗi: ' + error.message;
     } finally { btn.disabled = false; }
@@ -1736,6 +1789,14 @@ async function runSceneSearch(body) {
       `Ngày: <b>${data.date}</b>${cloudDisplay}${methodTxt}${mosaicOptionsSummary(data.scene_grouping,data.mosaic_mask_clouds)}${colorBalanceSummary(data.color_balance)}${landCoverTxt}<br>` +
       `Độ phân giải: ${data.scale_m} m · Băng: ${data.bands.join(', ')} · Góc lưới xuất: ${Number(data.rotation_deg) || 0}°` +
       (data.coverage_pct != null ? ` · Độ phủ: ${data.coverage_pct.toFixed(2)}%` : '');
+    sceneFootprints.clear();
+    window.ResultFootprints.add($('meta'), data.footprint);
+    for (const source of data.scenes || []) {
+      const row = document.createElement('div');
+      row.textContent = source.scene_id;
+      window.ResultFootprints.add(row, source.footprint);
+      $('meta').append(row);
+    }
     if (data.preview_url) { $('preview').src = data.preview_url; }
     $('dl').href = data.download_url;
     $('dl').textContent = 'Tải GeoTIFF';
@@ -1744,6 +1805,9 @@ async function runSceneSearch(body) {
     renderResponseRoi(data);
 
     $('result').style.display = 'block';
+    requestAnimationFrame(() => {
+      if (version === searchGeneration && data.bbox) sceneFootprints.fit(data.bbox);
+    });
   } catch (e) {
     if (version === searchGeneration) $('status').textContent = 'Lỗi: ' + e.message;
   } finally {
@@ -1761,6 +1825,7 @@ $('confirmComposite').addEventListener('click', () => {
 
 $('cancelComposite').addEventListener('click', () => {
   pendingCompositeBody = null;
+  sceneFootprints.clear();
   $('plan').style.display = 'none';
   $('status').textContent = 'Đã hủy — chưa chạy composite nào.';
 });
@@ -1786,11 +1851,13 @@ async function searchS1Gee(lon, lat) {
       polarization: 'vvvh',
       platform: window.MatchedFrame?.platform() ?? null,
       merge_scenes: $('sar_merge_scenes').checked,
-      group_by_orbit: true
+      group_by_orbit: true,
+      list_scenes: true
     };
     if (selectionMode === 'vector') body = {...window.VectorLayers.request(),
       start_date:$('start_date').value, end_date:$('end_date').value, polarization:'vvvh',
-      platform:window.MatchedFrame?.platform() ?? null, merge_scenes:$('sar_merge_scenes').checked, group_by_orbit:true};
+      platform:window.MatchedFrame?.platform() ?? null, merge_scenes:$('sar_merge_scenes').checked,
+      group_by_orbit:true, list_scenes:true};
     else if (selectionMode === 'rectangle') body = RectangleROI.body(body, rectangleEditor.get());
     else if (selectionMode !== 'point') body.rotation_deg = 0;
     const res = await fetch('/api/s1gee/scene', {
@@ -1806,6 +1873,9 @@ async function searchS1Gee(lon, lat) {
 
     renderS1OrbitResults(data, version);
     $('result').style.display = 'block';
+    if (data.results?.[0]?.bbox) requestAnimationFrame(() => {
+      if (version === searchGeneration) sceneFootprints.fit(data.results[0].bbox);
+    });
   } catch (e) {
     if (version === searchGeneration) $('status').textContent = 'Lỗi: ' + e.message;
   } finally {
@@ -1814,6 +1884,7 @@ async function searchS1Gee(lon, lat) {
 }
 
 function renderS1OrbitResults(data, version) {
+  sceneFootprints.clear();
   const details = document.createElement('div');
   const controls = document.createElement('div');
   controls.className = 's1-orbit-options';
@@ -1844,9 +1915,15 @@ function renderS1OrbitResults(data, version) {
     if (result.preview_url) $('preview').src = result.preview_url;
     else $('preview').removeAttribute('src');
     $('dl').href = result.download_url;
-    $('dl').textContent = 'Tải GeoTIFF (dB)';
+    $('dl').textContent = 'Tải GeoTIFF theo vùng (dB)';
+    if (!result.composite && result.full_scene_download_url?.startsWith('/api/s1gee/download?')) {
+      const full = document.createElement('a');
+      full.href = result.full_scene_download_url;
+      full.textContent = 'Tải nguyên cảnh (COG, dB)';
+      details.appendChild(full);
+    }
     window.DownloadJobs?.bindSelection(result);
-    renderResponseRoi(result);
+    renderResponseRoi({...result, roi_geometry: result.roi_geometry || data.roi_geometry});
   }
 
   if (!Array.isArray(data.results)) {
@@ -1854,15 +1931,37 @@ function renderS1OrbitResults(data, version) {
     select(data);
     return;
   }
+  if (!data.results.length) {
+    $('meta').textContent = 'Không có cảnh SAR trong vùng và khoảng ngày đã chọn.';
+    $('preview').removeAttribute('src');
+    $('dl').removeAttribute('href');
+    $('dl').textContent = '';
+    return;
+  }
   for (const [pass, label] of [['ASCENDING', 'ASCENDING · Hướng lên'], ['DESCENDING', 'DESCENDING · Hướng xuống']]) {
-    const option = data.results.find(result => result.orbit_pass === pass);
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.disabled = !option;
-    button.textContent = `${label} · ${option ? formatCoverage(option.coverage_pct) : 'Không có cảnh'}`;
-    if (option) button.addEventListener('click', () => select(option));
-    choices.push([button, option]);
-    controls.appendChild(button);
+    const options = data.results.filter(result => result.orbit_pass === pass);
+    const group = document.createElement('details');
+    group.open = !!options.length;
+    const heading = document.createElement('summary');
+    heading.textContent = `${label} · ${options.length} kết quả`;
+    group.appendChild(heading);
+    for (const option of options) {
+      const row = document.createElement('div');
+      row.className = 's1-orbit-choice';
+      const button = document.createElement('button');
+      button.type = 'button';
+      const source = option.scenes?.[0];
+      const track = source?.relative_orbit;
+      button.textContent = `${option.date} · ${option.composite ? `Ghép ${option.scene_count} cảnh` : option.scene_id}` +
+        (track == null ? '' : ` · Quỹ đạo ${track}`) + ` · ${formatCoverage(option.coverage_pct)}`;
+      sceneFootprints.bind(row, button, option.footprint, false);
+      button.addEventListener('click', () => select(option));
+      choices.push([button, option]);
+      if (!option.composite && source) window.SceneThumbnails?.append(row, source, option.scene_id);
+      row.appendChild(button);
+      group.appendChild(row);
+    }
+    controls.appendChild(group);
   }
   $('meta').replaceChildren(controls, details);
   const first = data.results.reduce((best, item) => item.coverage_pct > best.coverage_pct ? item : best);
@@ -1918,9 +2017,11 @@ async function searchS1(lon, lat) {
         btns.appendChild(c);
       }
       div.appendChild(info); div.appendChild(btns);
+      window.ResultFootprints.add(div, p.footprint);
       list.appendChild(div);
     }
     $('s1result').style.display = 'block';
+    window.ResultFootprints.fit(data.bbox);
   } catch (e) {
     if (version === searchGeneration) $('status').textContent = 'Lỗi: ' + e.message;
   } finally {
@@ -2007,9 +2108,11 @@ async function searchS2(lon, lat, source) {
         btns.appendChild(a); btns.appendChild(b); btns.appendChild(c);
         div.appendChild(info); div.appendChild(btns);
       }
+      window.ResultFootprints.add(div, p.footprint);
       list.appendChild(div);
     }
     $('s1result').style.display = 'block';
+    window.ResultFootprints.fit(data.bbox);
   } catch (e) {
     if (version === searchGeneration) $('status').textContent = 'Lỗi: ' + e.message;
   } finally {
@@ -2154,7 +2257,7 @@ async function searchProvinceScenes(dataset) {
         $('status').textContent = 'Đang ghép mosaic tỉnh (đọc COG từng tile qua AWS) — có thể mất vài phút…';
         const url = `/api/s2/aws/province-mosaic?province_id=${encodeURIComponent(provinceId)}` +
           `&start_date=${encodeURIComponent(dateMin)}&end_date=${encodeURIComponent(dateMax)}`;
-        window.location.href = url;
+        window.TaskCenter.download(url);
       });
       const hint = document.createElement('div');
       hint.style.cssText = 'color:var(--muted); font-size:11px; margin-top:6px;';
@@ -2188,6 +2291,7 @@ async function searchProvinceScenes(dataset) {
           `<span style="color:var(--muted); font-size:11px;">${escapeHtml(p.name.slice(0, 48))}…${size}</span>`;
         div.appendChild(info);
         div.appendChild(provinceSceneDownloadLink(p, dataset));
+        window.ResultFootprints.add(div, p.footprint);
         inner.appendChild(div);
       }
       head.addEventListener('click', () => {
@@ -2215,13 +2319,14 @@ async function searchProvinceScenes(dataset) {
           $('status').textContent = `Đang ghép ${ids.length} mảnh (tải measurement qua S3, warp + mosaic) — có thể mất vài phút…`;
           const url = `/api/s1/crop-mosaic?product_ids=${ids.map(encodeURIComponent).join(',')}` +
             `&province_id=${encodeURIComponent(provinceId)}`;
-          window.location.href = url;
+          window.TaskCenter.download(url);
         });
         box.appendChild(mbtn);
       }
       list.appendChild(box);
     }
     $('s1result').style.display = 'block';
+    window.ResultFootprints.fit(data.bbox);
   } catch (e) {
     if (version === searchGeneration) $('status').textContent = 'Lỗi: ' + e.message;
   } finally {
@@ -2261,9 +2366,11 @@ async function searchS3(lon, lat) {
       a.textContent = 'ZIP nguyên sản phẩm (không cắt ROI)';
       a.style.cssText = 'flex-shrink:0; background:var(--accent); color:var(--on-accent); text-decoration:none; padding:6px 10px; border-radius:6px; font-weight:600;';
       div.appendChild(info); div.appendChild(a);
+      window.ResultFootprints.add(div, p.footprint);
       list.appendChild(div);
     }
     $('s1result').style.display = 'block';
+    window.ResultFootprints.fit(data.bbox);
   } catch (e) {
     if (version === searchGeneration) $('status').textContent = 'Lỗi: ' + e.message;
   } finally {
@@ -2337,9 +2444,11 @@ async function searchS1Slc(lon, lat) {
         `<span style="color:var(--muted); font-size:11px;">${escapeHtml(p.name.slice(0, 48))}… · ${p.size_gb.toFixed(2)} GB</span>`;
       div.appendChild(info);
       div.appendChild(slcDownloadLink(p));
+      window.ResultFootprints.add(div, p.footprint);
       list.appendChild(div);
     }
     $('s1result').style.display = 'block';
+    window.ResultFootprints.fit(data.bbox);
   } catch (e) {
     if (version === searchGeneration) $('status').textContent = 'Lỗi: ' + e.message;
   } finally {
@@ -2391,6 +2500,7 @@ async function searchS1Pairs(lon, lat) {
           `<span style="color:var(--muted); font-size:11px;">${escapeHtml(p.name.slice(0, 48))}… · ${p.size_gb.toFixed(2)} GB</span>`;
         row.appendChild(info);
         row.appendChild(slcDownloadLink(p));
+        window.ResultFootprints.add(row, p.footprint);
         div.appendChild(row);
       }
 
@@ -2401,6 +2511,7 @@ async function searchS1Pairs(lon, lat) {
       list.appendChild(div);
     }
     $('s1result').style.display = 'block';
+    window.ResultFootprints.fit(data.bbox);
   } catch (e) {
     if (version === searchGeneration) $('status').textContent = 'Lỗi: ' + e.message;
   } finally {
@@ -2408,15 +2519,17 @@ async function searchS1Pairs(lon, lat) {
   }
 }
 </script>
-<script src="/s5p.js?v=scene-thumbnails-2"></script>
+<script src="/s5p.js?v=scene-thumbnails-4"></script>
 <script src="/esri.js?v=rectangle-1"></script>
 <script src="/download-jobs.js?v=1"></script>
-<script src="/workspace.js?v=download-jobs-1"></script>
-<script src="/matched-frame.js?v=scene-thumbnails-2"></script>
+<script src="/workspace.js?v=workspace-layout-1"></script>
+<script src="/task-center.js?v=8"></script>
+<script src="/matched-frame.js?v=task-center-2"></script>
 <script src="/scene-inventory.js?v=1"></script>
-<script src="/vector-layers.js?v=1"></script>
-<script src="/vector-search.js?v=2"></script>
+<script src="/vector-layers.js?v=2"></script>
+<script src="/vector-search.js?v=3"></script>
 <script src="/timeseries-batches.js?v=1"></script>
+<script src="/provider-warning.js?v=1"></script>
 <script>
 $('time_series_yearly').addEventListener('change', updateTimeSeriesVisibility);
 updateTimeSeriesVisibility();

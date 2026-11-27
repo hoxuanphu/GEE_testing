@@ -3,9 +3,9 @@
   const get = id => document.getElementById(id);
   const API = '/api/matched-frame';
   const STORAGE = 'satellite-workspace-matched-frame-job';
-  const TERMINAL = new Set(['completed', 'partial', 'failed', 'interrupted']);
+  const TERMINAL = new Set(['completed', 'partial', 'failed', 'interrupted', 'cancelled']);
   const SUCCESS = new Set(['completed', 'succeeded', 'success']);
-  const labels = {queued:'Đang chờ', running:'Đang xử lý', completed:'Hoàn tất', partial:'Hoàn tất một phần', failed:'Thất bại', interrupted:'Bị gián đoạn', pending:'Chưa xử lý', succeeded:'Thành công', success:'Thành công'};
+  const labels = {queued:'Đang chờ', running:'Đang xử lý', cancelling:'Đang hủy', cancelled:'Đã hủy', completed:'Hoàn tất', partial:'Hoàn tất một phần', failed:'Thất bại', interrupted:'Bị gián đoạn', pending:'Chưa xử lý', succeeded:'Thành công', success:'Thành công'};
   const selected = new Map();
   const dateHome = get('dateSelection').parentElement;
   const dateNext = get('dateSelection').nextElementSibling;
@@ -143,6 +143,7 @@
     controls();
   }
   function invalidateSearch() {
+    if (snapshot) window.ResultFootprints?.clear();
     searchVersion++;
     searchController?.abort();
     searching = false;
@@ -411,6 +412,7 @@
     const target = get('mfSceneRows');
     target.replaceChildren();
     if (!snapshot) return;
+    window.ResultFootprints?.clear();
     if (!snapshot.scenes.length) target.append(node('p', 'Không có cảnh phù hợp. Thu hẹp/đổi khoảng ngày hoặc kiểm tra bộ lọc.'));
     snapshot.scenes.forEach((scene, index) => {
       const card = node('article', null, 'mf-scene');
@@ -467,6 +469,7 @@
         }
       });
       card.append(previewButton, preview);
+      window.ResultFootprints?.add(card, scene.footprint);
       target.append(card);
     });
   }
@@ -484,6 +487,7 @@
     get('mfProcessing').textContent = processing(snapshot.parameters);
     get('mfPage').textContent = snapshot.total ? `Cảnh ${snapshot.offset + 1}–${Math.min(snapshot.offset + snapshot.scenes.length, snapshot.total)} / ${snapshot.total}` : '0 cảnh';
     renderScenes();
+    window.ResultFootprints?.fit();
     renderSelected();
     controls();
   }

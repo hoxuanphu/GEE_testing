@@ -5,6 +5,7 @@ ee_private_key.json
 __pycache__/
 *.pyc
 .venv/
+/.workspace-install.lock
 downloads/
 wheels/
 .pytest_cache/

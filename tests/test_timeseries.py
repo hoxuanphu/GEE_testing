@@ -108,13 +108,14 @@ class TimeSeriesTests(unittest.TestCase):
         self.assertIsNone(self.store.download_path("../../anything"))
         self.assertIsNone(self.service._executor)
 
-    def test_concurrent_idempotent_job_and_busy(self):
+    def test_concurrent_idempotent_job_and_queue(self):
         search_id, other = self.search(), self.search()
         with ThreadPoolExecutor(max_workers=8) as executor:
             jobs = list(executor.map(lambda _: self.store.create_job(search_id), range(16)))
         self.assertEqual(len({j["job_id"] for j in jobs}), 1)
-        with self.assertRaises(ts.BusyError):
-            ts.TimeSeriesStore(self.root).create_job(other)
+        queued = ts.TimeSeriesStore(self.root).create_job(other)
+        self.assertEqual(queued['status'], 'queued')
+        self.assertNotEqual(queued['job_id'], jobs[0]['job_id'])
 
     def test_zip_grid_metadata_cloud_and_unique_same_timestamp(self):
         job, seen = self.run_job()
@@ -215,9 +216,12 @@ class TimeSeriesTests(unittest.TestCase):
         self.assertFalse((self.store._job_dir(job["job_id"]) / "timeseries.zip.part").exists())
         self.assertNotIn("SECRET", job["error"])
 
-    def test_restart_marks_queued_running_interrupted_and_allows_retry(self):
+    def test_restart_retains_queue_and_marks_running_interrupted(self):
         job = self.store.create_job(self.search())
         reopened = ts.TimeSeriesStore(self.root)
+        self.assertEqual(reopened.recover_interrupted_jobs(), 0)
+        self.assertEqual(reopened.get_job(job["job_id"])["status"], "queued")
+        reopened._update_job(job["job_id"], status="running")
         self.assertEqual(reopened.recover_interrupted_jobs(), 1)
         self.assertEqual(reopened.get_job(job["job_id"])["status"], "interrupted")
         retry = reopened.create_job(job["search_id"])
@@ -264,8 +268,8 @@ class TimeSeriesTests(unittest.TestCase):
                 self.assertTrue(started.wait(2))
                 self.assertEqual(len({j["job_id"] for j in jobs}), 1)
                 self.assertEqual(run.call_count, 1)
-                with self.assertRaises(ts.BusyError):
-                    self.service.start_job(other)
+                queued = self.service.start_job(other)
+                self.assertEqual(queued['status'], 'queued')
                 with self.assertRaises(ts.BusyError):
                     self.service.recover_interrupted_jobs()
             finally:

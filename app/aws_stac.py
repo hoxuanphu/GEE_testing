@@ -408,6 +408,7 @@ def search_s2_l2a(
                 "assets": band_urls,
                 "download_url": f.get("links", [{}])[0].get("href"),
                 "self_href": f.get("links", [{}])[0].get("href"),
+                "footprint": f.get("geometry"),
                 **_thumbnail_fields(assets),
             }
         )

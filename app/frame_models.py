@@ -154,6 +154,7 @@ class FrameScene(FrameContract):
     orbit_pass: str | None = None
     relative_orbit: int | None = None
     covers_roi: bool = False
+    footprint: dict | None = None
     band_coverage_pct: float | None = Field(None, ge=0, le=100)
     roi_cloud_pct: float | None = None
     roi_shadow_pct: float | None = None

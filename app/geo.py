@@ -12,6 +12,27 @@ MAX_GEOGRAPHIC_LAT = 85.05112878
 MAX_RECTANGLE_DIMENSION_M = 90_000.0
 
 
+def source_footprint(sources):
+    from shapely.errors import ShapelyError
+    from shapely.geometry import mapping, shape
+    from shapely.ops import unary_union
+
+    polygons = []
+    for source in sources:
+        footprint = source.get('footprint')
+        if not isinstance(footprint, dict) or footprint.get('type') not in ('Polygon', 'MultiPolygon'):
+            continue
+        try:
+            polygon = shape(footprint)
+            if polygon.is_valid and not polygon.is_empty:
+                polygons.append(polygon)
+        except (ShapelyError, TypeError, ValueError):
+            continue
+    if not polygons:
+        return None
+    return mapping(polygons[0] if len(polygons) == 1 else unary_union(polygons))
+
+
 @dataclass
 class Bbox:
     """Axis-aligned bounding box in geographic coordinates (degrees)."""

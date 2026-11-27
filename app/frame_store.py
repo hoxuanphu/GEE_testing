@@ -12,8 +12,8 @@ import uuid
 
 from .frame_models import FrameError, TTL_SECONDS
 
-ACTIVE = ('queued', 'running')
-TERMINAL = ('completed', 'partial', 'failed', 'interrupted')
+ACTIVE = ('queued', 'running', 'cancelling')
+TERMINAL = ('completed', 'partial', 'failed', 'interrupted', 'cancelled')
 
 
 def identifier(value) -> str:
@@ -96,7 +96,7 @@ class FrameStore:
             existing = db.execute('SELECT * FROM jobs WHERE preflight_id=?', (preflight['preflight_id'],)).fetchone()
             if existing is not None:
                 return json.loads(existing['data'])
-            if db.execute("SELECT 1 FROM jobs WHERE status IN ('queued','running')").fetchone():
+            if db.execute("SELECT 1 FROM jobs WHERE status IN ('queued','running','cancelling')").fetchone():
                 raise FrameError('busy', 'Một tác vụ đồng khung đang chạy; chờ hoàn tất.', 409)
             selected = preflight['scenes']
             if preflight['parameters'].get('merge_scenes'):
@@ -143,6 +143,28 @@ class FrameStore:
                        ('running', encode(data), time.time(), str(key)))
         return True
 
+    def cancel_job(self, key):
+        with self.lock:
+            job = self.get_job(key)
+            if job['status'] == 'queued':
+                return self.update_job(key, status='cancelled', stage='cancelled')
+            if job['status'] in ('running', 'cancelling'):
+                return self.update_job(key, status='cancelling', stage='cancelling')
+            return job
+
+    def finish_if_cancelled(self, key):
+        with self.lock:
+            job = self.get_job(key)
+            if job['status'] != 'cancelling':
+                return False
+            self.update_job(key, status='cancelled', stage='cancelled')
+            return True
+
+    def finish_job(self, key, status):
+        with self.lock:
+            if not self.finish_if_cancelled(key):
+                self.update_job(key, status=status, stage=status)
+
     def job_dir(self, key):
         return self.root / 'jobs' / identifier(key)
 
@@ -178,7 +200,7 @@ class FrameStore:
 
     def recover(self):
         with self.lock, self.connect() as db:
-            rows = db.execute("SELECT id,data FROM jobs WHERE status IN ('queued','running')").fetchall()
+            rows = db.execute("SELECT id,data FROM jobs WHERE status IN ('queued','running','cancelling')").fetchall()
             for row in rows:
                 data = json.loads(row['data'])
                 for scene in data['scenes']:
@@ -194,7 +216,7 @@ class FrameStore:
     def cleanup(self, now=None):
         cutoff = (time.time() if now is None else now) - TTL_SECONDS
         with self.lock, self.connect() as db:
-            rows = db.execute("SELECT id FROM jobs WHERE activity<? AND status NOT IN ('queued','running')", (cutoff,)).fetchall()
+            rows = db.execute("SELECT id FROM jobs WHERE activity<? AND status NOT IN ('queued','running','cancelling')", (cutoff,)).fetchall()
             for row in rows:
                 if row['id'] not in self.leases:
                     shutil.rmtree(self.job_dir(row['id']), ignore_errors=True)

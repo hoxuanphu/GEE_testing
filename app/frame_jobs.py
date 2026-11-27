@@ -322,6 +322,8 @@ class FrameService:
                                                 parameters['bands'], len(preflight['scenes']))['disk_reserve_bytes']
             fatal = False
             for record in records:
+                if self.store.finish_if_cancelled(key):
+                    return
                 token = str(uuid.uuid4())
                 destination = directory / f'{token}.tif'
                 record['status'] = 'running'
@@ -354,6 +356,8 @@ class FrameService:
                 succeeded = sum(r['status'] == 'succeeded' for r in records)
                 failed = sum(r['status'] == 'failed' for r in records)
                 self.store.update_job(key, scenes=records, processed=succeeded + failed, succeeded=succeeded, failed=failed)
+                if self.store.finish_if_cancelled(key):
+                    return
             manifest_reports = []
             quality_names = ('band_coverage_pct', 'roi_cloud_pct', 'roi_shadow_pct', 'roi_cloud_shadow_pct',
                              'roi_snow_pct', 'scl_valid_pct', 'tile_cloud_pct', 'covers_roi')
@@ -373,6 +377,8 @@ class FrameService:
             os.replace(temp_manifest, manifest_path)
             succeeded = sum(r['status'] == 'succeeded' for r in records)
             if succeeded:
+                if self.store.finish_if_cancelled(key):
+                    return
                 self.store.update_job(key, stage='archive')
                 archive_bytes = sum(p.stat().st_size for p in directory.glob('*.tif'))
                 self._space(max(MIN_FREE_BYTES, archive_bytes * 2))
@@ -380,15 +386,18 @@ class FrameService:
                 with zipfile.ZipFile(temporary, 'w', compression=zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
                     archive.write(manifest_path, 'manifest.json')
                     for record in records:
+                        if self.store.finish_if_cancelled(key):
+                            return
                         if record['status'] == 'succeeded':
                             archive.write(directory / f"{record['file_token']}.tif", record['filename'])
                 os.replace(temporary, directory / 'result.zip')
             status = 'completed' if succeeded == len(records) else ('partial' if succeeded else 'failed')
-            self.store.update_job(key, status=status, stage=status)
+            self.store.finish_job(key, status)
         except Exception as exc:
-            self.store.update_job(key, status='failed', stage='failed',
-                                  error_code=getattr(exc, 'code', 'worker_failed'),
-                                  error=exc.message if isinstance(exc, FrameError) else 'Tác vụ không hoàn tất; thử lại sau.')
+            if not self.store.finish_if_cancelled(key):
+                self.store.update_job(key, status='failed', stage='failed',
+                                      error_code=getattr(exc, 'code', 'worker_failed'),
+                                      error=exc.message if isinstance(exc, FrameError) else 'Tác vụ không hoàn tất; thử lại sau.')
         finally:
             for path in directory.glob('*.partial*'):
                 path.unlink(missing_ok=True)

@@ -519,7 +519,7 @@ def _download_source(plan, output, cache, workers=4, cancel=None, progress=None,
 
 class EsriService:
     """Single active job. Atomic job.json plus verified cache survive restart."""
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, *, recover=True):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
@@ -527,7 +527,8 @@ class EsriService:
         self._thread = None
         self._cancel = threading.Event()
         self._closed = False
-        self.recover()
+        if recover:
+            self.recover()
 
     def _save(self, job):
         _atomic_json(self.root / job['job_id'] / 'job.json', job)
