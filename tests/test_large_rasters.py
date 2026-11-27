@@ -108,6 +108,22 @@ class RasterOutputs(unittest.TestCase):
             self.assertEqual(src.transform, from_origin(0, 280, 1, 1))
             self.assertEqual(src.descriptions, ("B2",))
 
+    def test_gee_wire_nodata_is_masked_before_stack_and_mosaic(self):
+        first = np.array([[0.0, -9999.0, 0.17], [np.inf, -0.02, -9999.0]], dtype="float32")
+        overlap = np.array([[0.5, 0.2, 0.9], [0.25, 0.49, -9999.0]], dtype="float32")
+        payloads = {"B2": self.tile(first, nodata=-np.inf),
+                    "B3_t00": self.tile(first, nodata=-np.inf),
+                    "B3_t01": self.tile(overlap, nodata=-np.inf)}
+        out = self.root / "wire-nodata.tif"
+        self.merge(payloads, out, preserve_masks=True)
+        with rasterio.open(out) as src:
+            self.assertTrue(np.isnan(src.nodata))
+            np.testing.assert_array_equal(src.read(1), np.array(
+                [[0.0, np.nan, 0.17], [np.nan, -0.02, np.nan]], dtype="float32"))
+            np.testing.assert_array_equal(src.read_masks(1), [[255, 0, 255], [0, 255, 0]])
+            np.testing.assert_array_equal(src.read(2), np.array(
+                [[0.0, 0.2, 0.17], [0.25, -0.02, np.nan]], dtype="float32"))
+
     def test_stack_never_reads_a_whole_band_and_preserves_sentinel_nodata(self):
         data = np.full((280, 300), 0.1, dtype="float32")
         data[3, 4] = -9999

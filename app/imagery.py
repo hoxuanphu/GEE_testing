@@ -7,6 +7,7 @@ normalization.
 from __future__ import annotations
 
 import datetime as dt
+import json
 import math
 import time
 from dataclasses import dataclass
@@ -93,6 +94,7 @@ DYNAMIC_WORLD_PALETTE = [
 # 04.00 DN shift.  Only the documented scale factor remains.
 _S2_OFFSET = 0.0
 _S2_SCALE = 10000.0
+_GEE_FLOAT_NODATA = -9999
 
 
 @dataclass(frozen=True)
@@ -538,6 +540,8 @@ def list_timeseries_scenes(
     cloud_min: float | None = None,
     cloud_max: float | None = None,
     platform: str | None = None,
+    *,
+    include_footprint: bool = False,
 ) -> list[dict]:
     """Return scene metadata; optional scene-cloud filters apply before enumeration."""
     platform = validate_platform(dataset, platform)
@@ -563,13 +567,16 @@ def list_timeseries_scenes(
 
     def metadata(value):
         image = ee.Image(value)
-        return ee.Dictionary({
+        row = {
             "asset_id": image.get("timeseries:asset_id"),
             "collection": image.get("timeseries:collection"),
             "timestamp_ms": image.get("system:time_start"),
             "cloud_pct": image.get(cloud_property) if cloud_property else None,
             "source_metadata": image.toDictionary(source_properties),
-        })
+        }
+        if include_footprint:
+            row['footprint'] = image.geometry(ee.ErrorMargin(30), ee.Projection('EPSG:4326'), False)
+        return ee.Dictionary(row)
 
     # One extra row detects an incomplete result; never publish a truncated list.
     rows = _compute_timeseries_metadata(collection.toList(TIMESERIES_MAX_SCENES + 1).map(metadata))
@@ -1616,6 +1623,19 @@ def best_scene(
     )
 
 
+def _preview_rgb_style(dataset):
+    if dataset == "dynamic_world":
+        return [DYNAMIC_WORLD_LABEL_BAND], {
+            "min": 0,
+            "max": 8,
+            "palette": DYNAMIC_WORLD_PALETTE,
+        }
+    if dataset == "s1gee":
+        return ["VV"], {"min": -25.0, "max": 0.0, "palette": ["000000", "ffffff"]}
+    bands = {"sentinel2": ["B4", "B3", "B2"], "nicfi": ["R", "G", "B"]}
+    return bands.get(dataset, ["SR_B4", "SR_B3", "SR_B2"]), {"min": 0.0, "max": 0.3}
+
+
 def preview_rgb(
     image: ee.Image,
     dataset: str,
@@ -1623,25 +1643,7 @@ def preview_rgb(
     region: ee.Geometry | None = None,
 ) -> str:
     """Return a PNG (via getThumbURL) for quick visual preview in the browser."""
-    if dataset == "dynamic_world":
-        rgb = image.select([DYNAMIC_WORLD_LABEL_BAND])
-        vis = {
-            "min": 0,
-            "max": 8,
-            "palette": DYNAMIC_WORLD_PALETTE,
-        }
-    elif dataset == "sentinel2":
-        rgb = image.select(["B4", "B3", "B2"])
-        vis = {"min": 0.0, "max": 0.3}
-    elif dataset == "nicfi":
-        rgb = image.select(["R", "G", "B"])
-        vis = {"min": 0.0, "max": 0.3}
-    elif dataset == "s1gee":
-        rgb = image.select(["VV"])
-        vis = {"min": -25.0, "max": 0.0, "palette": ["000000", "ffffff"]}
-    else:
-        rgb = image.select(["SR_B4", "SR_B3", "SR_B2"])
-        vis = {"min": 0.0, "max": 0.3}
+    bands, vis = _preview_rgb_style(dataset)
     vis.update({
         "dimensions": 512,
         "region": region or ee.Geometry.Rectangle(
@@ -1649,7 +1651,31 @@ def preview_rgb(
         ),
         "format": "png",
     })
-    return rgb.getThumbURL(vis)
+    return image.select(bands).getThumbURL(vis)
+
+
+def render_thumbnail_png(image, region, style) -> bytes:
+    """Render a bounded display-only PNG without exposing a signed URL."""
+    from .frame_search import _RPC, _retry
+
+    deadline = time.monotonic() + 18
+    with _RPC(10, deadline) as rpc:
+        params = {**style, 'dimensions': 192, 'region': region}
+        content = _retry(lambda: rpc.thumbnail_once(image, params, deadline=deadline, preview=True), deadline)
+    if not content.startswith(b'\x89PNG\r\n\x1a\n') or len(content) > 256 * 1024:
+        raise ValueError('Invalid catalogue PNG')
+    return content
+
+
+def render_catalog_thumbnail(asset_id: str, dataset: str, region_json: str,
+                             polarization: str = 'vvvh') -> bytes:
+    """Render a small display-only PNG for an exact catalogue scene and ROI."""
+    region = ee.Geometry(json.loads(region_json), proj='EPSG:4326', geodesic=False)
+    bands, style = _preview_rgb_style(dataset)
+    if dataset == 's1gee':
+        bands = [timeseries_source_metadata(dataset, polarization)['bands'][0]]
+    image = load_timeseries_scene(asset_id, dataset, polarization).select(bands).clip(region)
+    return render_thumbnail_png(image, region, style)
 
 
 def _tile_bbox(bbox: Bbox, n: int, i: int, j: int) -> Bbox:
@@ -1771,9 +1797,9 @@ def download_geotiff(
         else:
             one_band = selected.multiply(1.0).toFloat()
             if dataset in ("dem", "sentinel2") or dataset.startswith("s5p_"):
-                one_band = one_band.unmask(-9999, sameFootprint=False)
+                one_band = one_band.unmask(_GEE_FLOAT_NODATA, sameFootprint=False)
             dtype = "float"
-            nodata = -9999
+            nodata = _GEE_FLOAT_NODATA
         download_params = {
             "name": f"{dataset}_{band}{tag}",
             "scale": scale,
@@ -1906,7 +1932,14 @@ def _mosaic_placements(sources, profile):
     return placements
 
 
-def _read_mosaic_window(placements, window, dtype, nodata):
+def _gee_float_missing(values):
+    import numpy as np
+
+    # GEE can write the wire sentinel even when the TIFF NoData tag is -inf.
+    return ~np.isfinite(values) | (values == _GEE_FLOAT_NODATA)
+
+
+def _read_mosaic_window(placements, window, dtype, nodata, *, preserve_float_masks=False):
     """Read one first-valid-pixel mosaic block using globally anchored sampling."""
     import numpy as np
     from rasterio.windows import Window
@@ -1933,7 +1966,10 @@ def _read_mosaic_window(placements, window, dtype, nodata):
             empty = np.isclose(region, fill)
         else:
             empty = region == fill
-        np.copyto(region, data.data, where=empty & ~np.ma.getmaskarray(data), casting="unsafe")
+        valid = ~np.ma.getmaskarray(data)
+        if preserve_float_masks:
+            valid &= ~_gee_float_missing(data.data)
+        np.copyto(region, data.data, where=empty & valid, casting="unsafe")
     return result
 
 
@@ -2059,6 +2095,7 @@ def merge_local_band_tiffs(paths, out_path, *, categorical=False, preserve_masks
     from .raster_grid import GEOTIFF_OPTIONS, atomic_raster_path
 
     dtype = "uint8" if categorical else "float32"
+    preserve_float_masks = preserve_masks and not categorical
     with atomic_raster_path(out_path) as temporary, ExitStack() as output_context:
         dst = None
         for index, base in enumerate(order, 1):
@@ -2082,7 +2119,7 @@ def merge_local_band_tiffs(paths, out_path, *, categorical=False, preserve_masks
                 if dst is None:
                     if categorical:
                         profile.update(nodata=DYNAMIC_WORLD_NODATA)
-                    elif preserve_masks:
+                    elif preserve_float_masks:
                         profile.update(nodata=float("nan"))
                     profile.update(count=len(order), dtype=dtype, **GEOTIFF_OPTIONS)
                     dst = output_context.enter_context(rasterio.open(temporary, "w", **profile))
@@ -2098,9 +2135,12 @@ def merge_local_band_tiffs(paths, out_path, *, categorical=False, preserve_masks
                         data = ref.read(1, window=window, masked=preserve_masks)
                         if preserve_masks:
                             data = data.astype(dtype).filled(dst.nodata)
+                        if preserve_float_masks:
+                            data[_gee_float_missing(data)] = dst.nodata
                     else:
-                        mosaic_nodata = float("nan") if preserve_masks and not categorical else ref.nodata
-                        data = _read_mosaic_window(placements, window, dtype, mosaic_nodata)
+                        mosaic_nodata = dst.nodata if preserve_float_masks else ref.nodata
+                        data = _read_mosaic_window(placements, window, dtype, mosaic_nodata,
+                                                   preserve_float_masks=preserve_float_masks)
                     dst.write(data.astype(dtype, copy=False), index, window=window)
                 dst.set_band_description(index, base)
                 dst.update_tags(index, **ref.tags(1))

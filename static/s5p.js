@@ -30,6 +30,7 @@
     const rows = data.scenes.map(scene => {
       const row = document.createElement('div');
       row.style.cssText = 'padding:12px 0;overflow-wrap:anywhere';
+      window.SceneThumbnails?.append(row, scene, `${data.parameters.product} · ${scene.timestamp}`);
       const label = document.createElement('p');
       label.textContent = `${scene.timestamp} — ${scene.scene_id}`;
       const download = document.createElement('button');
@@ -52,7 +53,8 @@
           image.onerror = () => { message.textContent = 'Không tải được xem trước; có thể thử tải GeoTIFF.'; };
           const vis = data.parameters.visualization;
           message.textContent = `Thang màu: ${vis.min}–${vis.max} ${result.unit} (xanh dương → đỏ). Vùng trống là pixel bị mask.`;
-          row.querySelector('img')?.remove();
+          row.querySelector('.s5p-expanded-preview')?.remove();
+          image.className = 's5p-expanded-preview';
           row.append(image);
         } catch (error) { if (token === generation) message.textContent = error.message; }
         finally { preview.disabled = false; }

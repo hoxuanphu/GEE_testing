@@ -110,6 +110,11 @@ class S5PTests(unittest.TestCase):
             preview = self.client.get(scene['preview_url'])
             self.assertEqual(preview.status_code, 200)
             self.assertEqual(preview.json()['unit'], 'mol/m²')
+            with patch.object(s5p.imagery, 'render_thumbnail_png', return_value=b'png') as render:
+                thumbnail = self.client.get(scene['thumbnail_url'])
+                self.assertEqual(thumbnail.status_code, 200)
+                self.assertEqual(thumbnail.headers['content-type'], 'image/png')
+                self.assertEqual(render.call_args.args[2], data['parameters']['visualization'])
         image.mean.assert_not_called()
         image.select.assert_called_with('tropospheric_NO2_column_number_density')
 

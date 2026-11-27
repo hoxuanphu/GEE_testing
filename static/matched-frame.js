@@ -414,6 +414,7 @@
     if (!snapshot.scenes.length) target.append(node('p', 'Không có cảnh phù hợp. Thu hẹp/đổi khoảng ngày hoặc kiểm tra bộ lọc.'));
     snapshot.scenes.forEach((scene, index) => {
       const card = node('article', null, 'mf-scene');
+      window.SceneThumbnails?.append(card, scene, scene.asset_id);
       const label = node('label', null, 'mf-scene-choice');
       const checkbox = node('input');
       checkbox.type = best() ? 'radio' : 'checkbox';

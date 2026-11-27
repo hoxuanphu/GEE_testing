@@ -15,6 +15,7 @@ DN -> reflectance (đã xử lý trong harmonize()).
 from __future__ import annotations
 
 import datetime as dt
+import re
 import time
 
 import requests
@@ -23,6 +24,22 @@ from .ee_session import _load_extra_cas
 
 _STAC_URL = "https://earth-search.aws.element84.com/v1/search"
 _COLLECTION = "sentinel-2-l2a"
+_THUMBNAIL_ORIGIN = 'https://sentinel-cogs.s3.us-west-2.amazonaws.com'
+
+
+def thumbnail_url(path):
+    if isinstance(path, str) and re.fullmatch(r'/sentinel-s2-l2a-cogs/[\w/-]+/preview\.jpg', path, re.ASCII):
+        return _THUMBNAIL_ORIGIN + path
+    return None
+
+
+def _thumbnail_fields(assets):
+    href = (assets.get('thumbnail') or {}).get('href')
+    if isinstance(href, str) and href.startswith(_THUMBNAIL_ORIGIN):
+        url = thumbnail_url(href[len(_THUMBNAIL_ORIGIN):])
+        if url:
+            return {'thumbnail_url': url}
+    return {}
 
 # Asset name trong Earth Search STAC dùng common names:
 # blue=B02, green=B03, red=B04, nir=B08, scl=SCL
@@ -272,7 +289,7 @@ def harmonize(dn: float) -> float:
     return (dn + _BASELINE_OFFSET) / _S2_SCALE
 
 
-def get_item(product_id: str) -> dict | None:
+def get_item(product_id: str, *, timeout: float = 60) -> dict | None:
     """Lấy 1 item S2 L2A theo ID trực tiếp (không phụ thuộc bbox/điểm).
 
     Dùng GET /collections/sentinel-2-l2a/items/{id} — trả về None nếu
@@ -284,7 +301,7 @@ def get_item(product_id: str) -> dict | None:
     _ensure_cas()
     url = f"https://earth-search.aws.element84.com/v1/collections/{_COLLECTION}/items/{product_id}"
     try:
-        resp = _requests.get(url, timeout=60)
+        resp = _requests.get(url, timeout=timeout)
     except _requests.RequestException:
         return None
     if resp.status_code != 200:
@@ -391,6 +408,7 @@ def search_s2_l2a(
                 "assets": band_urls,
                 "download_url": f.get("links", [{}])[0].get("href"),
                 "self_href": f.get("links", [{}])[0].get("href"),
+                **_thumbnail_fields(assets),
             }
         )
     out.sort(key=lambda p: p["date"] or "", reverse=True)
@@ -446,7 +464,9 @@ def _normalize_features(features: list[dict]) -> list[dict]:
                 "cloud_pct": props.get("eo:cloud_cover"),
                 "size_mb": None,
                 "cog": True,
+                "footprint": f.get("geometry"),
                 "assets": band_urls,
+                **_thumbnail_fields(assets),
             }
         )
     out.sort(key=lambda p: p["date"] or "", reverse=True)

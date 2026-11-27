@@ -4,6 +4,7 @@ from __future__ import annotations
 import datetime as dt
 import asyncio
 from contextlib import asynccontextmanager, suppress
+from functools import lru_cache
 import os
 import math
 import logging
@@ -24,6 +25,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from rasterio.errors import RasterioError
 
 from .request_timing import SearchTimingMiddleware, measure_call
+from . import cdse, imagery, scene_thumbnails
 from .scene_snapshots import SceneSnapshots
 from .download_metrics import DownloadTimingMiddleware, measure as measure_download
 from .export_resources import bulk_export, QueueTimeout
@@ -68,6 +70,8 @@ from .admin_boundaries import (
 from .commune_boundaries import Commune, commune_feature, get_commune, list_communes
 from .ee_session import init_ee
 from .platforms import validate_platform
+from .provider_credentials import PROVIDERS, active_credentials
+from .provider_credentials_api import router as local_provider_settings_router
 from .vector_store import VectorStore
 from .vector_api import VectorArea, vector_area, register_vector_routes
 from .geo import (
@@ -119,6 +123,8 @@ _frame_service = FrameService(_frame_store)
 @asynccontextmanager
 async def _lifespan(application):
     global _timeseries_service, _esri_service, _frame_service, _batch_service, _download_service
+    for provider in PROVIDERS:
+        active_credentials(provider)
     if _download_service is not None and _download_service._stop.is_set():
         _download_service = None
     if os.getenv('GEE_DOWNLOAD_JOBS') == '1':
@@ -688,7 +694,7 @@ def search_timeseries(body: TimeSeriesRequest) -> dict:
         stage = 'validation'
         scenes = [TimeSeriesSceneResponse.model_validate(scene).model_dump() for scene in scenes]
         stage = 'snapshot'
-        return _timeseries_store.create_search(parameters, scenes)
+        return _timeseries_thumbnail_links(_timeseries_store.create_search(parameters, scenes))
     except Exception as exc:
         error = search_failure(exc, stage=stage, request_id=request_id, started=started)
         raise HTTPException(error.status, error.message,
@@ -702,7 +708,84 @@ def timeseries_search_page(search_id: str, offset: int = 0, limit: int = 50) -> 
     result = _timeseries_store.get_search(search_id, offset, limit)
     if result is None:
         raise HTTPException(404, "Search not found or expired")
+    return _timeseries_thumbnail_links(result)
+
+
+def _timeseries_thumbnail_links(result):
+    if result['parameters'].get('roi_geometry'):
+        for index, scene in enumerate(result['scenes'], result['offset']):
+            scene['thumbnail_url'] = f"/api/timeseries/search/{result['search_id']}/thumbnail/{index}"
     return result
+
+
+@lru_cache(maxsize=96)
+def _timeseries_thumbnail(asset_id, dataset, geometry, polarization):
+    return imagery.render_catalog_thumbnail(asset_id, dataset, geometry, polarization)
+
+
+def _serve_gee_thumbnail(asset_id, dataset, region, polarization='vvvh'):
+    try:
+        _ensure_ee()
+        content = _timeseries_thumbnail(asset_id, dataset, json.dumps(region, separators=(',', ':')), polarization)
+    except Exception:
+        raise HTTPException(502, 'Không tải được ảnh xem trước của cảnh.') from None
+    return scene_thumbnails.response(content)
+
+
+def _serve_timeseries_thumbnail(search_id, index):
+    if index < 0:
+        raise HTTPException(404, 'Scene not found')
+    page = _timeseries_store.get_search(search_id, index, 1)
+    if not page or not page['scenes'] or not page['parameters'].get('roi_geometry'):
+        raise HTTPException(404, 'Thumbnail unavailable')
+    params = page['parameters']
+    return _serve_gee_thumbnail(page['scenes'][0]['asset_id'],
+        params['dataset'], params['roi_geometry'], params.get('polarization', 'vvvh'))
+
+
+@app.get('/api/timeseries/search/{search_id}/thumbnail/{index}')
+async def timeseries_thumbnail(search_id: str, index: int):
+    return await scene_thumbnails.load(_serve_timeseries_thumbnail, search_id, index)
+
+
+_component_thumbnail_snapshots = SceneSnapshots(capacity=128)
+
+
+def _component_thumbnail_links(scenes, dataset, geometry, polarization='vvvh'):
+    if not scenes or not geometry:
+        return scenes
+    token = _component_thumbnail_snapshots.put(dataset, (scenes, geometry, polarization))
+    return [{**scene, 'thumbnail_url': f'/api/scene-components/{dataset}/{token}/thumbnail/{index}'}
+            for index, scene in enumerate(scenes)]
+
+
+@app.get('/api/scene-components/{dataset}/{token}/thumbnail/{index}')
+async def component_thumbnail(dataset: Literal['sentinel2', 'landsat', 's1gee'], token: str, index: int):
+    try:
+        scenes, geometry, polarization = _component_thumbnail_snapshots.get(token, dataset)
+        if not 0 <= index < len(scenes):
+            raise IndexError
+        scene_id = scenes[index]['scene_id']
+        asset_id = (imagery.S1_COLLECTION + '/' + scene_id if dataset == 's1gee'
+                    else imagery._native_asset({'system:index': scene_id}, dataset))
+    except (LookupError, ValueError):
+        raise HTTPException(404, 'Thumbnail unavailable') from None
+    return await scene_thumbnails.load(_serve_gee_thumbnail, asset_id, dataset, geometry, polarization)
+
+
+def _serve_cdse_thumbnail(product_id):
+    try:
+        media_type, content = cdse.scene_thumbnail(product_id)
+    except LookupError:
+        raise HTTPException(404, 'CDSE không có ảnh xem trước cho cảnh này.') from None
+    except (OSError, ValueError):
+        raise HTTPException(502, 'Không tải được ảnh xem trước từ CDSE.') from None
+    return scene_thumbnails.response(content, media_type)
+
+
+@app.get('/api/cdse/thumbnail/{product_id}')
+async def cdse_thumbnail(product_id: str):
+    return await scene_thumbnails.load(_serve_cdse_thumbnail, product_id)
 
 
 @app.post("/api/timeseries/jobs")
@@ -1085,6 +1168,8 @@ def plan_composite(req: SceneRequest) -> dict:
     if plan is None:
         raise HTTPException(404, f"Không có ảnh Sentinel-2{req.platform} trong khoảng thời gian/vùng đã chọn."
                             if req.platform is not None else "No image found for this selection/date range")
+    if plan.get('scenes') and getattr(_province, 'geometry', None):
+        plan = {**plan, 'scenes': _component_thumbnail_links(plan['scenes'], req.dataset, _province.geometry)}
     return plan
 
 
@@ -1611,6 +1696,10 @@ def _s1_scene_response(req, scene, roi, bbox, province, orbit_pass=None):
     if orbit_pass:
         source_ids = [source['scene_id'] for source in scene.scenes]
         download_params += '&' + urlencode({'orbit_pass': orbit_pass, 'scene_ids': source_ids}, doseq=True)
+    geometry = (province.geometry if province else
+                _rectangle_model(req.center_lon, req.center_lat, req.width_m, req.height_m, req.rotation_deg).geometry
+                if req.selection_mode == 'rectangle' else
+                point_roi(req.lon, req.lat, req.radius_m, req.rotation_deg)[0])
     return {
         "dataset": "s1gee",
         "orbit_pass": orbit_pass,
@@ -1619,15 +1708,7 @@ def _s1_scene_response(req, scene, roi, bbox, province, orbit_pass=None):
         "date": scene.date,
         "cloud_pct": scene.cloud_pct,
         "bbox": _bbox_dict(bbox),
-        "roi_geometry": (
-            province.geometry
-            if province
-            else _rectangle_model(
-                req.center_lon, req.center_lat, req.width_m, req.height_m, req.rotation_deg
-            ).geometry
-            if req.selection_mode == "rectangle"
-            else point_roi(req.lon, req.lat, req.radius_m, req.rotation_deg)[0]
-        ),
+        "roi_geometry": geometry,
         "rotation_deg": req.rotation_deg,
         "scale_m": S1_SCALE,
         "bands": bands,
@@ -1636,7 +1717,7 @@ def _s1_scene_response(req, scene, roi, bbox, province, orbit_pass=None):
         "coverage_pct": scene.coverage_pct,
         "coverage_scale_m": 100,
         "scene_count": scene.scene_count,
-        "scenes": list(scene.scenes),
+        "scenes": _component_thumbnail_links(list(scene.scenes), 's1gee', geometry, req.polarization),
         "composite": (scene.scene_count or 1) > 1,
         "warning": ("Độ phủ SAR dưới 99%; vẫn cho tải phần có dữ liệu. Hãy mở rộng khoảng ngày hoặc thu nhỏ ROI."
                     if scene.coverage_pct is not None and scene.coverage_pct < 99 else None),
@@ -3188,5 +3269,6 @@ _scene_inventory_store = register_scene_inventory(app)
 
 register_vector_routes(app, _vector_store)
 register_batch_routes(app, _batch_store, lambda: _batch_service)
+app.include_router(local_provider_settings_router)
 
 app.mount("/", StaticFiles(directory=str(_STATIC_DIR), html=True), name="static")

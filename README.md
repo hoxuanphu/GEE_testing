@@ -29,14 +29,21 @@ các mô hình yêu cầu liên quan.
 
 1. Clone repo và lấy dữ liệu Git LFS như mục [Dữ liệu và cấu hình cục bộ](#dữ-liệu-và-cấu-hình-cục-bộ).
 2. Tạo môi trường Python và cài `requirements.txt` theo mục [Cài đặt](#cài-đặt).
-3. Cấu hình Earth Engine và các tài khoản nguồn dữ liệu cần dùng; không đưa khóa
-   hoặc tệp `.env` thật vào Git.
-4. Chạy `uvicorn app.main:app --reload --port 8000`, mở
+3. Chạy `uvicorn app.main:app --reload --port 8000`, mở
    <http://127.0.0.1:8000>. Tài liệu API FastAPI có tại
    <http://127.0.0.1:8000/docs> khi server đang chạy.
+4. Mở **Cấu hình nguồn** để nhập khóa riêng của bạn cho GEE, CDSE và S3 CDSE.
+   Chỉ cần lưu các nguồn bạn sử dụng. Khởi động lại backend sau khi lưu.
 
 Đây là ứng dụng local/trusted: các job và snapshot không cung cấp xác thực hay
 phân quyền người dùng. Cần thiết kế bổ sung trước khi đưa ra mạng công cộng.
+
+Trang **Cấu hình nguồn** chỉ lưu qua `localhost`, `127.0.0.1` hoặc `::1` trên
+máy chạy backend. GEE nhận tệp JSON service account, CDSE nhận email và mật
+khẩu, S3 CDSE nhận Access Key và Secret Key đã cấp. Mỗi nguồn được lưu vào tệp
+`.env.providers.<nguồn>.json` trong thư mục clone và Git bỏ qua các tệp này.
+Cấu hình lưu qua giao diện có hiệu lực sau khi backend khởi động lại. Với
+nguồn chưa lưu qua giao diện, ứng dụng vẫn đọc cấu hình `.env` hiện có.
 
 ## Giao diện Satellite Workspace
 

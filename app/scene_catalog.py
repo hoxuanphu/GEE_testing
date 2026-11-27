@@ -3,20 +3,52 @@ from __future__ import annotations
 
 import datetime as dt
 from copy import deepcopy
+from functools import lru_cache
+import json
+import logging
 import math
+import re
 import time
 import uuid
 from pathlib import Path
-from urllib.parse import urlencode
+from typing import Literal
+from urllib.parse import urlencode, urlsplit
 
 from fastapi import HTTPException
 from fastapi.responses import FileResponse, RedirectResponse
 from pydantic import Field, model_validator
+from starlette.background import BackgroundTask
 
-from . import imagery, eodag_adapter
+from . import aws_stac, cdse, imagery, eodag_adapter, scene_thumbnails
 from .catalog_models import CatalogFailure, CatalogUnavailable
+from .export_resources import QueueTimeout
+from .full_scene_export import FullSceneDiskSpaceError, export_full_scene
 from .timeseries_metadata import search_failure
+from .vector_import import VectorImportError, validate_geometry
 from .vector_mask import mask_raster_to_polygon
+
+logger = logging.getLogger(__name__)
+
+
+def _scene_footprint(footprint):
+    if not isinstance(footprint, dict) or footprint.get('type') not in ('Polygon', 'MultiPolygon'):
+        return None
+    geometry = {'type': footprint['type'], 'coordinates': footprint.get('coordinates')}
+    try:
+        validate_geometry(geometry)
+    except VectorImportError:
+        return None
+    return geometry
+
+
+def _has_thumbnail(parameters, scene):
+    return (parameters['source'] == 'gee' and parameters['dataset'] in ('sentinel2', 'landsat')
+            and bool(scene.get('asset_id')))
+
+
+def _aws_scene_id(scene):
+    identifier = scene.get('id')
+    return isinstance(identifier, str) and re.fullmatch(r'S2[A-D]_\d{2}[A-Z]{3}_\d{8}_\d+_L2A', identifier)
 
 
 def register_scene_catalog(api):
@@ -67,6 +99,17 @@ def register_scene_catalog(api):
                 if params['selection_mode'] == 'rectangle' and params['source'] in ('aws', 'cdse'):
                     scene['download_capabilities'] = {'status': 'supported'}
                 scene['download_url'] = f'/api/scene-catalog/{search_id}/download/{index}'
+                if _has_thumbnail(params, scene):
+                    scene['thumbnail_url'] = f'/api/scene-catalog/{search_id}/thumbnail/{index}'
+                    scene['full_scene_download_url'] = scene['download_url'] + '?extent=scene'
+                elif params['source'] == 'cdse' and (url := cdse.thumbnail_path(scene.get('id'))):
+                    scene['thumbnail_url'] = url
+                elif params['source'] == 'aws':
+                    public_url = aws_stac.thumbnail_url(scene.pop('browse_path', None))
+                    if public_url:
+                        scene['thumbnail_url'] = public_url
+                    elif _aws_scene_id(scene):
+                        scene['thumbnail_url'] = f'/api/scene-catalog/{search_id}/thumbnail/{index}'
         return result
 
     def search(body):
@@ -106,6 +149,8 @@ def register_scene_catalog(api):
                 **rectangle_args, **vector_args)
             if body.selection_mode == 'vector':
                 params['roi_geometry'] = deepcopy(area.geometry)
+            elif body.selection_mode in ('province', 'commune') and getattr(area, 'geometry', None):
+                params['roi_geometry'] = area.geometry
         elif rectangle is not None:
             pass  # External providers search the envelope; the true polygon stays in the snapshot.
         elif body.selection_mode == 'point':
@@ -128,7 +173,7 @@ def register_scene_catalog(api):
                 end = (dt.date.fromisoformat(body.end_date) + dt.timedelta(days=1)).isoformat()
                 scenes = main.list_timeseries_scenes(body.dataset, body.lon or 0, body.lat or 0,
                     body.start_date, end, roi=roi, cloud_min=body.cloud_min, cloud_max=body.cloud_max,
-                    platform=body.platform)
+                    platform=body.platform, include_footprint=True)
                 params['source'] = 'gee'
                 truncated = False
             elif body.source == 'eodag':
@@ -156,6 +201,12 @@ def register_scene_catalog(api):
                     continue
                 row = dict(scene)
                 row.pop('assets', None)
+                if params['source'] == 'aws' and isinstance(row.get('thumbnail_url'), str):
+                    href = row.pop('thumbnail_url')
+                    path = urlsplit(href).path
+                    if aws_stac.thumbnail_url(path) == href:
+                        row['browse_path'] = path
+                row['footprint'] = _scene_footprint(row.get('footprint'))
                 row['cloud_pct'] = float(cloud)
                 meta = row.get('source_metadata', {})
                 if body.source == 'eodag':
@@ -189,7 +240,7 @@ def register_scene_catalog(api):
                 raise HTTPException(502, 'EODAG provider search failed') from exc
             raise HTTPException(502, f'Unable to list scenes: {exc}') from exc
 
-    def download(search_id: str, index: int):
+    def snapshot_scene(search_id, index):
         try:
             params, scenes = store._snapshot(search_id)
         except ValueError as exc:
@@ -201,6 +252,64 @@ def register_scene_catalog(api):
             expected_platform = 'Sentinel-2' + params['platform']
             if params['dataset'] != 'sentinel2' or scene.get('platform') != expected_platform:
                 raise HTTPException(409, 'Scene does not match the selected platform; search again')
+        return params, scene
+
+    @lru_cache(maxsize=96)
+    def thumbnail_bytes(asset_id, dataset, region_json):
+        return imagery.render_catalog_thumbnail(asset_id, dataset, region_json)
+
+    def serve_thumbnail(search_id, index):
+        params, scene = snapshot_scene(search_id, index)
+        if params['source'] == 'aws' and _aws_scene_id(scene):
+            row = aws_stac.get_item(scene['id'], timeout=8)
+            if row and row.get('id') == scene['id'] and row.get('thumbnail_url'):
+                return RedirectResponse(row['thumbnail_url'])
+            raise HTTPException(404, 'Thumbnail unavailable for this scene')
+        if not _has_thumbnail(params, scene):
+            raise HTTPException(404, 'Thumbnail unavailable for this scene')
+        try:
+            region = params.get('roi_geometry')
+            if region is None:
+                if params['selection_mode'] == 'point':
+                    region, _ = main.point_roi(params['lon'], params['lat'], params['radius_m'], params.get('rotation_deg', 0))
+                else:  # Administrative snapshots saved before ROI geometry was included.
+                    bbox = main.Bbox(**params['bbox'])
+                    corners = [[bbox.west, bbox.south], [bbox.east, bbox.south],
+                               [bbox.east, bbox.north], [bbox.west, bbox.north]]
+                    region = {'type': 'Polygon', 'coordinates': [[*corners, corners[0]]]}
+            main._ensure_ee()
+            content = thumbnail_bytes(scene['asset_id'], params['dataset'], json.dumps(region, separators=(',', ':')))
+        except Exception:
+            raise HTTPException(502, 'Không tải được ảnh xem trước của cảnh.') from None
+        return scene_thumbnails.response(content)
+
+    async def thumbnail(search_id: str, index: int):
+        return await scene_thumbnails.load(serve_thumbnail, search_id, index)
+
+    def download(search_id: str, index: int, extent: Literal['roi', 'scene'] = 'roi'):
+        params, scene = snapshot_scene(search_id, index)
+        if extent == 'scene':
+            if not _has_thumbnail(params, scene):
+                raise HTTPException(409, 'Chế độ nguyên cảnh chỉ hỗ trợ Sentinel-2 và Landsat GEE.')
+            main._ensure_ee()
+            out = main._DOWNLOADS_DIR / f'{uuid.uuid4().hex}.tif'
+            band_options = {key: params[key] for key in ('s2_auxiliary_bands', 's2_band_preset')
+                            if params.get(key) is not None}
+            try:
+                export_full_scene(scene['asset_id'], params['dataset'], out, **band_options)
+            except QueueTimeout:
+                raise
+            except FullSceneDiskSpaceError:
+                raise HTTPException(507, 'Máy chủ không đủ dung lượng để tạo GeoTIFF nguyên cảnh.') from None
+            except Exception as exc:
+                out.unlink(missing_ok=True)
+                logger.warning('Full scene export failed: dataset=%s error_type=%s',
+                               params['dataset'], type(exc).__name__)
+                raise HTTPException(502, 'Không tạo được GeoTIFF nguyên cảnh từ GEE. Hãy thử tải lại.') from None
+            suffix = '_rgbnir' if params.get('s2_band_preset') == 'rgbnir' else ''
+            filename = f'{params["dataset"]}_{Path(scene["asset_id"]).name}{suffix}_full_scene.tif'
+            return FileResponse(out, media_type='image/tiff', filename=filename,
+                                background=BackgroundTask(out.unlink, missing_ok=True))
         if params['selection_mode'] == 'vector' and params['source'] != 'gee':
             raise HTTPException(409, 'Vector ROI downloads are unsupported for external providers')
         if params['source'] == 'eodag':
@@ -266,5 +375,6 @@ def register_scene_catalog(api):
     search.__annotations__['body'] = CatalogRequest
     api.post('/api/scene-catalog')(search)
     api.get('/api/scene-catalog/{search_id}')(page)
+    api.get('/api/scene-catalog/{search_id}/thumbnail/{index}')(thumbnail)
     api.get('/api/scene-catalog/{search_id}/download/{index}')(download)
     return store
