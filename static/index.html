@@ -105,7 +105,7 @@
     <select id="selection_mode">
       <option value="point">Theo vị trí</option>
       <option value="rectangle">Vẽ hình chữ nhật (ROI)</option>
-      <option value="reference">Đồng khung GeoTIFF mẫu</option>
+      <option id="selection_mode_reference" value="reference">Đồng khung GeoTIFF mẫu</option>
       <option value="vector">Từ polygon lớp vector</option>
       <option value="province">Theo tỉnh / thành phố</option>
       <option value="commune">Theo xã / phường</option>
@@ -243,6 +243,7 @@
       <option value="nicfi">Planet NICFI (4.77 m, composite tháng)</option>
       <option value="dynamic_world">Dynamic World land cover (10 m)</option>
       <option value="s5p">Sentinel-5P OFFL (từng ảnh, lưới ~1.1 km)</option>
+      <option value="umbra">Umbra Open Data (SAR)</option>
       <option value="dem_alos">DEM — ALOS AW3D30 (DSM, ~30 m)</option>
       <option value="dem_srtm">DEM — SRTM (30 m)</option>
       <option value="dem_copernicus">DEM — Copernicus GLO-30 (DSM, ~30 m)</option>
@@ -255,6 +256,10 @@
     </select>
   </div>
 
+  <div id="umbraSelection" hidden>
+    <button id="umbraRefresh" type="button">Tạo danh mục Umbra</button>
+    <p id="umbraCatalogStatus" role="status"></p>
+  </div>
   <div id="s5pSelection" hidden>
     <label for="s5p_product">Sản phẩm Sentinel-5P</label>
     <select id="s5p_product">
@@ -465,6 +470,12 @@
   <button id="btnSearch" type="button">Tìm ảnh (ít mây nhất)</button>
   <div id="status" role="status" aria-live="polite"></div>
   <div id="searchTiming" class="hint" role="status" aria-live="polite"></div>
+  <section id="umbraResults" aria-label="Ảnh Umbra Open Data" hidden>
+    <p id="umbraResultStatus" role="status"></p>
+    <div id="umbraScenes"></div>
+    <button id="umbraPrev" type="button" disabled>Trang trước</button>
+    <button id="umbraNext" type="button" disabled>Trang sau</button>
+  </section>
   <section id="s5pResults" aria-label="Ảnh Sentinel-5P" hidden>
     <p id="s5pMeta" role="status" aria-live="polite"></p>
     <div id="s5pScenes"></div>
@@ -1045,7 +1056,7 @@ function updateTimeSeriesVisibility() {
   $('pointMergeSelection').style.display =
     ['point', 'rectangle'].includes($('selection_mode').value) && ['sentinel2', 'landsat'].includes($('dataset').value)
     && !$('time_series_enabled').checked ? '' : 'none';
-  $('btnSearch').textContent = window.TimeSeriesBatches?.enabled() ? 'Bắt đầu tải theo năm' : $('dataset').value === 's5p' ? 'Liệt kê từng ảnh Sentinel-5P' : $('time_series_enabled').checked
+  $('btnSearch').textContent = $('dataset').value === 'umbra' ? 'Tìm ảnh Umbra' : window.TimeSeriesBatches?.enabled() ? 'Bắt đầu tải theo năm' : $('dataset').value === 's5p' ? 'Liệt kê từng ảnh Sentinel-5P' : $('time_series_enabled').checked
     ? 'Tìm ảnh time series' : ['sentinel2', 'landsat', 's2', 's2aws'].includes($('dataset').value) && !$('least_cloud_enabled').checked
       ? 'Liệt kê ảnh theo % mây' : 'Tìm ảnh (ít mây nhất)';
 }
@@ -1337,7 +1348,16 @@ map.on('click', e => {
 
 $('sar_merge_scenes').addEventListener('change', invalidateSearchResults);
 $('selection_mode').addEventListener('change', setSelectionMode);
-$('dataset').addEventListener('change', updateCompositeVisibility);
+$('dataset').addEventListener('change', () => {
+  const selection = $('selection_mode');
+  const reference = $('selection_mode_reference');
+  reference.disabled = $('dataset').value === 'umbra';
+  if (reference.disabled && selection.value === 'reference') {
+    selection.value = 'point';
+    selection.dispatchEvent(new Event('change', {bubbles:true}));
+  }
+  updateCompositeVisibility();
+});
 $('slc_mode').addEventListener('change', updateSlcVisibility);
 $('province_id').addEventListener('change', e => selectProvince(e.target.value));
 $('clearProvinceSelection').addEventListener('click', () => {
@@ -1392,6 +1412,7 @@ let searchGeneration = 0;
 function invalidateSearchResults() {
   window.SceneInventory?.invalidate();
   window.S5P?.invalidate();
+  window.Umbra?.invalidate();
   searchGeneration++;
   invalidateTimeSeries();
   updateCloudSelection();
@@ -1448,7 +1469,7 @@ function updateCloudSelection() {
   $('cloudSelection').hidden = !supported || timeSeries;
   const listing = supported && !timeSeries && !$('least_cloud_enabled').checked;
   $('cloudRange').hidden = !listing;
-  $('btnSearch').textContent = $('dataset').value === 's5p' ? 'Liệt kê từng ảnh Sentinel-5P' : dem ? 'Tải DEM GeoTIFF (30 m)' : listing ? 'Liệt kê ảnh theo % mây' : timeSeries ? 'Tìm chuỗi thời gian' : rectangleExternal ? 'Liệt kê ảnh (bao ngoài ROI)' : 'Tìm ảnh (ít mây nhất)';
+  $('btnSearch').textContent = $('dataset').value === 'umbra' ? 'Tìm ảnh Umbra' : $('dataset').value === 's5p' ? 'Liệt kê từng ảnh Sentinel-5P' : dem ? 'Tải DEM GeoTIFF (30 m)' : listing ? 'Liệt kê ảnh theo % mây' : timeSeries ? 'Tìm chuỗi thời gian' : rectangleExternal ? 'Liệt kê ảnh (bao ngoài ROI)' : 'Tìm ảnh (ít mây nhất)';
   sceneCatalog = null;
   sceneCatalogGeneration++;
   sceneFootprints.clear();
@@ -1608,6 +1629,10 @@ $('btnSearch').addEventListener('click', async () => {
     return;
   }
   if (window.MatchedFrame?.isActive() || selectionMode === 'reference') {
+    if ($('dataset').value === 'umbra') {
+      $('status').textContent = 'Umbra hỗ trợ ROI thủ công hoặc vùng hành chính. Hãy vẽ ROI mới hoặc đổi cách chọn vùng.';
+      return;
+    }
     if (window.MatchedFrame) await window.MatchedFrame.search();
     else $('status').textContent = 'Bộ điều khiển đồng khung chưa sẵn sàng. Hãy tải lại trang.';
     return;
@@ -1644,6 +1669,16 @@ $('btnSearch').addEventListener('click', async () => {
   $('plan').style.display = 'none';
   pendingCompositeBody = null;
 
+  if (dataset === 'umbra') {
+    const dates = {start_date:$('start_date').value, end_date:$('end_date').value};
+    let body = {...dates, selection_mode:selectionMode};
+    if (rectangleMode) body = RectangleROI.body(body, rectangleEditor.get());
+    else if (selectionMode === 'province') body.province_id = provinceId;
+    else if (selectionMode === 'commune') body.commune_id = communeId;
+    else Object.assign(body, {lon, lat, radius_m:parseFloat($('radius_m').value) || 2000,
+                              rotation_deg:rotationValue()});
+    return window.Umbra.search(body);
+  }
   if (dataset === 's5p') {
     const body = opticalSceneBody(selectionMode, provinceId, communeId, lon, lat);
     delete body.dataset; delete body.merge_scenes; delete body.composite_method;
@@ -2520,14 +2555,15 @@ async function searchS1Pairs(lon, lat) {
 }
 </script>
 <script src="/s5p.js?v=scene-thumbnails-4"></script>
+<script src="/umbra.js?v=2"></script>
 <script src="/esri.js?v=rectangle-1"></script>
 <script src="/download-jobs.js?v=1"></script>
-<script src="/workspace.js?v=workspace-layout-1"></script>
+<script src="/workspace.js?v=workspace-layout-2"></script>
 <script src="/task-center.js?v=8"></script>
 <script src="/matched-frame.js?v=task-center-2"></script>
 <script src="/scene-inventory.js?v=1"></script>
 <script src="/vector-layers.js?v=2"></script>
-<script src="/vector-search.js?v=3"></script>
+<script src="/vector-search.js?v=4"></script>
 <script src="/timeseries-batches.js?v=1"></script>
 <script src="/provider-warning.js?v=1"></script>
 <script>

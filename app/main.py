@@ -142,6 +142,7 @@ async def _application_lifespan(application):
         _timeseries_service = TimeSeriesService(_timeseries_store)
     _timeseries_service.recover_interrupted_jobs()
     _timeseries_service.cleanup_expired_jobs()
+    _umbra_store.cleanup_expired_jobs()
     _batch_service = BatchService(_batch_store, _timeseries_service)
     _batch_store.recover()
     _batch_store.cleanup()
@@ -155,6 +156,7 @@ async def _application_lifespan(application):
         while True:
             await asyncio.sleep(3600)
             await asyncio.to_thread(_timeseries_service.cleanup_expired_jobs)
+            await asyncio.to_thread(_umbra_store.cleanup_expired_jobs)
             await asyncio.to_thread(_batch_store.cleanup)
             await asyncio.to_thread(_frame_service.cleanup)
             if _download_service is not None:
@@ -167,6 +169,7 @@ async def _application_lifespan(application):
         cleanup_task.cancel()
         with suppress(asyncio.CancelledError):
             await cleanup_task
+        await asyncio.to_thread(_umbra_catalog.shutdown)
         await asyncio.to_thread(_batch_service.pause_active)
         await asyncio.to_thread(_esri_service.shutdown)
         if _esri_service._thread is not None:
@@ -3461,6 +3464,9 @@ from .scene_inventory import register_scene_inventory
 _scene_inventory_store = register_scene_inventory(app)
 
 register_vector_routes(app, _vector_store)
+from .umbra_api import register_umbra
+
+_umbra_catalog, _umbra_store = register_umbra(app, _DOWNLOADS_DIR / 'umbra', _vector_store)
 register_batch_routes(app, _batch_store, lambda: _batch_service)
 from .task_center import register_task_center
 register_task_center(app, _timeseries_store, _batch_store, _frame_store,

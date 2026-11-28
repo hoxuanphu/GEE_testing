@@ -69,6 +69,11 @@
         return;
       }
       if (dataset.startsWith('dem_')) return await downloadDem(dataset, selection, version);
+      if (dataset === 'umbra') {
+        return await window.Umbra.search({
+          ...selection, start_date:el('start_date').value, end_date:el('end_date').value
+        });
+      }
       const body = {...copy(opticalSceneBody('vector', null, null, null, null)), ...selection, dataset};
       if (dataset === 's5p') {
         return await window.S5P.search({

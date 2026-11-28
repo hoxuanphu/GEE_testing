@@ -44,7 +44,7 @@
   move(vector.body, ['vectorLayersPanel']);
 
   source.append(get('dataset').parentElement);
-  move(source, ['mfPlatformSelection', 's5pSelection', 'sarSelection', 'slcSelection', 's2SourceSelection', 's3TypeSelection', 'demHint']);
+  move(source, ['mfPlatformSelection', 'umbraSelection', 's5pSelection', 'sarSelection', 'slcSelection', 's2SourceSelection', 's3TypeSelection', 'demHint']);
   move(filters, ['dateSelection', 'cloudSelection']);
   const advanced = disclosure(filters, 'Tùy chọn nâng cao');
   move(advanced.body, ['s2AuxiliarySelection', 'pointMergeSelection', 'compositeSelection', 'sceneGroupingSelection', 'mosaicMaskSelection', 'colorBalanceSelection', 'sarMergeSelection', 'timeSeriesSelection']);
@@ -56,7 +56,7 @@
   const action = document.createElement('div');
   action.className = 'workspace-action';
   move(action, ['btnSearch', 'status', 'searchTiming']);
-  const resultIds = ['plan', 'sceneCatalogResults', 'result', 's1result', 's5pResults', 'timeSeriesResults', 'matchedFrameResults'];
+  const resultIds = ['plan', 'sceneCatalogResults', 'result', 's1result', 's5pResults', 'umbraResults', 'timeSeriesResults', 'matchedFrameResults'];
   move(get('workspaceResultContent'), resultIds);
   move(get('workspaceJobDetails'), ['downloadJobPanel', 'timeSeriesBatchPanel', 'esriPanel']);
   filters.append(...sidebar.children);

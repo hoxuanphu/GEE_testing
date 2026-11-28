@@ -132,6 +132,7 @@ Sản phẩm gồm TIFF và manifest, có thể tải từng ảnh hoặc ZIP kh
 | Sentinel-1 GRD/SLC, Sentinel-2 L2A, Sentinel-3 CDSE | Tìm catalogue và tải tùy sản phẩm/quyền truy cập; ZIP là nguyên sản phẩm. Gợi ý cặp SLC chỉ hỗ trợ chọn dữ liệu InSAR, không tạo interferogram. |
 | Sentinel-2 L2A AWS | Tìm catalogue và tải/cắt các band COG theo luồng được hỗ trợ. |
 | Sentinel-5P OFFL GEE | Tìm từng ảnh NO2, SO2, CO, CH4, O3, HCHO hoặc AAI; tải GeoTIFF một band cho từng ảnh. |
+| Umbra Open Data | Tìm cảnh SAR theo footprint và ngày UTC. Tải toàn cảnh GEC GeoTIFF và metadata từ S3 công khai. |
 | ALOS AW3D30, SRTM, Copernicus GLO-30 qua GEE | Tải DEM/DSM 30 m theo ROI; ALOS và Copernicus là DSM, không phải DTM đất trống. |
 | Esri World Imagery | Tải nền RGB dạng job theo điểm, chữ nhật, xã/phường hoặc bbox. Đây là ảnh mosaic hiển thị, không phải surface reflectance; không bảo đảm ngày chụp hay độ phân giải nguồn. |
 
@@ -150,6 +151,26 @@ Giá trị là lượng cột khí, tỷ lệ trộn CH4 hoặc chỉ số aeros
 GeoTIFF giữ giá trị và mask của sản phẩm. Phần giao ROI vẫn có thể không có
 pixel hợp lệ. Quyền truy cập và điều khoản sử dụng dữ liệu do từng nhà cung cấp
 quy định.
+
+### Umbra Open Data
+
+Trong **Khám phá**, chọn **Umbra Open Data (SAR)**. Lần đầu, bấm **Tạo danh
+mục Umbra** và chờ trạng thái đồng bộ hoàn tất. Ứng dụng lưu chỉ mục metadata
+trong thư mục `umbra/` dưới `GEE_DOWNLOADS_DIR`. Không cần tài khoản AWS.
+Ở những lần sau, dùng **Cập nhật danh mục Umbra** để lấy các cảnh mới. Nếu cập
+nhật gặp lỗi, trạng thái sẽ cho biết khi ứng dụng đang dùng danh mục trước đó.
+
+Chọn ROI và khoảng ngày, sau đó bấm **Tìm ảnh Umbra**. Ngày đầu và cuối đều
+được tính theo UTC. Kết quả hiện footprint, kích thước tệp, vệ tinh, phân cực
+và độ phân giải SAR khi có metadata. Ảnh xem trước phụ thuộc thumbnail hoặc
+overview COG của cảnh. **Tải toàn cảnh GEC** giữ tệp GeoTIFF nguồn, kể cả phần
+nằm ngoài ROI. Có thể theo dõi hoặc hủy trong **Tiến trình tải**, và lấy JSON
+kèm theo bằng **Tải metadata**.
+
+Độ phủ và lịch chụp phụ thuộc danh mục công khai của Umbra. Một cảnh giao ROI
+có thể chỉ phủ một phần vùng. Dữ liệu theo CC BY 4.0, cần ghi công Umbra khi
+sử dụng. [AWS Open Data Registry](https://registry.opendata.aws/umbra-open-data/) ·
+[Giấy phép Umbra Open Data](https://umbra.space/open-license).
 
 ### Ghép cảnh và chất lượng
 
@@ -277,6 +298,7 @@ schema hoặc mã tương ứng.
 | Catalogue và đếm ảnh | `POST /api/scene-catalog`, `POST /api/scene-inventory` |
 | Vector | `POST /api/vectors/import`, `POST /api/vectors/rois` |
 | Sentinel-5P | `GET /api/s5p/products`, `POST /api/s5p/search` |
+| Umbra Open Data | `GET /api/umbra/catalog`, `POST /api/umbra/catalog/refresh`, `POST /api/umbra/search` |
 | Đồng khung | `POST /api/matched-frame/references`, `POST /api/matched-frame/searches`, `POST /api/matched-frame/preflight`, `POST /api/matched-frame/jobs` |
 | Time series | `POST /api/timeseries/search`, `POST /api/timeseries/jobs`, `POST /api/timeseries/batches` |
 | Esri / DEM | `POST /api/esri/jobs`, `GET /api/dem/download` |

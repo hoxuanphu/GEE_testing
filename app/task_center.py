@@ -21,6 +21,7 @@ from .timeseries import BusyError
 
 ACTIVE = {'queued', 'running', 'cancelling', 'pausing'}
 SCENE_PATH = re.compile(r'/api/scene-catalog/[^/]+/download/[^/]+')
+UMBRA_PATH = re.compile(r'/api/umbra/search/[^/]+/scenes/[^/]+/download')
 logger = logging.getLogger(__name__)
 
 
@@ -32,6 +33,7 @@ DOWNLOAD_PATH = re.compile(
     r'|s1/crop(?:-mosaic)?|s2/aws/province-mosaic'
     r'|scene-catalog/[^/]+/download/[^/]+|scene-inventory/[^/]+/csv'
     r'|s5p/search/[^/]+/scenes/[^/]+/download'
+    r'|umbra/search/[^/]+/scenes/[^/]+/download'
     r'|(?:timeseries|esri|matched-frame)/jobs/[^/]+/download'
     r'|matched-frame/jobs/[^/]+/files/[^/]+|download-jobs/[^/]+/file'
     r'|timeseries/batches/[^/]+/years/[^/]+/(?:download|csv))'
@@ -42,6 +44,7 @@ class DownloadTransfers:
     def __init__(self):
         self.items = {}
         self.stops = {}
+        self.cancelled_umbra = {}
         self.lock = Lock()
 
     def snapshot(self):
@@ -55,8 +58,14 @@ class DownloadTransfers:
         params = parse_qs(query.decode('utf-8', errors='replace'))
         name = next((params[key][0] for key in ('filename', 'scene_ids', 'product_id', 'product_ids')
                      if params.get(key)), None)
+        attempt = None
+        if UMBRA_PATH.fullmatch(path):
+            token = params.get('attempt', [''])[0]
+            attempt = (path, token if re.fullmatch(r'[a-f0-9]{32}', token) else '')
         with self.lock:
-            self.stops[job_id] = (loop, stopped)
+            if attempt is not None and self.cancelled_umbra.get(attempt, 0) > time():
+                raise TransferCancelled
+            self.stops[job_id] = (loop, stopped, attempt)
             self.items[job_id] = {
                 'id': job_id, 'kind': 'transfer', 'status': 'queued',
                 'stage': 'queued', 'created': time(), 'source': path,
@@ -72,7 +81,15 @@ class DownloadTransfers:
                 raise HTTPException(404, 'Không tìm thấy tác vụ.')
             if item['status'] not in {'queued', 'running', 'cancelling'}:
                 raise HTTPException(409, 'Lượt tải đã kết thúc.')
-            loop, stopped = self.stops[job_id]
+            loop, stopped, attempt = self.stops[job_id]
+            if attempt is not None:
+                # Chrome retries an interrupted attachment with the same URL.
+                now = time()
+                self.cancelled_umbra = {key: expiry for key, expiry in self.cancelled_umbra.items()
+                                        if expiry > now}
+                if len(self.cancelled_umbra) >= 1024:
+                    self.cancelled_umbra.pop(next(iter(self.cancelled_umbra)))
+                self.cancelled_umbra[attempt] = now + 3600
             item['status'] = 'cancelling'
             loop.call_soon_threadsafe(stopped.set)
             return item.copy()
@@ -165,7 +182,10 @@ class DownloadTransferMiddleware:
         if not self.tracked(path, query):
             return await self.app(scope, receive, send)
 
-        job, stopped = self.transfers.start(path, query)
+        try:
+            job, stopped = self.transfers.start(path, query)
+        except TransferCancelled:
+            return await JSONResponse({'detail': 'Lượt tải Umbra đã được hủy.'}, status_code=409)(scope, receive, send)
         navigation = dict(scope.get('headers', ())).get(b'sec-fetch-mode') == b'navigate'
         acquired = False
         assembling = False

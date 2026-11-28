@@ -27,6 +27,19 @@ README hiện tại được rút gọn trong phiên làm việc ngày 2026-11-2
 lịch sử dưới đây được trích từ README tại commit `344c8fb`. Có thể xem nguyên
 văn bản đã commit bằng `git show 344c8fb:README.md`.
 
+## Umbra Open Data ngày 2026-11-28
+
+Thêm nguồn Umbra vào **Khám phá** để tìm cảnh giao ROI theo ngày UTC, xem
+footprint, xem trước và tải GEC GeoTIFF nguyên gốc kèm metadata. Ứng dụng lập
+chỉ mục SQLite từ danh sách object S3 và sidecar. **Tiến trình tải** theo dõi
+số byte và chặn Chrome tự tải lại một lượt đã hủy.
+
+Kiểm chứng trên Windows bằng Chrome với dữ liệu S3 thật trong các nhóm cảnh
+mẫu năm 2025 và 2026. Tệp mẫu 56.325.902 byte được tải đủ và mở được bằng
+Rasterio và QGIS 3.44.14 ở EPSG:4326. Thử hủy cảnh 525.465.602 byte sau khi
+đã truyền dữ liệu. Chrome báo lượt tải bị hủy và yêu cầu tự tải lại nhận
+HTTP 409. Xem [phương án và bằng chứng](docs/superpowers/plans/2026-11-28-umbra-open-data-integration.md).
+
 ## Ghi chú trích từ README trước đây
 
 Các đoạn trích được giữ nguyên để bảo toàn ngữ cảnh và giới hạn của những lần

@@ -142,6 +142,18 @@ class TimeSeriesStore:
         return {"search_id": search_id, "total": len(scenes), "scenes": scenes[offset:offset + limit],
                 "parameters": json.loads(row["parameters"]), "offset": offset, "limit": limit}
 
+    def get_search_scene(self, search_id: str, index: int) -> dict | None:
+        """Read just the selected scene from a frozen search."""
+        if not 0 <= index <= 2**31 - 1:
+            return None
+        with self._lock, self._connect() as db:
+            row = db.execute("SELECT json_extract(scenes, ?) FROM searches WHERE id=?",
+                             (f'$[{index}]', search_id)).fetchone()
+            if row is None or row[0] is None:
+                return None
+            db.execute("UPDATE searches SET activity=? WHERE id=?", (time.time(), search_id))
+        return json.loads(row[0])
+
     def _snapshot(self, search_id: str):
         with self._lock, self._connect() as db:
             row = db.execute("SELECT * FROM searches WHERE id=?", (search_id,)).fetchone()
