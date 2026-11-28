@@ -369,6 +369,7 @@ def _scene_row(raw: dict, request) -> dict:
            "platform": raw.get("platform"), "tile": raw.get("tile"), "orbit_pass": raw.get("orbit_pass"),
            "relative_orbit": raw.get("relative_orbit"), "covers_roi": raw.get("covers_roi") is True,
            "tile_cloud_pct": raw.get("tile_cloud_pct") if optical else None,
+           "footprint": raw.get("footprint"),
            **metrics, "eligible": bool(eligible), "warnings": warnings,
            "quality_context": QUALITY_POLICY["sentinel2" if optical else "s1gee"],
            "reference_orbit_match": _orbit_match(raw, request) if not optical else False}
@@ -419,6 +420,7 @@ def _search(request, frame: dict) -> list[dict]:
             return []
 
         def describe(asset_id):
+            from .imagery import scene_geometry
             image = ee.Image(asset_id)
             optical = dataset == "sentinel2"
             props = image.toDictionary(["system:time_start", "SPACECRAFT_NAME", "MGRS_TILE",
@@ -431,6 +433,7 @@ def _search(request, frame: dict) -> list[dict]:
                 "orbit_pass": props.get("SENSING_ORBIT_DIRECTION" if optical else "orbitProperties_pass"),
                 "relative_orbit": props.get("SENSING_ORBIT_NUMBER" if optical else "relativeOrbitNumber_start"),
                 "tile_cloud_pct": props.get("CLOUDY_PIXEL_PERCENTAGE") if optical else None,
+                "footprint": scene_geometry(image),
                 "covers_roi": image.geometry().contains(roi, maxError=1)}).combine(metrics)
 
         raw = rpc.compute(ee.List([describe(asset_id) for asset_id in ids]))

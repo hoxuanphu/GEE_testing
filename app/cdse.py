@@ -198,6 +198,9 @@ def _normalize_product(p: dict, with_metadata: bool) -> dict:
     }
     if url := thumbnail_path(product['id']):
         product['thumbnail_url'] = url
+    footprint = p.get('GeoFootprint')
+    if isinstance(footprint, dict) and footprint.get('type') in ('Polygon', 'MultiPolygon'):
+        product['footprint'] = footprint
     if with_metadata:
         meta = _normalize_attributes(p.get("Attributes"))
         product["timestamp"] = timestamp
@@ -328,7 +331,6 @@ def search_s2_area(
     products = []
     for p in value:
         norm = _normalize_product(p, with_metadata=False)
-        norm["footprint"] = p.get("GeoFootprint")
         norm["cloud_pct"] = next((a.get("Value") for a in p.get("Attributes", []) if a.get("Name") == "cloudCover"), None)
         m = re.search(r"_T(\d{2}[A-Z]{3})_", p["Name"])
         norm["tile"] = m.group(1) if m else None

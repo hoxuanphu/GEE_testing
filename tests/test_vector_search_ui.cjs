@@ -83,7 +83,7 @@ test('late plan success/failure cannot replace a changed ROI or another search g
   assert.equal(f.get('status').textContent,'new search');
 });
 
-test('DEM downloads use only vector reference and dataset, retain filename and discard late blobs', async () => {
+test('DEM downloads keep the chosen ROI and save late blobs without replacing the current status', async () => {
   const f=fixture(); assert.ok(f.api, 'vector search helper is available'); f.get('dataset').value='dem_srtm';
   let pending=f.api.search(); let call=f.calls.at(-1);
   const url=new URL(call.url,'http://localhost');
@@ -91,8 +91,11 @@ test('DEM downloads use only vector reference and dataset, retain filename and d
   call.resolve({ok:true,blob:async()=>({}),headers:{get:()=> 'attachment; filename="SRTM_polygon.tif"'}}); await pending;
   assert.equal(f.downloads[0].download,'SRTM_polygon.tif'); assert.equal(f.revoked.length,1); assert.equal(f.get('btnSearch').disabled,false);
   pending=f.api.search(); call=f.calls.at(-1); f.setRoi('roi-b');
+  f.get('status').textContent = 'new search';
   call.resolve({ok:true,blob:async()=>({}),headers:{get:()=> ''}}); await pending;
-  assert.equal(f.downloads.length,1);
+  assert.equal(f.downloads.length,2);
+  assert.equal(new URL(call.url,'http://localhost').searchParams.get('vector_roi_id'),'roi-a');
+  assert.equal(f.get('status').textContent,'new search');
 });
 
 test('DEM errors and missing ROI are visible safe text, with controls restored', async () => {

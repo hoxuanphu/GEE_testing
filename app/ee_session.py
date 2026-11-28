@@ -5,12 +5,36 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 import ee
+from google.auth import _cloud_sdk
 
 from .provider_credentials import active_credentials
 
 _BASE_DIR = Path(__file__).resolve().parent.parent
 
 _initialized = False
+
+
+def _service_account_from_env():
+    account = os.getenv("GEE_SERVICE_ACCOUNT", "").strip()
+    path = _BASE_DIR / os.getenv("GEE_KEY_FILE", "ee_private_key.json").strip()
+    return account, path
+
+
+def has_gee_configuration():
+    """Check for local credentials without contacting Google or refreshing a token."""
+    if _initialized or active_credentials('gee'):
+        return True
+    account, path = _service_account_from_env()
+    if account and path.is_file():
+        return True
+    try:
+        if ee.oauth.get_credentials_arguments().get('refresh_token'):
+            return True
+    except (OSError, ValueError, AttributeError):
+        pass
+    explicit = os.getenv('GOOGLE_APPLICATION_CREDENTIALS')
+    path = Path(explicit or _cloud_sdk.get_application_default_credentials_path())
+    return path.is_file()
 
 
 def _load_dotenv() -> None:
@@ -82,11 +106,9 @@ def init_ee() -> None:
         ee.Initialize(credentials, project=saved['project_id'])
         _initialized = True
         return
-    service_account = os.getenv("GEE_SERVICE_ACCOUNT", "").strip()
-    key_file = os.getenv("GEE_KEY_FILE", "ee_private_key.json").strip()
-    key_path = _BASE_DIR / key_file
+    service_account, key_path = _service_account_from_env()
 
-    if service_account and key_path.exists():
+    if service_account and key_path.is_file():
         credentials = ee.ServiceAccountCredentials(service_account, str(key_path))
         ee.Initialize(credentials)
     else:

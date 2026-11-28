@@ -29,8 +29,8 @@ from .imagery import download_geotiff, load_timeseries_scene, merge_band_tiffs
 from .vector_mask import mask_raster_to_polygon
 
 TTL_SECONDS = 24 * 60 * 60
-ACTIVE_STATUSES = ("queued", "running")
-TERMINAL_STATUSES = ("completed", "partial", "failed", "interrupted")
+ACTIVE_STATUSES = ("queued", "running", "cancelling")
+TERMINAL_STATUSES = ("completed", "partial", "failed", "interrupted", "cancelled")
 MIN_FREE_BYTES = 64 * 1024 * 1024
 
 
@@ -104,6 +104,13 @@ class TimeSeriesStore:
                 );
                 CREATE INDEX IF NOT EXISTS jobs_search ON jobs(search_id);
             """)
+            columns = {row['name'] for row in db.execute("PRAGMA table_info(jobs)")}
+            if 'cancel_requested' not in columns:
+                db.execute("ALTER TABLE jobs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0")
+            if 'stage' not in columns:
+                db.execute("ALTER TABLE jobs ADD COLUMN stage TEXT")
+            db.execute("""CREATE TABLE IF NOT EXISTS hidden_tasks (
+                       kind TEXT NOT NULL, id TEXT NOT NULL, PRIMARY KEY(kind, id))""")
 
     @contextmanager
     def _connect(self):
@@ -146,7 +153,7 @@ class TimeSeriesStore:
     def _job(row) -> dict:
         return {"job_id": row["id"], "search_id": row["search_id"],
                 **{key: row[key] for key in
-                   ("status", "total", "processed", "succeeded", "failed", "error")}}
+                   ("status", "total", "processed", "succeeded", "failed", "error", "stage")}}
 
     def create_job(self, search_id: str) -> dict:
         with self._lock, self._connect() as db:
@@ -161,12 +168,8 @@ class TimeSeriesStore:
                                   (search_id,)).fetchone()
             if existing is not None and existing["status"] in (*ACTIVE_STATUSES, "completed", "partial"):
                 db.execute("UPDATE jobs SET activity=? WHERE id=?", (time.time(), existing["id"]))
+                db.execute("DELETE FROM hidden_tasks WHERE kind='timeseries' AND id=?", (existing["id"],))
                 return self._job(existing)
-            if db.execute("SELECT 1 FROM jobs WHERE status IN ('queued','running')").fetchone():
-                raise BusyError("Another time-series job is active. Try again after it finishes.")
-            if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ts_batches'").fetchone() and \
-                    db.execute("SELECT 1 FROM ts_batches WHERE status IN ('queued','running','pausing')").fetchone():
-                raise BusyError("A yearly time-series batch is active. Pause it or wait for completion.")
             job_id, now = str(uuid.uuid4()), time.time()
             db.execute("INSERT INTO jobs (id,search_id,status,total,created,activity) VALUES (?,?,?,?,?,?)",
                        (job_id, search_id, "queued", total, now, now))
@@ -184,8 +187,63 @@ class TimeSeriesStore:
             db.execute("UPDATE searches SET activity=? WHERE id=?", (now, row["search_id"]))
             return self._job(row)
 
+    def list_jobs(self):
+        with self._connect() as db:
+            rows = db.execute("""SELECT j.*, s.parameters FROM jobs j
+                JOIN searches s ON s.id=j.search_id
+                WHERE NOT EXISTS (SELECT 1 FROM hidden_tasks h
+                                  WHERE h.kind='timeseries' AND h.id=j.id)
+                ORDER BY j.created DESC""").fetchall()
+        return [{**self._job(row), 'created': row['created'],
+                 'parameters': json.loads(row['parameters'])} for row in rows]
+
+    def cancel_job(self, job_id):
+        with self._connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
+            if row is None:
+                return None
+            status = 'cancelled' if row['status'] == 'queued' else 'cancelling' if row['status'] in ('running', 'cancelling') else row['status']
+            db.execute('UPDATE jobs SET status=?,cancel_requested=?,activity=? WHERE id=?',
+                       (status, int(status in ('cancelling', 'cancelled')), time.time(), job_id))
+        return self.get_job(job_id)
+
+    def cancel_requested(self, job_id):
+        with self._connect() as db:
+            row = db.execute('SELECT cancel_requested FROM jobs WHERE id=?', (job_id,)).fetchone()
+        return row is None or bool(row['cancel_requested'])
+
+    def finish_job(self, job_id, status, processed, succeeded, failed, error):
+        with self._connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT cancel_requested FROM jobs WHERE id=?', (job_id,)).fetchone()
+            if row is None:
+                return
+            if row['cancel_requested']:
+                status, error = 'cancelled', None
+            db.execute("""UPDATE jobs SET status=?,processed=?,succeeded=?,failed=?,error=?,
+                       stage=?,activity=? WHERE id=?""",
+                       (status, processed, succeeded, failed, error, status, time.time(), job_id))
+
+    def hide_job(self, job_id, *, delete_files=False):
+        with self._connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT status FROM jobs WHERE id=?', (job_id,)).fetchone()
+            if row is None:
+                return False
+            if row['status'] in ACTIVE_STATUSES:
+                raise BusyError('Hãy hủy và chờ tác vụ dừng trước khi xóa.')
+            if delete_files:
+                from .task_files import remove_task_directory
+                try:
+                    remove_task_directory(self._job_dir(job_id), self.root)
+                except RuntimeError as exc:
+                    raise BusyError(str(exc)) from None
+            db.execute("INSERT OR IGNORE INTO hidden_tasks VALUES ('timeseries', ?)", (job_id,))
+        return True
+
     def _update_job(self, job_id: str, **updates):
-        if not set(updates) <= {"status", "processed", "succeeded", "failed", "error"}:
+        if not set(updates) <= {"status", "processed", "succeeded", "failed", "error", "stage"}:
             raise ValueError("Invalid job update")
         updates["activity"] = time.time()
         with self._lock, self._connect() as db:
@@ -208,7 +266,7 @@ class TimeSeriesStore:
     def recover_interrupted_jobs(self) -> int:
         with self._lock, self._connect() as db:
             result = db.execute("UPDATE jobs SET status='interrupted', error=?, activity=? "
-                                "WHERE status IN ('queued','running')",
+                                "WHERE status IN ('running','cancelling')",
                                 ("Application restarted; start a new export to retry.", time.time()))
             return result.rowcount
 
@@ -217,11 +275,14 @@ class TimeSeriesStore:
         with self._lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             rows = db.execute("SELECT id FROM jobs WHERE activity < ? "
-                              "AND status NOT IN ('queued','running')", (cutoff,)).fetchall()
+                              "AND status NOT IN ('queued','running','cancelling')", (cutoff,)).fetchall()
             for row in rows:
                 directory = self._job_dir(row["id"])
-                if directory.exists():
-                    shutil.rmtree(directory)
+                from .task_files import remove_task_directory
+                try:
+                    remove_task_directory(directory, self.root)
+                except (RuntimeError, ValueError, OSError):
+                    continue
                 db.execute("DELETE FROM jobs WHERE id=?", (row["id"],))
                 removed += 1
             db.execute("DELETE FROM searches WHERE activity < ? AND NOT EXISTS "
@@ -346,7 +407,7 @@ class TimeSeriesService:
             self._closed = True
             executor = self._executor
         if executor is not None:
-            executor.shutdown(wait=True)
+            executor.shutdown(wait=True, cancel_futures=True)
 
     def _check_disk(self, parameters: dict, directory: Path, *, archive: bool = False):
         bbox, scale = parameters["bbox"], float(parameters["scale_m"])
@@ -367,7 +428,7 @@ class TimeSeriesService:
             return
         directory = self.store._job_dir(job_id)
         with self.store._lock, self.store._connect() as db:
-            claimed = db.execute("UPDATE jobs SET status='running', activity=? WHERE id=? AND status='queued'",
+            claimed = db.execute("UPDATE jobs SET status='running', stage='downloading', activity=? WHERE id=? AND status='queued'",
                                  (time.time(), job_id))
             if claimed.rowcount != 1:
                 return
@@ -385,6 +446,9 @@ class TimeSeriesService:
                 clip_kwargs['clip_region'] = ee.Geometry(vector_geometry, geodesic=False)
             directory.mkdir(parents=True, exist_ok=True)
             for position, scene in enumerate(scenes):
+                if self.store.cancel_requested(job_id):
+                    self.store._update_job(job_id, status="cancelled", error=None)
+                    return
                 record = {**scene, "file": None, "status": "failed", "error": None,
                           "bands": parameters["bands"], "units": parameters.get("units"),
                           "value_scale": parameters.get("value_scale"),
@@ -449,6 +513,9 @@ class TimeSeriesService:
                 records.append(record)
                 processed += 1
                 self.store._update_job(job_id, processed=processed, succeeded=succeeded, failed=failed)
+                if self.store.cancel_requested(job_id):
+                    self.store._update_job(job_id, status="cancelled", error=None)
+                    return
                 if fatal:
                     for remainder in scenes[position + 1:]:
                         records.append({**remainder, "file": None, "status": "failed",
@@ -474,21 +541,29 @@ class TimeSeriesService:
                                  for k, v in row.items()})
             (directory / "manifest.csv").write_text(csv_buffer.getvalue(), encoding="utf-8")
             if succeeded and not fatal:
+                if self.store.cancel_requested(job_id):
+                    self.store._update_job(job_id, status="cancelled", error=None)
+                    return
+                self.store._update_job(job_id, stage="packaging")
                 self._check_disk(parameters, directory, archive=True)
                 pending = directory / "timeseries.zip.part"
                 with zipfile.ZipFile(pending, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
                     for record in records:
+                        if self.store.cancel_requested(job_id):
+                            self.store._update_job(job_id, status="cancelled", error=None)
+                            return
                         if record["file"]:
                             archive.write(directory / record["file"], record["file"])
                     for filename in ("manifest.json", "manifest.csv"):
                         archive.write(directory / filename, filename)
+                if self.store.cancel_requested(job_id):
+                    self.store._update_job(job_id, status="cancelled", error=None)
+                    return
                 os.replace(pending, directory / "timeseries.zip")
             status = "failed" if fatal or not succeeded else ("partial" if failed else "completed")
-            self.store._update_job(job_id, status=status, processed=processed,
-                                   succeeded=succeeded, failed=failed,
-                                   error=fatal or ("All scenes failed to export." if not succeeded else None))
+            self.store.finish_job(job_id, status, processed, succeeded, failed,
+                                  fatal or ("All scenes failed to export." if not succeeded else None))
         except Exception as exc:
-            self.store._update_job(job_id, status="failed", processed=processed,
-                                   succeeded=succeeded, failed=failed, error=_error(exc))
+            self.store.finish_job(job_id, "failed", processed, succeeded, failed, _error(exc))
         finally:
             (directory / "timeseries.zip.part").unlink(missing_ok=True)

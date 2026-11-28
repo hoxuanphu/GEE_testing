@@ -76,6 +76,19 @@ class BatchStore(TimeSeriesStore):
                   status TEXT NOT NULL DEFAULT 'pending', file TEXT, checksum TEXT, error TEXT,
                   PRIMARY KEY(batch_id,year,asset_id));
             ''')
+            columns = {row['name'] for row in db.execute('PRAGMA table_info(ts_batches)')}
+            if 'enqueued_at' not in columns:
+                db.execute('ALTER TABLE ts_batches ADD COLUMN enqueued_at REAL')
+                db.execute('UPDATE ts_batches SET enqueued_at=created WHERE enqueued_at IS NULL')
+
+    def queued_tasks(self):
+        with self._connect() as db:
+            return db.execute("""SELECT id,created AS enqueued_at,'timeseries' AS kind
+                    FROM jobs WHERE status='queued'
+                    UNION ALL
+                    SELECT id,COALESCE(enqueued_at,created),'annual' AS kind
+                    FROM ts_batches WHERE status='queued'
+                    ORDER BY enqueued_at,id""").fetchall()
 
     def directory(self, batch_id, year=None):
         if not isinstance(batch_id, str) or str(uuid.UUID(batch_id)) != batch_id:
@@ -89,12 +102,6 @@ class BatchStore(TimeSeriesStore):
         path.relative_to(self.root)
         return path
 
-    @staticmethod
-    def _admit(db):
-        if db.execute("SELECT 1 FROM jobs WHERE status IN ('queued','running')").fetchone() or \
-           db.execute("SELECT 1 FROM ts_batches WHERE status IN ('queued','running','pausing')").fetchone():
-            raise BusyError('Một tác vụ time series đang chạy; hãy đợi hoặc tạm dừng trước.')
-
     def create_batch(self, parameters):
         parameters = _safe(parameters)
         start, end = date.fromisoformat(parameters['start_date']), date.fromisoformat(parameters['end_date'])
@@ -103,9 +110,8 @@ class BatchStore(TimeSeriesStore):
         batch_id, now = str(uuid.uuid4()), time.time()
         with self._connect() as db:
             db.execute('BEGIN IMMEDIATE')
-            self._admit(db)
-            db.execute('INSERT INTO ts_batches(id,parameters,status,grid,created,activity) VALUES(?,?,?,?,?,?)',
-                (batch_id,json.dumps(parameters),'queued',json.dumps(parameters.get('output_grid')),now,now))
+            db.execute('INSERT INTO ts_batches(id,parameters,status,grid,created,activity,enqueued_at) VALUES(?,?,?,?,?,?,?)',
+                (batch_id,json.dumps(parameters),'queued',json.dumps(parameters.get('output_grid')),now,now,now))
             for year in range(start.year, end.year+1):
                 first, last = max(start,date(year,1,1)), min(end,date(year,12,31))
                 db.execute('INSERT INTO ts_years(batch_id,year,start_date,end_date) VALUES(?,?,?,?)',
@@ -120,13 +126,14 @@ class BatchStore(TimeSeriesStore):
             raise ValueError('Batch not found or expired')
         return {**dict(row), 'parameters':json.loads(row['parameters']), 'grid':json.loads(row['grid'] or 'null')}
 
-    def get_batch(self, batch_id):
+    def get_batch(self, batch_id, *, touch=True):
         self.directory(batch_id)
         with self._connect() as db:
             row = db.execute('SELECT * FROM ts_batches WHERE id=?',(batch_id,)).fetchone()
             if row is None:
                 return None
-            db.execute('UPDATE ts_batches SET activity=? WHERE id=?',(time.time(),batch_id))
+            if touch:
+                db.execute('UPDATE ts_batches SET activity=? WHERE id=?',(time.time(),batch_id))
             years = []
             for year in db.execute('SELECT * FROM ts_years WHERE batch_id=? ORDER BY year',(batch_id,)):
                 counts = dict(db.execute('SELECT status,COUNT(*) FROM ts_scenes WHERE batch_id=? AND year=? GROUP BY status',
@@ -135,11 +142,38 @@ class BatchStore(TimeSeriesStore):
                 item.update(succeeded=counts.get('succeeded',0), failed=counts.get('failed',0),
                             processed=counts.get('succeeded',0)+counts.get('failed',0))
                 prefix = f'/api/timeseries/batches/{batch_id}/years/{year["year"]}'
-                item['zip_url'] = prefix+'/download' if year['zip_ready'] else None
-                item['csv_url'] = prefix+'/csv' if year['csv_ready'] else None
+                directory = self.directory(batch_id, year['year'])
+                item['zip_url'] = prefix+'/download' if year['zip_ready'] and (directory / 'timeseries.zip').is_file() else None
+                item['csv_url'] = prefix+'/csv' if year['csv_ready'] and (directory / 'manifest.csv').is_file() else None
                 years.append(item)
         return dict(batch_id=batch_id,status=row['status'],parameters=json.loads(row['parameters']),
                     current_year=row['current_year'],error=row['error'],years=years)
+
+    def list_batches(self):
+        with self._connect() as db:
+            rows = db.execute("""SELECT id,created FROM ts_batches b
+                WHERE NOT EXISTS (SELECT 1 FROM hidden_tasks h
+                                  WHERE h.kind='annual' AND h.id=b.id)
+                ORDER BY created DESC""").fetchall()
+        return [{**batch, 'created': row['created']} for row in rows
+                if (batch := self.get_batch(row['id'], touch=False)) is not None]
+
+    def hide_batch(self, batch_id, *, delete_files=False):
+        with self._connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT status FROM ts_batches WHERE id=?', (batch_id,)).fetchone()
+            if row is None:
+                return False
+            if row['status'] in ACTIVE:
+                raise BusyError('Hãy tạm dừng và chờ tác vụ dừng trước khi xóa.')
+            if delete_files:
+                from .task_files import remove_task_directory
+                try:
+                    remove_task_directory(self.root / 'batches' / batch_id, self.root / 'batches')
+                except RuntimeError as exc:
+                    raise BusyError(str(exc)) from None
+            db.execute("INSERT OR IGNORE INTO hidden_tasks VALUES ('annual', ?)", (batch_id,))
+        return True
 
     def update(self, batch_id, **values):
         if not set(values) <= {'status','grid','current_year','error','pause_requested'}:
@@ -149,6 +183,13 @@ class BatchStore(TimeSeriesStore):
         values['activity'] = time.time()
         with self._connect() as db:
             db.execute(f'UPDATE ts_batches SET {",".join(k+"=?" for k in values)} WHERE id=?',(*values.values(),batch_id))
+
+    def finish_batch(self, batch_id, status):
+        with self._connect() as db:
+            db.execute("""UPDATE ts_batches SET
+                status=CASE WHEN pause_requested=1 THEN 'paused' ELSE ? END,
+                pause_requested=0,current_year=NULL,activity=? WHERE id=?""",
+                (status, time.time(), batch_id))
 
     def update_year(self, batch_id, year, **values):
         if not set(values) <= {'status','total','listed','error','zip_ready','csv_ready'}:
@@ -189,7 +230,9 @@ class BatchStore(TimeSeriesStore):
     def pause(self, batch_id):
         self.snapshot(batch_id)
         with self._connect() as db:
-            db.execute("UPDATE ts_batches SET pause_requested=1,status='pausing',activity=? WHERE id=? AND status IN ('queued','running','pausing')",
+            db.execute("""UPDATE ts_batches SET pause_requested=1,
+                       status=CASE WHEN status='queued' THEN 'paused' ELSE 'pausing' END,
+                       activity=? WHERE id=? AND status IN ('queued','running','pausing')""",
                        (time.time(),batch_id))
         return self.get_batch(batch_id)
 
@@ -201,13 +244,14 @@ class BatchStore(TimeSeriesStore):
             allowed = ('paused','interrupted','failed','partial','completed') if retry else ('paused','interrupted')
             if row['status'] not in allowed:
                 raise ValueError('Batch cannot resume in its current state')
-            self._admit(db)
-            db.execute("UPDATE ts_batches SET status='queued',pause_requested=0,error=NULL,activity=? WHERE id=?",(time.time(),batch_id))
+            db.execute("DELETE FROM hidden_tasks WHERE kind='annual' AND id=?", (batch_id,))
+            now = time.time()
+            db.execute("UPDATE ts_batches SET status='queued',pause_requested=0,error=NULL,activity=?,enqueued_at=? WHERE id=?",(now,now,batch_id))
         return self.get_batch(batch_id)
 
     def recover(self):
         with self._connect() as db:
-            return db.execute("UPDATE ts_batches SET status='interrupted',pause_requested=0,error=?,activity=? WHERE status IN ('queued','running','pausing')",
+            return db.execute("UPDATE ts_batches SET status='interrupted',pause_requested=0,error=?,activity=? WHERE status IN ('running','pausing')",
                               ('Ứng dụng đã khởi động lại; bấm Tiếp tục.',time.time())).rowcount
 
     def artifact(self, batch_id, year, kind):
@@ -229,10 +273,12 @@ class BatchStore(TimeSeriesStore):
                 ttl = 7*TTL_SECONDS if row['status'] in ('paused','interrupted') else TTL_SECONDS
                 if row['activity'] >= now-ttl:
                     continue
-                directory = self.directory(row['id'])
-                # directory() verifies canonical IDs and resolved workspace containment.
-                if directory.exists():
-                    shutil.rmtree(directory)
+                from .task_files import remove_task_directory
+                directory = self.root / 'batches' / row['id']
+                try:
+                    remove_task_directory(directory, self.root / 'batches')
+                except (RuntimeError, ValueError, OSError):
+                    continue
                 for table in ('ts_scenes','ts_years'):
                     db.execute(f'DELETE FROM {table} WHERE batch_id=?',(row['id'],))
                 db.execute('DELETE FROM ts_batches WHERE id=?',(row['id'],))
@@ -253,18 +299,26 @@ class BatchService:
         return batch
 
     def start(self, parameters):
-        return self._schedule(self.store.create_batch(parameters))
+        with self.legacy._lock:
+            return self._schedule(self.store.create_batch(parameters))
 
     def resume(self, batch_id, retry=False):
-        return self._schedule(self.store.prepare_resume(batch_id,retry=retry))
+        with self.legacy._lock:
+            return self._schedule(self.store.prepare_resume(batch_id,retry=retry))
 
     def pause(self, batch_id):
-        return self.store.pause(batch_id)
+        with self.legacy._lock:
+            batch = self.store.pause(batch_id)
+            if batch['status'] == 'paused':
+                future = self.legacy._futures.get('batch:' + batch_id)
+                if future is not None and not future.cancel():
+                    future.result()
+            return batch
 
     def pause_active(self):
         """Let graceful app shutdown stop at a checkpoint before executor join."""
         with self.store._connect() as db:
-            db.execute("UPDATE ts_batches SET pause_requested=1,status='pausing',activity=? WHERE status IN ('queued','running','pausing')",
+            db.execute("UPDATE ts_batches SET pause_requested=1,status='pausing',activity=? WHERE status IN ('running','pausing')",
                        (time.time(),))
 
     def _check(self, batch_id):
@@ -386,7 +440,7 @@ class BatchService:
             years = self.store.get_batch(batch_id)['years']
             good = any(y['status'] in ('completed','empty','partial') for y in years)
             bad = any(y['status'] in ('failed','partial') for y in years)
-            self.store.update(batch_id,status='partial' if good and bad else 'failed' if bad else 'completed',current_year=None)
+            self.store.finish_batch(batch_id, 'partial' if good and bad else 'failed' if bad else 'completed')
         except BatchPaused:
             self.store.update(batch_id,status='paused',pause_requested=0,error=None)
         except Exception as exc:

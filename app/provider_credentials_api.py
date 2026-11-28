@@ -1,6 +1,7 @@
 """Loopback-only browser setup for providers used by the local backend."""
 import ipaddress
 import json
+import os
 import re
 
 import ee
@@ -9,6 +10,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from starlette.requests import ClientDisconnect
 
+from .ee_session import _load_dotenv, has_gee_configuration
 from .provider_credentials import (
     PROVIDERS, CredentialSettingsError, active_credentials, normalize_settings,
     read_saved, save_settings,
@@ -61,6 +63,37 @@ def get_status(request: Request):
                      'active' if saved == active_credentials(provider) else 'restart_required')
         result[provider] = state
     return _reply(result)
+
+
+@router.get('/availability')
+def get_availability(request: Request):
+    if not _is_local(request):
+        return _forbidden()
+    _load_dotenv()
+    required = {
+        'cdse': {'email': 'CDSE_USERNAME', 'password': 'CDSE_PASSWORD'},
+        's3': {'access_key': 'Access_Key_S3', 'secret_key': 'Secret_Key_S3'},
+    }
+    missing = {}
+    pending = []
+    for provider in PROVIDERS:
+        if provider == 'gee':
+            fields = [] if has_gee_configuration() else ['service_account_json']
+        elif active_credentials(provider):
+            fields = []
+        else:
+            fields = [field for field, env in required[provider].items() if not os.getenv(env, '').strip()]
+        if not fields:
+            continue
+        try:
+            saved = read_saved(provider)
+        except CredentialSettingsError:
+            saved = None
+        if saved:
+            pending.append(provider)
+        else:
+            missing[provider] = fields
+    return _reply({'missing': missing, 'restart_required': pending})
 
 
 @router.put('/{provider}')

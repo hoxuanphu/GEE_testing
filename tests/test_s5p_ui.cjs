@@ -49,6 +49,9 @@ test('request errors remain visible with busy state cleared', async () => {
 });
 test('workspace moves and observes Sentinel-5P controls and result panel', () => {
   const workspace=fs.readFileSync(path.join(__dirname,'..','static','workspace.js'),'utf8');
-  assert.match(workspace,/move\(source, \['s5pSelection'/);
-  assert.equal((workspace.match(/'s5pResults'/g)||[]).length,3);
+  assert.match(workspace,/move\(source, \[[^\]]*'s5pSelection'/);
+  assert.match(workspace,/const resultIds = \[[^\]]*'s5pResults'/);
+  assert.match(workspace,/move\(get\('workspaceResultContent'\), resultIds\)/);
+  assert.match(workspace,/const resultNodes = resultIds\.map\(get\)/);
+  assert.match(workspace,/resultNodes\.forEach\(node => observer\.observe\(node/);
 });

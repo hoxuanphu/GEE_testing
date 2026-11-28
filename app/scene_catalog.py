@@ -17,12 +17,16 @@ from urllib.parse import urlencode, urlsplit
 from fastapi import HTTPException
 from fastapi.responses import FileResponse, RedirectResponse
 from pydantic import Field, model_validator
+from shapely.geometry import box, mapping, shape
+from shapely.prepared import prep
 from starlette.background import BackgroundTask
 
 from . import aws_stac, cdse, imagery, eodag_adapter, scene_thumbnails
 from .catalog_models import CatalogFailure, CatalogUnavailable
-from .export_resources import QueueTimeout
-from .full_scene_export import FullSceneDiskSpaceError, export_full_scene
+from .export_resources import CURRENT_SCENE, QueueTimeout, TransferCancelled, scene_download_admission
+from .full_scene_export import (
+    FullSceneDiskSpaceError, SceneDoesNotCoverProvince, export_full_scene, export_s2_province,
+)
 from .timeseries_metadata import search_failure
 from .vector_import import VectorImportError, validate_geometry
 from .vector_mask import mask_raster_to_polygon
@@ -44,6 +48,19 @@ def _scene_footprint(footprint):
 def _has_thumbnail(parameters, scene):
     return (parameters['source'] == 'gee' and parameters['dataset'] in ('sentinel2', 'landsat')
             and bool(scene.get('asset_id')))
+
+
+def _province_thumbnail_region(parameters, scene):
+    bbox = parameters.get('bbox')
+    bounds = ([bbox[key] for key in ('west', 'south', 'east', 'north')] if bbox is not None
+              else shape(parameters['roi_geometry']).bounds)
+    window = box(*bounds)
+    if footprint := _scene_footprint(scene.get('footprint')):
+        overlap = window.intersection(shape(footprint))
+        if overlap.area > 0:
+            # A rectangle keeps the thumbnail request small even for detailed footprints.
+            window = box(*overlap.bounds)
+    return mapping(window)
 
 
 def _aws_scene_id(scene):
@@ -119,6 +136,7 @@ def register_scene_catalog(api):
             params.pop('provider', None)
             params.pop('eodag_collection', None)
         gee = body.dataset in ('sentinel2', 'landsat')
+        s2_province = body.dataset == 'sentinel2' and body.selection_mode == 'province'
         if body.selection_mode == 'vector' and not gee:
             raise HTTPException(409, 'Vector ROI search/download is unsupported for external providers; use scene counts instead')
         rectangle = None
@@ -171,8 +189,9 @@ def register_scene_catalog(api):
         try:
             if gee:
                 end = (dt.date.fromisoformat(body.end_date) + dt.timedelta(days=1)).isoformat()
+                query_roi = main.bbox_to_ee_geom(bbox) if s2_province else roi
                 scenes = main.list_timeseries_scenes(body.dataset, body.lon or 0, body.lat or 0,
-                    body.start_date, end, roi=roi, cloud_min=body.cloud_min, cloud_max=body.cloud_max,
+                    body.start_date, end, roi=query_roi, cloud_min=body.cloud_min, cloud_max=body.cloud_max,
                     platform=body.platform, include_footprint=True)
                 params['source'] = 'gee'
                 truncated = False
@@ -194,6 +213,7 @@ def register_scene_catalog(api):
                 params['source'] = source
                 truncated = len(scenes) >= cap
             stage = 'validation'
+            province = prep(shape(params['roi_geometry'])) if s2_province else None
             filtered = []
             for scene in scenes:
                 cloud = scene.get('cloud_pct')
@@ -207,6 +227,12 @@ def register_scene_catalog(api):
                     if aws_stac.thumbnail_url(path) == href:
                         row['browse_path'] = path
                 row['footprint'] = _scene_footprint(row.get('footprint'))
+                if province is not None:
+                    if row['footprint'] is None:
+                        raise HTTPException(502, 'GEE chưa trả footprint hợp lệ để lọc cảnh theo ranh giới tỉnh.',
+                                            headers={'X-Search-Request-ID': request_id})
+                    if not province.intersects(shape(row['footprint'])):
+                        continue
                 row['cloud_pct'] = float(cloud)
                 meta = row.get('source_metadata', {})
                 if body.source == 'eodag':
@@ -269,7 +295,9 @@ def register_scene_catalog(api):
             raise HTTPException(404, 'Thumbnail unavailable for this scene')
         try:
             region = params.get('roi_geometry')
-            if region is None:
+            if params['dataset'] == 'sentinel2' and params['selection_mode'] == 'province':
+                region = _province_thumbnail_region(params, scene)
+            elif region is None:
                 if params['selection_mode'] == 'point':
                     region, _ = main.point_roi(params['lon'], params['lat'], params['radius_m'], params.get('rotation_deg', 0))
                 else:  # Administrative snapshots saved before ROI geometry was included.
@@ -286,18 +314,30 @@ def register_scene_catalog(api):
     async def thumbnail(search_id: str, index: int):
         return await scene_thumbnails.load(serve_thumbnail, search_id, index)
 
+    def scene_output(scene_export, filename, *, temporary=False):
+        result = main._DOWNLOADS_DIR / f'{uuid.uuid4().hex}.tif'
+        if scene_export is not None:
+            scene_export.check()
+            scene_export.result = result
+            scene_export.temporary_result = temporary
+            scene_export.update(filename=filename)
+        return result
+
     def download(search_id: str, index: int, extent: Literal['roi', 'scene'] = 'roi'):
         params, scene = snapshot_scene(search_id, index)
+        scene_export = CURRENT_SCENE.get()
+        suffix = '_rgbnir' if params.get('s2_band_preset') == 'rgbnir' else ''
         if extent == 'scene':
             if not _has_thumbnail(params, scene):
                 raise HTTPException(409, 'Chế độ nguyên cảnh chỉ hỗ trợ Sentinel-2 và Landsat GEE.')
+            filename = f'{params["dataset"]}_{Path(scene["asset_id"]).name}{suffix}_full_scene.tif'
+            out = scene_output(scene_export, filename, temporary=True)
             main._ensure_ee()
-            out = main._DOWNLOADS_DIR / f'{uuid.uuid4().hex}.tif'
             band_options = {key: params[key] for key in ('s2_auxiliary_bands', 's2_band_preset')
                             if params.get(key) is not None}
             try:
                 export_full_scene(scene['asset_id'], params['dataset'], out, **band_options)
-            except QueueTimeout:
+            except (QueueTimeout, TransferCancelled):
                 raise
             except FullSceneDiskSpaceError:
                 raise HTTPException(507, 'Máy chủ không đủ dung lượng để tạo GeoTIFF nguyên cảnh.') from None
@@ -306,10 +346,8 @@ def register_scene_catalog(api):
                 logger.warning('Full scene export failed: dataset=%s error_type=%s',
                                params['dataset'], type(exc).__name__)
                 raise HTTPException(502, 'Không tạo được GeoTIFF nguyên cảnh từ GEE. Hãy thử tải lại.') from None
-            suffix = '_rgbnir' if params.get('s2_band_preset') == 'rgbnir' else ''
-            filename = f'{params["dataset"]}_{Path(scene["asset_id"]).name}{suffix}_full_scene.tif'
             return FileResponse(out, media_type='image/tiff', filename=filename,
-                                background=BackgroundTask(out.unlink, missing_ok=True))
+                                background=BackgroundTask(out.unlink, missing_ok=True) if scene_export is None else None)
         if params['selection_mode'] == 'vector' and params['source'] != 'gee':
             raise HTTPException(409, 'Vector ROI downloads are unsupported for external providers')
         if params['source'] == 'eodag':
@@ -330,7 +368,33 @@ def register_scene_catalog(api):
                 target = '/api/s2/bands'
                 query.update(action='download', bands='B02,B03,B04,B08,B11,B12')
             return RedirectResponse(target + '?' + urlencode(query), status_code=303)
+        filename = f'{params["dataset"]}_{Path(scene["asset_id"]).name}{suffix}.tif'
         main._ensure_ee()
+        if params['dataset'] == 'sentinel2' and params['selection_mode'] == 'province':
+            geometry = params.get('roi_geometry')
+            if geometry is None:
+                province = main.get_province(params['province_id'])
+                if province is None:
+                    raise HTTPException(404, 'Không tìm thấy ranh giới tỉnh.')
+                geometry = province.geometry
+            out = scene_output(scene_export, filename, temporary=True)
+            band_options = {key: params[key] for key in ('s2_auxiliary_bands', 's2_band_preset')
+                            if params.get(key) is not None}
+            try:
+                export_s2_province(scene['asset_id'], out, province_geometry=geometry,
+                                   footprint=scene.get('footprint'), **band_options)
+            except (QueueTimeout, TransferCancelled):
+                raise
+            except SceneDoesNotCoverProvince:
+                raise HTTPException(422, 'Cảnh ảnh không giao với ranh giới tỉnh.') from None
+            except FullSceneDiskSpaceError:
+                raise HTTPException(507, 'Máy chủ không đủ dung lượng để xuất ảnh theo tỉnh.') from None
+            except Exception as exc:
+                out.unlink(missing_ok=True)
+                logger.warning('Province scene export failed: error_type=%s', type(exc).__name__)
+                raise HTTPException(502, 'Không tạo được GeoTIFF Sentinel-2 theo tỉnh từ GEE.') from None
+            return FileResponse(out, media_type='image/tiff', filename=filename,
+                                background=BackgroundTask(out.unlink, missing_ok=True) if scene_export is None else None)
         if params['selection_mode'] == 'vector':
             import ee
             roi = ee.Geometry(params['roi_geometry'], geodesic=False)
@@ -354,21 +418,23 @@ def register_scene_catalog(api):
         envelope = main.source_bbox(bbox, scale, center_lat) if grid else bbox
         band_options = {key: params[key] for key in ('s2_auxiliary_bands', 's2_band_preset')
                         if params.get(key) is not None}
-        urls = main.download_geotiff(image, params['dataset'], envelope, scale,
-                                    clip_region=None if grid else roi, **band_options)
-        out = main._DOWNLOADS_DIR / f'{uuid.uuid4().hex}.tif'
+        out = scene_output(scene_export, filename)
         raw = out.with_suffix('.source.tif') if grid else out
+        check = {'check': scene_export.check} if scene_export is not None else {}
         try:
-            main.merge_band_tiffs(urls, raw, preserve_masks=True)
+            with scene_download_admission():
+                urls = main.download_geotiff(image, params['dataset'], envelope, scale,
+                                            clip_region=None if grid else roi, **band_options)
+                main.merge_band_tiffs(urls, raw, preserve_masks=True)
             if grid:
-                main.warp_to_grid(raw, out, grid)
+                main.warp_to_grid(raw, out, grid, **check)
             if params['selection_mode'] == 'vector':
-                mask_raster_to_polygon(out, params['roi_geometry'])
+                mask_raster_to_polygon(out, params['roi_geometry'], **check)
+        except FullSceneDiskSpaceError:
+            raise HTTPException(507, 'Máy chủ không đủ dung lượng để xuất GeoTIFF.') from None
         finally:
             if grid:
                 raw.unlink(missing_ok=True)
-        suffix = '_rgbnir' if params.get('s2_band_preset') == 'rgbnir' else ''
-        filename = f'{params["dataset"]}_{Path(scene["asset_id"]).name}{suffix}.tif'
         return FileResponse(out, media_type='image/tiff', filename=filename)
 
     # Local Pydantic model is supplied explicitly so FastAPI resolves it without a forward reference.

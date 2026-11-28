@@ -21,7 +21,7 @@ from .geo import Bbox, bbox_to_ee_geom, point_bbox
 from . import color_balance as color_calibration
 from . import scene_grouping as grouping
 from .download_metrics import measure as measure_download
-from .export_resources import bulk_export
+from .export_resources import CURRENT_SCENE, scene_bulk_export
 from .platforms import apply_platform_filter, validate_platform
 from .timeseries_metadata import (MAX_SCENES as TIMESERIES_MAX_SCENES,
                                   MetadataSearchError,
@@ -114,6 +114,7 @@ class SceneInfo:
     selection_recipe: dict | None = None
     scene_grouping: dict | None = None
     mosaic_mask_clouds: bool | None = None
+    footprint_geometry: ee.Geometry | None = None
 
 
 class InsufficientCoverageError(ValueError):
@@ -423,7 +424,8 @@ def _s1_collection(start: str, end: str, polarization: str, platform: str | None
             .float()
         )
         return db.copyProperties(img, ["system:time_start", "system:index", "platform_number",
-                                       "orbitProperties_pass", "relativeOrbitNumber_start"])
+                                       "orbitProperties_pass", "relativeOrbitNumber_start",
+                                       "transmitterReceiverPolarisation"])
 
     collection = (
         ee.ImageCollection(S1_COLLECTION)
@@ -533,6 +535,22 @@ def timeseries_collection(
     return result
 
 
+def scene_geometry(image):
+    return image.geometry(ee.ErrorMargin(30), ee.Projection('EPSG:4326'), False)
+
+
+def source_scene_footprints(scenes, dataset):
+    if not scenes:
+        return []
+    images = []
+    for source in scenes:
+        asset_id = source.get('asset_id') or _native_asset({'system:index': source['scene_id']}, dataset)
+        images.append(ee.Image(asset_id))
+    with _OPTICAL_AGGREGATION_LOCK:
+        footprints = ee.List(images).map(lambda item: scene_geometry(ee.Image(item))).getInfo()
+    return [{**source, 'footprint': footprint} for source, footprint in zip(scenes, footprints)]
+
+
 def list_timeseries_scenes(
     dataset: str, lon: float, lat: float, start_date: str, end_exclusive: str,
     polarization: str = "vvvh",
@@ -575,7 +593,7 @@ def list_timeseries_scenes(
             "source_metadata": image.toDictionary(source_properties),
         }
         if include_footprint:
-            row['footprint'] = image.geometry(ee.ErrorMargin(30), ee.Projection('EPSG:4326'), False)
+            row['footprint'] = scene_geometry(image)
         return ee.Dictionary(row)
 
     # One extra row detects an incomplete result; never publish a truncated list.
@@ -638,30 +656,22 @@ def best_s1_scene(
     """
     point = roi if roi is not None else ee.Geometry.Point([lon, lat])
     coll = _s1_collection(start_date, end_date, polarization, platform=platform).filterBounds(point)
-    best = _pick_s1_covering(coll, point)
-    if best is None:
-        return None
-    return SceneInfo(
-        dataset="s1gee",
-        collection=S1_COLLECTION,
-        scene_id=best.get("system:index").getInfo(),
-        date=ee.Date(best.get("system:time_start")).format("YYYY-MM-dd").getInfo(),
-        cloud_pct=-1.0,  # SAR không có khái niệm mây
-        ee_object=best,
-        platform=best.get("platform_number").getInfo(),
-    )
+    return _pick_s1_covering(coll, point)
 
 
 def _pick_s1_covering(
     coll: ee.ImageCollection, roi: ee.Geometry
-) -> ee.Image | None:
+) -> SceneInfo | None:
     """Rank by valid data across the entire ROI, then by acquisition time."""
-    from .s1_mosaic import ranked_s1_sources
+    from .s1_mosaic import _source_metadata, ranked_s1_sources
 
     ranked = ranked_s1_sources(coll, roi)
     if not ranked:
         return None
-    return ee.Image(coll.filter(ee.Filter.eq('system:index', ranked[0]['system:index'])).first())
+    source = _source_metadata(ranked[0])
+    image = ee.Image(coll.filter(ee.Filter.eq('system:index', source['scene_id'])).first())
+    return SceneInfo('s1gee', S1_COLLECTION, source['scene_id'], source['date'], -1.0, image,
+                     scenes=(source,), platform=source['platform'])
 
 
 def best_s1_scene_for_roi(
@@ -673,18 +683,7 @@ def best_s1_scene_for_roi(
 ) -> SceneInfo | None:
     """Return the S1 scene covering the largest fraction of the ROI (newest first)."""
     coll = _s1_collection(start_date, end_date, polarization, platform=platform).filterBounds(roi)
-    best = _pick_s1_covering(coll, roi)
-    if best is None:
-        return None
-    return SceneInfo(
-        dataset="s1gee",
-        collection=S1_COLLECTION,
-        scene_id=best.get("system:index").getInfo(),
-        date=ee.Date(best.get("system:time_start")).format("YYYY-MM-dd").getInfo(),
-        cloud_pct=-1.0,
-        ee_object=best,
-        platform=best.get("platform_number").getInfo(),
-    )
+    return _pick_s1_covering(coll, roi)
 
 
 def _raw_gap_fill(
@@ -1132,6 +1131,7 @@ def _dynamic_world_scene_info(
         cloud_pct=-1.0,
         ee_object=mode,
         scene_count=size,
+        footprint_geometry=coll.geometry(ee.ErrorMargin(30)),
     )
 
 
@@ -1397,6 +1397,7 @@ def _composite_scene_info(
         cloud_pct=cloud,
         ee_object=composite,
         scene_count=size,
+        footprint_geometry=coll.geometry(ee.ErrorMargin(30)),
         estimated_seconds=_estimate_median_seconds(
             size,
             float(roi.area(maxError=1).getInfo()),
@@ -1529,6 +1530,7 @@ def best_scene_for_roi(
             date=f"{start_date} to {end_date}",
             cloud_pct=-1.0,
             ee_object=image.clip(roi),
+            footprint_geometry=scene_geometry(image),
         )
 
     # Xếp hạng mây theo tỷ lệ pixel trong suốt trong ROI, tính TRỰC TIẾP từ
@@ -1756,6 +1758,7 @@ def download_geotiff(
     re-select the bands and force float type, because getDownloadURL otherwise
     casts values back to the collection's native int type.
     """
+    scene_export = CURRENT_SCENE.get()
     if clip_region is not None:
         image = image.clip(clip_region)
 
@@ -1814,6 +1817,8 @@ def download_geotiff(
         # Probe eager để phát hiện vượt 32 MiB cần chia tile; cũng có thể
         # dính RefreshError/EEException tạm thời do gateway chặn — retry.
         for k in range(1, 6):
+            if scene_export is not None:
+                scene_export.check()
             try:
                 url.url()
                 break
@@ -1822,7 +1827,7 @@ def download_geotiff(
             except Exception:
                 if k == 5:
                     raise
-                time.sleep(2.0 * k)
+                (scene_export.wait_retry if scene_export is not None else time.sleep)(2.0 * k)
         url.discard()  # ...rồi bỏ: URL có thời hạn, tạo lại ngay trước khi tải
         return [(f"{band}{tag}", url)]
 
@@ -1884,7 +1889,7 @@ def download_geotiff(
     return band_urls
 
 
-def _fetch_with_retry(url: str, max_retries: int = 5, timeout: int = 600) -> bytes:
+def _fetch_with_retry(url: str, max_retries: int = 5, timeout: int = 600, *, scene=None) -> bytes:
     """GET with retries. The corporate gateway occasionally answers 401/403
     ("Certificateincident") for no reason; retrying with backoff usually
     succeeds."""
@@ -1892,7 +1897,17 @@ def _fetch_with_retry(url: str, max_retries: int = 5, timeout: int = 600) -> byt
 
     last_exc: Exception | None = None
     for attempt in range(1, max_retries + 1):
+        if scene is not None:
+            scene.check()
         try:
+            if scene is not None:
+                with requests.get(url, timeout=timeout, stream=True) as resp:
+                    resp.raise_for_status()
+                    data = bytearray()
+                    for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                        scene.check()
+                        data.extend(chunk)
+                    return bytes(data)
             resp = requests.get(url, timeout=timeout)
             resp.raise_for_status()
             return resp.content
@@ -1902,7 +1917,7 @@ def _fetch_with_retry(url: str, max_retries: int = 5, timeout: int = 600) -> byt
             if status is not None and status < 500 and status not in (401, 403, 429):
                 raise  # client errors that retrying won't fix
             if attempt < max_retries:
-                time.sleep(2.0 * attempt)
+                (scene.wait_retry if scene is not None else time.sleep)(2.0 * attempt)
     raise last_exc  # type: ignore[misc]
 
 
@@ -1973,7 +1988,7 @@ def _read_mosaic_window(placements, window, dtype, nodata, *, preserve_float_mas
     return result
 
 
-@bulk_export
+@scene_bulk_export
 def merge_band_tiffs(
     band_urls: list[tuple[str, "_DownloadURL"]],
     out_path,
@@ -1992,9 +2007,13 @@ def merge_band_tiffs(
     if not band_urls:
         raise ValueError("No band URLs to merge")
 
-    # Local imports: heavy deps only needed for the merge step.
-    import numpy as np
-    import rasterio
+    scene = CURRENT_SCENE.get()
+    if scene is not None:
+        if not scene.reserved:
+            # GEE caps each per-band tile request at 32 MiB of raw pixels.
+            scene.reserve(Path(out_path), len(band_urls) * 32 * 1024**2)
+        scene.update(stage='downloading_tiles', tiles_total=len(band_urls), tiles_downloaded=0)
+        import rasterio
 
     tmp_dir = Path(out_path).parent / (Path(out_path).stem + "_bands_tmp")
     tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -2015,8 +2034,9 @@ def merge_band_tiffs(
         # các URL cuối hết hạn và trả 401 Unauthorized trước khi tới lượt tải.
         # Ngoài ra GEE/proxy thỉnh thoảng trả 200 + body rỗng (cache theo
         # URL): kiểm tra magic bytes TIFF, sai thì TẠO LẠI URL rồi mới thử lại.
-        from concurrent.futures import ThreadPoolExecutor
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         import time
+        pause = scene.wait_retry if scene is not None else time.sleep
 
         def _get_url(url_obj: "_DownloadURL", first: bool) -> str:
             """url()/refresh() có thể fail khi gateway chặn request refresh
@@ -2025,11 +2045,13 @@ def merge_band_tiffs(
             """
             last_exc: Exception | None = None
             for k in range(1, 6):
+                if scene is not None:
+                    scene.check()
                 try:
                     return url_obj.url() if first else url_obj.refresh()
                 except Exception as exc:
                     last_exc = exc
-                    time.sleep(2.0 * k)
+                    pause(2.0 * k)
             # RuntimeError để endpoint bắt và trả 502 thay vì 500
             raise RuntimeError(
                 f"cannot create download URL after {k} attempts "
@@ -2040,23 +2062,33 @@ def merge_band_tiffs(
             for attempt in range(1, 7):
                 url = _get_url(url_obj, first=attempt == 1)
                 try:
-                    data = measure_download('transfer', _fetch_with_retry, url)
+                    options = {'scene': scene} if scene is not None else {}
+                    data = measure_download('transfer', _fetch_with_retry, url, **options)
                 except requests.RequestException:
                     # URL hết hạn (401) sau nhiều lần thử lại — tạo URL mới
                     if attempt == 6:
                         raise
-                    time.sleep(2.0 * attempt)
+                    pause(2.0 * attempt)
                     continue
                 if data[:4] in (b"II*\x00", b"MM\x00*"):
+                    if scene is not None:
+                        scene.check()
                     path.write_bytes(data)
-                    return
+                    if scene is None:
+                        return
+                    try:
+                        with rasterio.open(path) as tile:
+                            if tile.count == 1 and tile.crs is not None:
+                                return
+                    except rasterio.errors.RasterioIOError:
+                        pass
                 # HTTP 200 nhưng body rỗng / không phải TIFF (cache theo URL)
                 if attempt == 6:
                     raise RuntimeError(
                         f"tile {path.name}: GEE/proxy response is not a GeoTIFF "
                         f"after {attempt} URL refreshes"
                     )
-                time.sleep(2.0 * attempt)
+                pause(2.0 * attempt)
 
         jobs = [
             (tmp_dir / f"{base}_{k}.tif", url)
@@ -2066,8 +2098,11 @@ def merge_band_tiffs(
         pool = ThreadPoolExecutor(max_workers=6)
         try:
             futs = [pool.submit(_download_to, url, p) for p, url in jobs]
-            for fut in futs:
+            completed = as_completed(futs) if scene is not None else futs
+            for downloaded, fut in enumerate(completed, 1):
                 fut.result()
+                if scene is not None:
+                    scene.update(tiles_downloaded=downloaded)
         finally:
             # hủy các job chưa chạy để fail nhanh thay vì đợi cả hàng đợi
             pool.shutdown(wait=True, cancel_futures=True)
@@ -2075,7 +2110,10 @@ def merge_band_tiffs(
         for base, urls in groups.items():
             paths[base] = [tmp_dir / f"{base}_{k}.tif" for k in range(len(urls))]
 
-        merge_local_band_tiffs(paths, out_path, categorical=categorical, preserve_masks=preserve_masks)
+        if scene is not None:
+            scene.begin_assembly()
+        check = {'check': scene.check} if scene is not None else {}
+        merge_local_band_tiffs(paths, out_path, categorical=categorical, preserve_masks=preserve_masks, **check)
     finally:
         import shutil
 

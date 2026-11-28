@@ -1,4 +1,4 @@
-"""Administrative-boundary lookup for the 63-province selection mode."""
+"""Administrative-boundary lookup for the 34-province selection mode."""
 from __future__ import annotations
 
 import json
@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any
 
 import ee
+import shapefile
+from shapely.geometry import shape
 
 from .geo import Bbox
 
@@ -15,6 +17,7 @@ from .geo import Bbox
 _BOUNDARIES_FILE = (
     Path(__file__).resolve().parent.parent / "shapefile34" / "vn34.json"
 )
+_SHAPEFILE_NAME = "Việt Nam (tỉnh thành) - 34.shp"
 
 # Địa giới hành chính mới (sáp nhập 2025, 34 tỉnh/thành). Tên hiển thị lấy
 # thẳng từ dữ liệu (ten_tinh) — không cần ghi đè như bộ 63 tỉnh cũ.
@@ -50,6 +53,16 @@ def _bbox_for_geometry(geometry: dict[str, Any]) -> Bbox:
     return Bbox(west=min(lons), south=min(lats), east=max(lons), north=max(lats))
 
 
+def _source_boundaries() -> dict[str, dict[str, Any]]:
+    path = _BOUNDARIES_FILE.with_name(_SHAPEFILE_NAME)
+    try:
+        with shapefile.Reader(str(path), encoding="utf-8") as reader:
+            return {f"VN{record['ma_tinh']}": reader.shape(record.oid).__geo_interface__
+                    for record in reader.iterRecords(fields=["ma_tinh"])}
+    except (OSError, shapefile.ShapefileException) as exc:
+        raise RuntimeError(f"Cannot read province shapefile: {path}") from exc
+
+
 @lru_cache(maxsize=1)
 def _provinces_by_id() -> dict[str, Province]:
     try:
@@ -62,6 +75,7 @@ def _provinces_by_id() -> dict[str, Province]:
         raise RuntimeError("Boundary file is not a GeoJSON FeatureCollection")
 
     provinces: dict[str, Province] = {}
+    source_boundaries = None
     for feature in features:
         props = feature.get("properties") or {}
         province_id = props.get("id")
@@ -76,6 +90,14 @@ def _provinces_by_id() -> dict[str, Province]:
             raise RuntimeError("Boundary file contains an invalid province feature")
         if province_id in provinces:
             raise RuntimeError(f"Boundary file contains duplicate ID: {province_id}")
+        if not shape(geometry).is_valid:
+            # The GeoJSON export can put disjoint shapefile exteriors into the hole list.
+            if source_boundaries is None:
+                source_boundaries = _source_boundaries()
+            geometry = source_boundaries.get(province_id)
+            if (not geometry or geometry["type"] not in {"Polygon", "MultiPolygon"}
+                    or not shape(geometry).is_valid):
+                raise RuntimeError(f"Cannot recover a valid boundary for {province_id}")
         provinces[province_id] = Province(
             id=province_id,
             name=name,

@@ -20,6 +20,7 @@
     el('s5pSelection').hidden = el('dataset').value !== 's5p';
   }
   function render(data) {
+    window.ResultFootprints?.clear();
     snapshot = data;
     el('s5pResults').hidden = false;
     el('s5pMeta').textContent = `${data.total} ảnh ${data.parameters.product} (${data.parameters.unit}), UTC. ` +
@@ -69,7 +70,6 @@
             throw new Error(error.detail || 'Không tải được ảnh.');
           }
           const blob = await response.blob();
-          if (token !== generation) return;
           const url = URL.createObjectURL(blob);
           const link = document.createElement('a');
           link.href = url;
@@ -81,9 +81,11 @@
         finally { download.disabled = false; }
       };
       row.append(label, preview, download, message);
+      window.ResultFootprints?.add(row, scene.footprint);
       return row;
     });
     el('s5pScenes').replaceChildren(...rows);
+    window.ResultFootprints?.fit(data.parameters?.bbox);
   }
   async function load(url, options) {
     controller?.abort();

@@ -19,8 +19,8 @@ class TestProviderSettingsAccess(unittest.TestCase):
         for address, host in [('192.0.2.10', 'localhost'), ('127.0.0.1', 'example.test')]:
             with self.subTest(address=address, host=host):
                 client = TestClient(main.app, base_url=f'http://{host}:8000', client=(address, 50000))
-                response = client.get('/api/local-provider-settings')
-                self.assertEqual(response.status_code, 403)
+                for path in (_API, f'{_API}/availability'):
+                    self.assertEqual(client.get(path).status_code, 403)
 
     def test_cross_origin_submission_is_rejected_without_echoing_credentials(self):
         client = TestClient(main.app, base_url='http://localhost:8000', client=('127.0.0.1', 50000))
@@ -43,6 +43,26 @@ class TestProviderSettings(unittest.TestCase):
 
     def save(self, provider, payload):
         return self.client.put(f'{_API}/{provider}', json=payload, headers={'Origin': _ORIGIN})
+
+    def test_banner_reports_only_missing_fields_and_separates_staged_keys(self):
+        with patch.dict(os.environ, {'CDSE_USERNAME': 'private@example.test', 'Secret_Key_S3': 'private-secret'},
+                        clear=True), patch.object(ee_session, '_BASE_DIR', self.directory), \
+             patch.object(ee_session, '_initialized', False), \
+             patch.object(ee_session.ee.oauth, 'get_credentials_arguments', side_effect=FileNotFoundError), \
+             patch.object(ee_session._cloud_sdk, 'get_application_default_credentials_path',
+                          return_value=self.directory / 'adc.json'):
+            response = self.client.get(f'{_API}/availability')
+            self.assertEqual(response.json(), {'missing': {
+                'gee': ['service_account_json'], 'cdse': ['password'], 's3': ['access_key'],
+            }, 'restart_required': []})
+            self.assertEqual(response.headers['Cache-Control'], 'no-store')
+            self.assertNotIn('private', response.text)
+            self.assertEqual(self.save('s3', {'access_key': 'saved-key', 'secret_key': 'saved-secret'}).status_code, 200)
+            self.assertEqual(self.client.get(f'{_API}/availability').json(), {'missing': {
+                'gee': ['service_account_json'], 'cdse': ['password'],
+            }, 'restart_required': ['s3']})
+            with patch.object(ee_session.ee.oauth, 'get_credentials_arguments', return_value={'refresh_token': 'local'}):
+                self.assertNotIn('gee', self.client.get(f'{_API}/availability').json()['missing'])
 
     def test_cdse_save_is_write_only_and_applies_on_next_start(self):
         payload = {'username': 'someone@example.test', 'password': 'fixture-password=42'}

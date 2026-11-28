@@ -43,8 +43,12 @@ def list_scenes(product, roi, start, end, limit=2000):
     collection = (ee.ImageCollection(meta['collection']).filterBounds(roi)
                   .filterDate(start, end).sort('system:time_start'))
     images = collection.limit(limit + 1).toList(limit + 1)
-    rows = images.map(lambda obj: ee.Image(obj).toDictionary(
-        ['system:index', 'system:time_start'])).getInfo()
+    def metadata(obj):
+        image = ee.Image(obj)
+        return image.toDictionary(['system:index', 'system:time_start']).set(
+            'footprint', imagery.scene_geometry(image))
+
+    rows = images.map(metadata).getInfo()
     scenes = []
     for row in rows[:limit]:
         index = row['system:index']
@@ -53,7 +57,7 @@ def list_scenes(product, roi, start, end, limit=2000):
         timestamp = dt.datetime.fromtimestamp(row['system:time_start'] / 1000, dt.timezone.utc)
         scenes.append(dict(scene_id=index, asset_id=f"{meta['collection']}/{index}",
                            timestamp=timestamp.isoformat().replace('+00:00', 'Z'),
-                           date=timestamp.date().isoformat()))
+                           date=timestamp.date().isoformat(), footprint=row.get('footprint')))
     return scenes, len(rows) > limit
 
 

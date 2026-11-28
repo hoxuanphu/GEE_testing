@@ -9,13 +9,22 @@
       map.createPane('scene-footprints').style.zIndex = '390';
       this.layers = L.featureGroup().addTo(map);
       this.hovered = this.focused = this.selected = null;
+      this.count = 0;
     }
 
-    bind(row, button, footprint) {
+    bind(row, button, footprint, toggle = true) {
       if (!['Polygon', 'MultiPolygon'].includes(footprint?.type) || !footprint.coordinates?.length) return false;
-      const layer = this.L.geoJSON(footprint, {
-        pane: 'scene-footprints', interactive: false, style: this.style(false, false),
-      }).addTo(this.layers);
+      let layer;
+      try {
+        layer = this.L.geoJSON(footprint, {
+          pane: 'scene-footprints', interactive: false, style: this.style(false, false),
+        });
+      } catch (error) {
+        return false;
+      }
+      if (!layer.getBounds().isValid()) return false;
+      layer.addTo(this.layers);
+      this.count++;
       const scene = {layer, button};
       button.setAttribute('aria-pressed', 'false');
       row.addEventListener('pointerenter', () => this.setState('hovered', scene));
@@ -24,7 +33,7 @@
       row.addEventListener('focusout', event => {
         if (!row.contains(event.relatedTarget)) this.setState('focused', null);
       });
-      button.addEventListener('click', () => this.setState('selected', this.selected === scene ? null : scene));
+      button.addEventListener('click', () => this.setState('selected', toggle && this.selected === scene ? null : scene));
       return true;
     }
 
@@ -57,9 +66,11 @@
       this.selected?.button.setAttribute('aria-pressed', 'false');
       this.hovered = this.focused = this.selected = null;
       this.layers.clearLayers();
+      this.count = 0;
     }
 
     fit(roi) {
+      if (!this.count) return;
       const bounds = this.layers.getBounds();
       if (!bounds.isValid()) return;
       if (roi && [roi.south, roi.west, roi.north, roi.east].every(Number.isFinite)) {

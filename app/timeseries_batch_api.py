@@ -2,7 +2,7 @@
 from copy import deepcopy
 
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import FileResponse
+from .task_files import TaskFileResponse
 from pydantic import ConfigDict
 
 from .timeseries import BusyError
@@ -100,7 +100,8 @@ def register_batch_routes(api, store, service):
             raise HTTPException(409,'Kết quả năm chưa sẵn sàng.')
         extension = 'zip' if kind=='download' else 'csv'
         filename = f'timeseries_{batch["parameters"]["dataset"]}_{year}.{extension}'
-        return FileResponse(path,media_type='application/zip' if kind=='download' else 'text/csv; charset=utf-8',
+        return TaskFileResponse(path,task_directory=store.directory(batch_id),
+                            media_type='application/zip' if kind=='download' else 'text/csv; charset=utf-8',
                             filename=filename,headers={'Cache-Control':'no-store'})
 
     @router.get('/{batch_id}/years/{year}/download')

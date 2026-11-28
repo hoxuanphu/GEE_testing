@@ -11,7 +11,7 @@ from rasterio.warp import transform_geom
 from .raster_grid import GEOTIFF_OPTIONS
 
 
-def mask_raster_to_polygon(path: Path, geometry: dict) -> None:
+def mask_raster_to_polygon(path: Path, geometry: dict, *, check=lambda: None) -> None:
     path = Path(path)
     temporary = path.with_name(f'.{path.stem}.{uuid.uuid4().hex}.mask.tif')
     try:
@@ -35,11 +35,13 @@ def mask_raster_to_polygon(path: Path, geometry: dict) -> None:
                     if source.units[band - 1]:
                         target.set_band_unit(band, source.units[band - 1])
                 for _, window in source.block_windows(1):
+                    check()
                     data = source.read(window=window, masked=True)
                     outside = geometry_mask([projected], out_shape=(int(window.height), int(window.width)),
                                             transform=source.window_transform(window), all_touched=False)
                     data.mask = np.ma.getmaskarray(data) | outside[None, :, :]
                     target.write(data.filled(nodata), window=window)
+        check()
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)

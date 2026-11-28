@@ -120,6 +120,7 @@ class AnnualBatches(unittest.TestCase):
 
     def test_restart_requires_resume_and_missing_success_is_exported_again(self):
         batch_id = self.create()
+        self.store.update(batch_id, status='running')
         self.store.recover()
         self.assertEqual(self.store.get_batch(batch_id)['status'],'interrupted')
         self.store.prepare_resume(batch_id)
@@ -177,19 +178,19 @@ class AnnualBatches(unittest.TestCase):
         self.assertIsNone(result['years'][0]['total'])
         self.assertNotIn(('export','2020'),self.events)
 
-    def test_shared_db_admission_blocks_both_directions(self):
+    def test_shared_db_admission_queues_both_directions(self):
         search = self.store.create_search(self.parameters,[{'asset_id':'x'}])['search_id']
         self.create()
-        with self.assertRaises(legacy.BusyError): self.store.create_job(search)
-        self.store.recover()
-        self.store.create_job(search)
-        with self.assertRaises(legacy.BusyError): self.store.create_batch(self.parameters)
+        self.assertEqual(self.store.create_job(search)['status'], 'queued')
+        self.assertEqual(self.store.create_batch(self.parameters)['status'], 'queued')
 
-    def test_resume_is_atomic_with_legacy_job_admission(self):
-        batch_id = self.create(); self.store.recover()
+    def test_resume_queues_with_legacy_job(self):
+        batch_id = self.create()
+        self.store.update(batch_id, status='running')
+        self.store.recover()
         search = self.store.create_search(self.parameters,[{'asset_id':'x'}])['search_id']
         self.store.create_job(search)
-        with self.assertRaises(legacy.BusyError): self.store.prepare_resume(batch_id)
+        self.assertEqual(self.store.prepare_resume(batch_id)['status'], 'queued')
 
     def test_resume_queues_new_run_while_previous_future_is_still_returning(self):
         published, release = threading.Event(), threading.Event()
@@ -248,6 +249,7 @@ class AnnualBatches(unittest.TestCase):
         with self.store._connect() as db:
             db.execute('UPDATE ts_batches SET activity=?',(old,))
         self.assertEqual(self.store.cleanup(),0)
+        self.store.update(batch_id, status='running')
         self.store.recover()
         with self.store._connect() as db: db.execute('UPDATE ts_batches SET activity=?',(old,))
         self.assertEqual(self.store.cleanup(),0)

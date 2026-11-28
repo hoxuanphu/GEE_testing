@@ -172,6 +172,7 @@ class PlatformAPITests(unittest.TestCase):
                 patch.object(main, '_ensure_ee'), \
                 patch.object(main, '_resolve_selection', return_value=(MagicMock(), Bbox(106, 10, 107, 11), None)), \
                 patch.object(main, 'download_geotiff', return_value=[]), patch.object(main, 'merge_band_tiffs'), \
+                patch.object(s1_mosaic, 'write_s1_export_tags'), \
                 patch.object(main, 'best_s1_scene', return_value=scene) as s1, \
                 patch.object(s1_mosaic, 'prepare_s1', return_value=scene) as prepare, \
                 patch.object(main, 'best_scene', return_value=scene) as s2:
@@ -206,6 +207,7 @@ class PlatformAPITests(unittest.TestCase):
                 patch.object(main, 'best_s1_scene_for_roi', return_value=scene) as sar, \
                 patch.object(main, 'composite_plan', return_value={'scene_count': 1}) as plan, \
                 patch.object(s1_mosaic, 'prepare_s1', return_value=scene), \
+                patch.object(s1_mosaic, 'write_s1_export_tags'), \
                 patch.object(main, 'download_geotiff', return_value=[]), patch.object(main, 'merge_band_tiffs'):
             for route, helper in [('/api/scene', optical), ('/api/s1gee/scene', sar)]:
                 response = client.post(route, json=body)

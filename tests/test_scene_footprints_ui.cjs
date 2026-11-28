@@ -12,6 +12,7 @@ test('scene rows highlight only their own footprint and reset on page replacemen
     geoJSON(geometry, options) {
       return {
         geometry, style: options.style,
+        getBounds() { return {isValid: () => true}; },
         addTo() { layers.push(this); return this; },
         setStyle(style) { this.style = style; },
         bringToFront() {},

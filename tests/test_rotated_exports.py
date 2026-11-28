@@ -166,6 +166,8 @@ class TestGEERotatedMerge(RasterCase):
             grid = main.build_rotated_grid(107, 10, 100, 30, main.S1_SCALE)
             self.assertEqual(dst.transform, Affine(*grid["transform"]))
             self.assertTrue(np.all(dst.read_masks() == 255))
+            self.assertEqual(dst.tags()['SOURCE_ASSET'], 'COPERNICUS/S1_GRD/scene')
+            self.assertEqual(dst.tags()['EXPORT_EXTENT'], 'roi')
 
     def test_explicit_mask_and_valid_zero_survive_merge_then_warp(self):
         from app.raster_grid import warp_to_grid

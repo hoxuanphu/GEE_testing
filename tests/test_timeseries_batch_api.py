@@ -40,7 +40,10 @@ class BatchAPI(unittest.TestCase):
         self.body['width_m']=200
         saved = self.client.get('/api/timeseries/batches/'+batch['batch_id']).json()
         self.assertEqual(saved['parameters']['width_m'],40)
-        self.assertEqual(self.client.post('/api/timeseries/batches',json=self.body).status_code,409)
+        with patch.object(self.legacy, 'submit_task'):
+            next_batch = self.client.post('/api/timeseries/batches',json=self.body)
+        self.assertEqual(next_batch.status_code, 200)
+        self.assertEqual(next_batch.json()['status'], 'queued')
 
     def test_rgbnir_batch_freezes_four_bands_for_all_years(self):
         with patch.object(self.legacy, 'submit_task'):
@@ -62,8 +65,7 @@ class BatchAPI(unittest.TestCase):
         with patch.object(self.legacy,'submit_task'):
             batch = self.client.post('/api/timeseries/batches',json=self.body).json()
             prefix='/api/timeseries/batches/'+batch['batch_id']
-            self.assertEqual(self.client.post(prefix+'/pause').json()['status'],'pausing')
-            self.store.recover()
+            self.assertEqual(self.client.post(prefix+'/pause').json()['status'],'paused')
             self.assertEqual(self.client.post(prefix+'/resume').json()['status'],'queued')
             self.assertEqual(self.client.post(prefix+'/resume').status_code,409)
             self.assertEqual(self.client.get(prefix+'/years/2020/download').status_code,409)

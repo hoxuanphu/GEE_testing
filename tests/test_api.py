@@ -79,14 +79,19 @@ class TestTimeSeriesAPI(unittest.TestCase):
         return response.json()
 
     def test_snapshot_pagination_and_empty_job(self):
-        scenes = [dict(asset_id=f"asset/{i}", timestamp="2026-01-01T23:59:59Z", date="2026-01-01", cloud_pct=100) for i in range(73)]
+        footprint = {'type': 'Polygon', 'coordinates': [[[106, 10], [107, 10], [107, 11], [106, 10]]]}
+        scenes = [dict(asset_id=f"asset/{i}", timestamp="2026-01-01T23:59:59Z",
+                       date="2026-01-01", cloud_pct=100, footprint=footprint)
+                  for i in range(73)]
         data = self.search(scenes)
         self.assertEqual(data["total"], 73)
         self.assertEqual(len(data["scenes"]), 50)
+        self.assertEqual(data["scenes"][0]["footprint"], footprint)
         with mock.patch.object(main, "list_timeseries_scenes", side_effect=AssertionError("must not relist")):
             page = self.client.get(f"/api/timeseries/search/{data['search_id']}?offset=50&limit=50").json()
         self.assertEqual(len(page["scenes"]), 23)
         self.assertEqual(page["scenes"][0]["cloud_pct"], 100)
+        self.assertEqual(page["scenes"][0]["footprint"], footprint)
         empty = self.search([])
         self.assertEqual(self.client.post("/api/timeseries/jobs", json={"search_id": empty["search_id"]}).status_code, 400)
 
@@ -142,6 +147,9 @@ class _FakeResp:
 
     closed = False
 
+    def __init__(self, length):
+        self.headers = {'Content-Length': str(length)}
+
     def iter_content(self, chunk_size=None):
         return iter([])
 
@@ -153,7 +161,7 @@ def _open_ok(chunks=(b"zip",)):
     """mock open_product trả (resp, first_chunk) như thật."""
     first = chunks[0] if chunks else b""
     return mock.patch.object(
-        main, "open_product", return_value=(_FakeResp(), first)
+        main, "open_product", return_value=(_FakeResp(len(first)), first)
     )
 
 
